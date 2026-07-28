@@ -272,6 +272,16 @@ jobs:
           EXE_SIG=$(cat ./*_x64-setup.exe.sig)
           MSI_SIG=$(cat ./*_x64_en-US.msi.sig)
 
+          # Re-signing an artifact re-uploads it with --clobber, which deletes
+          # and recreates the asset under a new id. tauri-action baked the old
+          # asset-id API urls into latest.json, so we also rewrite the urls of
+          # the re-signed artifacts to the tag+filename download url, which is
+          # stable across clobbers. Filenames come from the .sig names.
+          APP_FILE=$(basename "$(ls ./*_amd64.AppImage.sig)" .sig)
+          EXE_FILE=$(basename "$(ls ./*_x64-setup.exe.sig)" .sig)
+          MSI_FILE=$(basename "$(ls ./*_x64_en-US.msi.sig)" .sig)
+          DL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+
           jq -e 'has("platforms") and (.platforms | has("linux-x86_64")
             and has("windows-x86_64") and has("windows-x86_64-msi")
             and has("windows-x86_64-nsis"))' latest.json >/dev/null \
@@ -279,22 +289,26 @@ jobs:
 
           # The generic windows-x86_64 key mirrors whichever installer Tauri
           # picked as primary; decode its current signature to see which file it
-          # references so the correct regenerated signature is substituted.
+          # references so the correct regenerated signature and url are used.
           GEN_FILE=$(jq -r '.platforms["windows-x86_64"].signature' latest.json \
             | base64 -d | grep -oE 'file:[^[:space:]]+' | head -n1)
+          GEN_FILE=${GEN_FILE#file:}
           case "$GEN_FILE" in
             *.msi) WIN_GEN="$MSI_SIG" ;;
             *)     WIN_GEN="$EXE_SIG" ;;
           esac
 
           jq --arg app "$APP_SIG" --arg gen "$WIN_GEN" \
-             --arg msi "$MSI_SIG" --arg nsis "$EXE_SIG" '
-            .platforms["linux-x86_64"].signature = $app
+             --arg msi "$MSI_SIG" --arg nsis "$EXE_SIG" \
+             --arg appurl "$DL/$APP_FILE" --arg genurl "$DL/$GEN_FILE" \
+             --arg msiurl "$DL/$MSI_FILE" --arg exeurl "$DL/$EXE_FILE" '
+            .platforms["linux-x86_64"] += {signature: $app, url: $appurl}
             | (if .platforms["linux-x86_64-appimage"]
-               then .platforms["linux-x86_64-appimage"].signature = $app else . end)
-            | .platforms["windows-x86_64"].signature = $gen
-            | .platforms["windows-x86_64-msi"].signature = $msi
-            | .platforms["windows-x86_64-nsis"].signature = $nsis
+               then .platforms["linux-x86_64-appimage"] += {signature: $app, url: $appurl}
+               else . end)
+            | .platforms["windows-x86_64"] += {signature: $gen, url: $genurl}
+            | .platforms["windows-x86_64-msi"] += {signature: $msi, url: $msiurl}
+            | .platforms["windows-x86_64-nsis"] += {signature: $nsis, url: $exeurl}
           ' latest.json > latest.json.tmp
           mv latest.json.tmp latest.json
 
