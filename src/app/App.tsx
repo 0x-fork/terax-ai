@@ -85,8 +85,10 @@ import {
   hasLeaf,
   leafIds,
   navigateFocusedBlocks,
+  ptyIdForLeaf,
   type PaneBounds,
   type TerminalPaneHandle,
+  useAgentActivityStore,
   useTerminalFileDrop,
   whenSessionReady,
   writeToSession,
@@ -389,6 +391,16 @@ export default function App() {
     for (const k of [...searchAddons.current.keys()])
       if (!live.has(k)) searchAddons.current.delete(k);
   }, [tabs]);
+
+  useEffect(() => {
+    const tab = tabsRef.current.find((t) => t.id === activeId);
+    if (tab?.kind !== "terminal") return;
+    const ptyIds = leafIds(tab.paneTree).flatMap((leafId) => {
+      const ptyId = ptyIdForLeaf(leafId);
+      return ptyId === null ? [] : [ptyId];
+    });
+    useAgentActivityStore.getState().acknowledgeAttention(ptyIds);
+  }, [activeId]);
 
   // Most-recently-used tab ids, most recent first, pruned to live tabs. Drives
   // the Ctrl+Tab quick switcher so it cycles by recency, not strip order.
