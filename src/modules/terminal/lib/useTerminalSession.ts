@@ -30,6 +30,7 @@ import {
   acquireSlot,
   applyBackgroundActive,
   applyCursorBlink,
+  applyCursorStyle,
   applyLetterSpacing,
   applyTerminalFont,
   applyTheme as applyPoolTheme,
@@ -910,6 +911,11 @@ export function useTerminalSession({
   useEffect(() => {
     applyCursorBlink(cursorBlink);
   }, [cursorBlink]);
+
+  const cursorStyle = usePreferencesStore((p) => p.terminalCursorStyle);
+  useEffect(() => {
+    applyCursorStyle(cursorStyle);
+  }, [cursorStyle]);
 
   const bgActive = usePreferencesStore(
     (p) => p.backgroundKind === "image" && !!p.backgroundImageId,
