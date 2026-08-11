@@ -153,6 +153,37 @@ export type OpenFileTabOptions = {
   activate?: boolean;
 };
 
+export function planMarkdownTabOpen(
+  tabs: Tab[],
+  path: string,
+  spaceId: string,
+  allocId: () => number,
+): { tabs: Tab[]; tabId: number } {
+  const pathKey = path.replace(/\\/g, "/");
+  const existing = tabs.find(
+    (tab) =>
+      tab.kind === "markdown" &&
+      tab.spaceId === spaceId &&
+      tab.path.replace(/\\/g, "/") === pathKey,
+  );
+  if (existing) return { tabs, tabId: existing.id };
+
+  const tabId = allocId();
+  return {
+    tabs: [
+      ...tabs,
+      {
+        id: tabId,
+        kind: "markdown",
+        spaceId,
+        title: basename(path),
+        path,
+      },
+    ],
+    tabId,
+  };
+}
+
 export function planFileTabOpen(
   tabs: Tab[],
   path: string,
@@ -499,6 +530,8 @@ export function useTabs(initial?: Partial<TerminalTab>) {
 
   const replaceTabs = useCallback((next: Tab[], nextActiveId: number) => {
     if (next.length === 0) return;
+    tabsRef.current = next;
+    activeIdRef.current = nextActiveId;
     setTabs(next);
     setActiveId(nextActiveId);
   }, []);
@@ -839,31 +872,24 @@ export function useTabs(initial?: Partial<TerminalTab>) {
     return id;
   }, []);
 
+  // Mirrors tabsRef like openFileTab instead of using a functional update: a
+  // batch that opens a markdown file before a regular one (multi-file "Open
+  // With") would otherwise have the queued markdown update clobbered by
+  // openFileTab's setTabs(plan.tabs), which is built from the stale ref.
   const newMarkdownTab = useCallback((path: string) => {
-    let targetId: number | null = null;
-    setTabs((curr) => {
-      const existing = curr.find(
-        (t) => t.kind === "markdown" && t.path === path,
-      );
-      if (existing) {
-        targetId = existing.id;
-        return curr;
-      }
-      const id = nextIdRef.current++;
-      targetId = id;
-      return [
-        ...curr,
-        {
-          id,
-          kind: "markdown",
-          spaceId: activeSpaceIdRef.current,
-          title: basename(path),
-          path,
-        },
-      ];
-    });
-    if (targetId !== null) setActiveId(targetId);
-    return targetId;
+    const curr = tabsRef.current;
+    const plan = planMarkdownTabOpen(
+      curr,
+      path,
+      activeSpaceIdRef.current,
+      () => nextIdRef.current++,
+    );
+    if (plan.tabs !== curr) {
+      tabsRef.current = plan.tabs;
+      setTabs(plan.tabs);
+    }
+    setActiveId(plan.tabId);
+    return plan.tabId;
   }, []);
 
   const setOverrideLanguage = useCallback((id: number, lang: string | null) => {
@@ -1280,6 +1306,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
     activeId,
     setActiveId,
     allocId,
+    booted,
     replaceTabs,
     moveTabToSpace,
     reorderTab,
