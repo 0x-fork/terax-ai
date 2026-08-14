@@ -74,6 +74,7 @@ import {
 import { StatusBar } from "@/modules/statusbar";
 import {
   TabSwitcherHud,
+  type CloseTabsPlan,
   useTabSwitcher,
   useTabs,
   useWindowTitle,
@@ -156,6 +157,7 @@ export default function App() {
     openCommitHistoryTab,
     openCommitFileDiffTab,
     closeTab,
+    closeTabs,
     updateTab,
     selectByIndex,
     setLeafCwd,
@@ -380,19 +382,41 @@ export default function App() {
     [closeTab],
   );
 
+  const disposeTabs = useCallback(
+    (anchorId: number, plan: CloseTabsPlan) => {
+      const closedIds = closeTabs(anchorId, plan);
+      for (const id of closedIds) {
+        editorRefs.current.delete(id);
+        previewRefs.current.delete(id);
+      }
+    },
+    [closeTabs],
+  );
+
   const {
     pendingCloseTab,
     pendingTerminalCloseTab,
     pendingDeleteTabs,
+    pendingCloseMany,
+    closeManyConfirming,
     handleClose,
+    handleCloseTabsToRight,
+    handleCloseOtherTabs,
     confirmClose,
     cancelClose,
     confirmTerminalClose,
     cancelTerminalClose,
     confirmDeleteClose,
     cancelDeleteClose,
+    confirmCloseMany,
+    cancelCloseMany,
     handlePathDeleted,
-  } = useTabCloseGuards({ tabs, disposeTab });
+  } = useTabCloseGuards({
+    tabs,
+    activeId,
+    disposeTab,
+    disposeTabs,
+  });
 
   const { pendingAppClose, confirmAppClose, cancelAppClose } =
     useAppCloseGuard(tabsRef);
@@ -712,8 +736,7 @@ export default function App() {
       : null;
   const isRepositoryContextCurrent = useCallback(
     (spaceId: string, workspaceKey: string) => {
-      const currentSpaceId =
-        useSpaces.getState().activeId ?? DEFAULT_SPACE_ID;
+      const currentSpaceId = useSpaces.getState().activeId ?? DEFAULT_SPACE_ID;
       const currentWorkspaceKey = workspaceScopeKey(
         useWorkspaceEnvStore.getState().env,
       );
@@ -1338,6 +1361,8 @@ export default function App() {
               onNewGitGraph={openGitGraphFromContext}
               onLaunchAgents={launchAgentGroup}
               onClose={handleClose}
+              onCloseTabsToRight={handleCloseTabsToRight}
+              onCloseOtherTabs={handleCloseOtherTabs}
               onPin={pinTab}
               onRename={handleRenameTab}
               onReorder={reorderTabByGap}
@@ -1546,6 +1571,10 @@ export default function App() {
             pendingDeleteTabs={pendingDeleteTabs}
             onCancelDeleteClose={cancelDeleteClose}
             onConfirmDeleteClose={confirmDeleteClose}
+            pendingCloseMany={pendingCloseMany}
+            closeManyConfirming={closeManyConfirming}
+            onCancelCloseMany={cancelCloseMany}
+            onConfirmCloseMany={confirmCloseMany}
             pendingAppClose={pendingAppClose}
             onCancelAppClose={cancelAppClose}
             onConfirmAppClose={confirmAppClose}
