@@ -48,6 +48,7 @@ import { setLspNavigator } from "@/modules/lsp";
 import type { PreviewPaneHandle } from "@/modules/preview";
 import { openSettingsWindow } from "@/modules/settings/openSettingsWindow";
 import { usePreferencesStore } from "@/modules/settings/preferences";
+import { setShowHidden } from "@/modules/settings/store";
 import {
   shouldDisablePaneSwapShortcut,
   type ShortcutHandlers,
@@ -751,6 +752,10 @@ export default function App() {
   const openSourceControl = useCallback(() => {
     openSidebarView("source-control");
   }, [openSidebarView]);
+  const toggleHiddenFiles = useCallback(() => {
+    openSidebarView("explorer");
+    void setShowHidden(!usePreferencesStore.getState().showHidden);
+  }, [openSidebarView]);
   const {
     repositoryTarget: sourceControlRepositoryTarget,
     openInSourceControl: handleOpenRepositoryInSourceControl,
@@ -906,6 +911,7 @@ export default function App() {
       "settings.open": () => void openSettingsWindow(),
       "sidebar.toggle": toggleSidebar,
       "explorer.focus": toggleExplorerFocus,
+      "explorer.toggleHidden": toggleHiddenFiles,
       "view.zoomIn": zoomIn,
       "view.zoomOut": zoomOut,
       "view.zoomReset": zoomReset,
@@ -939,6 +945,7 @@ export default function App() {
       onAskFromSelection,
       toggleSidebar,
       toggleExplorerFocus,
+      toggleHiddenFiles,
       zoomIn,
       zoomOut,
       zoomReset,
@@ -1232,6 +1239,7 @@ export default function App() {
             focusSearch: () => searchInlineRef.current?.focus(),
             focusExplorerSearch: () => explorerRef.current?.focusSearch(),
             toggleSidebar,
+            toggleHiddenFiles,
             toggleAi: togglePanelAndFocus,
             askAiSelection: askFromSelection,
             openSettings: () => void openSettingsWindow(),
@@ -1259,6 +1267,7 @@ export default function App() {
       handleCloseTabOrPane,
       splitActivePaneInActiveTab,
       toggleSidebar,
+      toggleHiddenFiles,
       togglePanelAndFocus,
       askFromSelection,
       activeSpaceId,
