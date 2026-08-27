@@ -1,5 +1,7 @@
 pub mod modules;
 
+#[cfg(target_os = "macos")]
+use modules::app_menu;
 use modules::{
     agent, control, fs, git, history, lsp, net, pty, secrets, shell, vibrancy, workspace,
 };
@@ -183,6 +185,10 @@ pub fn run() {
     let builder = tauri::Builder::default();
     #[cfg(target_os = "linux")]
     let builder = builder.plugin(tauri_plugin_clipboard_manager::init());
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .menu(app_menu::build)
+        .on_menu_event(app_menu::handle_event);
     builder
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
