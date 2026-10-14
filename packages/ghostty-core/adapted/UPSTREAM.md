@@ -6,15 +6,15 @@ without importing Restty's application runtime, PTY transport, perpetual
 per-terminal frame loop, or per-pane GPU lifecycle.
 
 - Ghostty source: `https://github.com/ghostty-org/ghostty`
-- Ghostty commit: `7ec9e26a29399b30ef78f06985fc75045b3cecb6`
+- Ghostty commit: `ad97d331459a0762f7aea5f56fe86748e03b860f`
 - Restty source: `https://github.com/wiedymi/restty`
 - Restty commit: `7700b14a7643ba9240818209ef1e0aa90d83ad77`
 - Zig: `0.16.0`
 - Optimization: `ReleaseFast`, WebAssembly SIMD and scalar variants
-- SIMD artifact size: `733953` bytes
-- Scalar artifact size: `731707` bytes
-- SIMD SHA-256: `ac21b4d0ded9d5f33ea956cff404965117c3709127eb046ce1dec80859914ce3`
-- Scalar SHA-256: `30fd8027c9351292238d2c4546485cb092534f74a35be56832503a9c5786ca87`
+- SIMD artifact size: `738052` bytes
+- Scalar artifact size: `735879` bytes
+- SIMD SHA-256: `c8bc4342c9a08c7ea908ecaa1646ca32bff891204f0684ef58972c62a9fdc55c`
+- Scalar SHA-256: `50b06006674e31eb095e0fac1dff97398fc82f026779137a91a7f6fc0969ecd3`
 
 Terax-specific changes include:
 
@@ -73,18 +73,29 @@ The bridge deliberately stays below Terax's model/surface boundary. Terax
 retains renderer pooling, hidden-tab renderer release, damage-driven frame
 scheduling, shell integration, semantic routing, and fallback selection.
 
-## October 8 nightly update
+## October 14 upstream update
 
-Both artifacts use the exact October 8 nightly source revision above. The update
-includes upstream wide-character resize repair, semantic/reset effects, and
-memory-query APIs. Terax continues to use its adapted bulk bridge; it does not
-consume the mutable official nightly binary as a drop-in ABI.
+Both artifacts use the exact `main` revision above (141 commits after the
+previous `7ec9e26a` pin). Terax continues to use its adapted bulk bridge; it does
+not consume the mutable official nightly binary as a drop-in ABI. Upstream
+changes that matter to Terax:
 
-The current profile adds one 64 KiB page to the prior pin: 20 blank 120x40 models
-use 10.4375 MiB. The block-enabled stress workload plateaus at 68.1875 MiB for both
-variants. This source update is not claimed as an application CPU or RAM saving.
-The native canvas reuse and row-staging measurements are recorded separately in
-`docs/architecture/ghostty-resource-efficiency.md`.
+- use-after-free when scrollback pruning frees the page holding the cursor
+  (ghostty-org/ghostty#14686), which long-running agent sessions that prune
+  constantly would otherwise hit;
+- grapheme preservation when a widening reflow wraps cells, DECSTR (soft reset)
+  handling, and wide-character selection fixes;
+- DECXCPR (`CSI ? 6 n`, answered `CSI ? row;col;1 R`) and `CSI 19 t`
+  (`CSI 9;rows;cols t`) were added to upstream's device-status and size-report
+  enums. The bridge's exhaustive switches required matching replies in
+  `terax.zig`; no other bridge behavior changed.
+
+Linear memory is unchanged from the previous pin: 20 blank 120x40 models use
+10.4375 MiB, and the block-enabled stress workload plateaus at 68.1875 MiB for
+both variants with zero plateau growth. Artifacts grew by 4,099 (SIMD) and 4,172
+(scalar) bytes. This source update is not claimed as an application CPU or RAM
+saving. Native canvas reuse and row-staging measurements are recorded separately
+in `docs/architecture/ghostty-resource-efficiency.md`.
 
 ## September memory regression gate
 

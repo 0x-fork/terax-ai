@@ -579,6 +579,18 @@ const StreamHandler = struct {
         }
     }
 
+    /// Cursor position for CPR/DECXCPR, relative to the scrolling region when
+    /// origin mode is set.
+    fn cursorReportPos(self: *StreamHandler) struct { x: usize, y: usize } {
+        return if (self.term.modes.get(.origin)) .{
+            .x = self.term.screens.active.cursor.x -| self.term.scrolling_region.left,
+            .y = self.term.screens.active.cursor.y -| self.term.scrolling_region.top,
+        } else .{
+            .x = self.term.screens.active.cursor.x,
+            .y = self.term.screens.active.cursor.y,
+        };
+    }
+
     fn deviceStatusReport(
         self: *StreamHandler,
         req: ghostty.device_status.Request,
@@ -586,16 +598,21 @@ const StreamHandler = struct {
         switch (req) {
             .operating_status => try self.appendOutput("\x1b[0n"),
             .cursor_position => {
-                const pos: struct { x: usize, y: usize } = if (self.term.modes.get(.origin)) .{
-                    .x = self.term.screens.active.cursor.x -| self.term.scrolling_region.left,
-                    .y = self.term.screens.active.cursor.y -| self.term.scrolling_region.top,
-                } else .{
-                    .x = self.term.screens.active.cursor.x,
-                    .y = self.term.screens.active.cursor.y,
-                };
+                const pos = self.cursorReportPos();
 
                 var buf: [64]u8 = undefined;
                 const resp = try std.fmt.bufPrint(&buf, "\x1b[{};{}R", .{
+                    pos.y + 1,
+                    pos.x + 1,
+                });
+                try self.appendOutput(resp);
+            },
+            // DECXCPR: extended cursor position adds a page number, always 1.
+            .cursor_position_extended => {
+                const pos = self.cursorReportPos();
+
+                var buf: [64]u8 = undefined;
+                const resp = try std.fmt.bufPrint(&buf, "\x1b[?{};{};1R", .{
                     pos.y + 1,
                     pos.x + 1,
                 });
@@ -656,6 +673,7 @@ const StreamHandler = struct {
             .csi_14_t => try ghostty.size_report.encode(&writer, .csi_14_t, size),
             .csi_16_t => try ghostty.size_report.encode(&writer, .csi_16_t, size),
             .csi_18_t => try ghostty.size_report.encode(&writer, .csi_18_t, size),
+            .csi_19_t => try ghostty.size_report.encode(&writer, .csi_19_t, size),
             .csi_21_t => unreachable,
         }
         try self.appendOutput(writer.buffered());

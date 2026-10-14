@@ -159,7 +159,7 @@ describe.each([
     });
     it("pins the audited Ghostty and Restty sources", () => {
       expect(ADAPTED_GHOSTTY_COMMIT).toBe(
-        "7ec9e26a29399b30ef78f06985fc75045b3cecb6",
+        "ad97d331459a0762f7aea5f56fe86748e03b860f",
       );
       expect(ADAPTED_RESTTY_COMMIT).toBe(
         "7700b14a7643ba9240818209ef1e0aa90d83ad77",
@@ -304,6 +304,20 @@ describe.each([
             "\x1b]10;rgb:cdcd/d6d6/f4f4\x07" +
             "\x1b]11;rgb:1111/1111/1b1b\x07" +
             "\x1b]12;rgb:f9f9/e2e2/afaf\x07",
+        );
+      } finally {
+        terminal.dispose();
+      }
+    });
+
+    it("answers DECXCPR and screen-size reports", () => {
+      const terminal = ghostty.createTerminal(80, 24);
+      try {
+        terminal.write(
+          new TextEncoder().encode("\x1b[3;5H\x1b[6n\x1b[?6n\x1b[19t"),
+        );
+        expect(new TextDecoder().decode(terminal.drainOutputBytes())).toBe(
+          "\x1b[3;5R\x1b[?3;5;1R\x1b[9;24;80t",
         );
       } finally {
         terminal.dispose();
