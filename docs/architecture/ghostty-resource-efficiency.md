@@ -52,7 +52,8 @@ The implementation:
   scale and clipping. First presentation uses exact dimensions; large reductions
   reclaim excess storage. This avoids allocating a new presentation buffer for
   every adjacent resize step.
-- Builds cells into a reusable row buffer and compares the exact packed values.
+- Ghostty compares every re-encoded cell record word by word and reports only
+  rows that changed; the WebGPU surface uploads those rows and nothing else.
   Unchanged rows neither upload nor trigger presentation. There are no hashes
   that could hide a real change through collisions. Frames that resolve to
   unchanged pixels do not create GPU encoders. Invisible blinking text does not

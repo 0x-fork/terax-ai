@@ -318,7 +318,7 @@ or long-duration stability. Do not use them as application performance claims.
 | Product events | Plain-text URLs and OSC 8 are implemented. Title, bell, and generic notification events remain exposed by the bridge; product routing beyond existing agent notifications is not implemented. |
 | Renderer recovery | Packaged GPU/context loss, recovery exhaustion, font/DPR changes, hidden panes, and sleep/wake; preserve model, PTY, selection, and history |
 | Shell and input parity | Fish/Starship drag resizing, zsh, bash, pwsh, cmd, WSL, IME, dead keys, AltGr, mouse protocols, synchronized output, and agent TUIs |
-| Glyph resources | Cold-glyph eviction under Unicode, emoji, and Nerd Font pressure; verify shared and isolated atlas bounds |
+| Glyph resources | Cold-glyph eviction under Unicode, emoji, and Nerd Font pressure; verify atlas growth, flush and recovery bounds |
 | Scheduling | Per-pane pacing, RAF timestamps, native macOS occlusion, and bounded submissions are implemented; packaged cadence, sleep/wake, resize churn, and other-platform occlusion still need measurements |
 | Transport throughput | Packaged 100 MiB plain and ANSI output with end-to-end parsing completion and fault injection, including final output and ConPTY close |
 | Memory and energy | Attributed host, WebContent, and GPU processes; 1/5/10/20 tabs, hidden streaming, sustained agents, and multi-hour or multi-day timelines |

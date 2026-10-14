@@ -8,8 +8,9 @@ context cannot reset the parser, scrollback, selection, search, or command block
 
 ## Presentation resources
 
-`ghostty/gpu/WebGpuTerminalRuntime.ts` owns the window's device, pipelines, atlas
-leases, and damage scheduler. Each frame uses one encoder/submission for eligible
+`ghostty/gpu/WebGpuTerminalRuntime.ts` owns the window's device, pipelines, glyph
+atlases (one per font and display ratio, shared by every surface that uses it),
+and damage scheduler. Each frame uses one encoder/submission for eligible
 surfaces. Per-pane deadlines bound focused, background-pane, and unfocused-window
 cadences to 60, 30, and 15 fps. At most two submissions await GPU completion.
 
