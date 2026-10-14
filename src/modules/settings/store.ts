@@ -318,7 +318,10 @@ export const DEFAULT_PREFERENCES: Preferences = {
   editorFontSize: EDITOR_FONT_SIZE_DEFAULT,
   customInstructions: "",
   autostart: false,
-  windowVibrancy: true,
+  // Off by default: a translucent window keeps the compositor blending the
+  // whole frame every present. An explicitly stored choice (either value)
+  // always wins; only an absent key falls back to this.
+  windowVibrancy: false,
   restoreWindowState: true,
   autocompleteEnabled: false,
   autocompleteTrigger: "auto",

@@ -684,9 +684,14 @@ async function initializeSessionGeneration(
   mark("modelReadyMs");
   session.model = model;
   session.callbacks.onModel?.(model);
-  await ghosttyBlocks(session.leafId)?.attach(model, () =>
-    session.surface?.requestFrame(),
-  );
+  const blockSession = ghosttyBlocks(session.leafId);
+  if (blockSession) {
+    blockSession.cellHeight = () => session.surface?.cellSize().height ?? 0;
+    // The shell/prompt input switch only depends on the block mode, so it runs
+    // when the mode changes instead of after every PTY chunk.
+    blockSession.modeEffect = () => applyBlockInputMode(session);
+  }
+  await blockSession?.attach(model, () => session.surface?.requestFrame());
   if (!alive()) {
     if (ghosttyBlocks(session.leafId)?.model === model)
       ghosttyBlocks(session.leafId)?.detach();
@@ -798,7 +803,6 @@ async function initializeSessionGeneration(
           mark("firstOutputMs");
           model.write(bytes);
           ghosttyBlocks(session.leafId)?.changed();
-          applyBlockInputMode(session);
         }
       },
       onExit: (code) => {
@@ -905,6 +909,19 @@ function applyBlockInputMode(
   if (session.visible && session.focused) focusSessionSurface(session, surface);
 }
 
+/**
+ * Cell height only: a plain read of cached font metrics. The per-frame block
+ * overlay needs nothing else, and unlike {@link ghosttyBlockGeometry} it forces
+ * no layout.
+ */
+export function ghosttyBlockCellHeight(leafId: number): number {
+  return sessions.get(leafId)?.surface?.cellSize().height ?? 0;
+}
+
+/**
+ * Surface top edge plus cell height. Reads the bounding rect (forces layout),
+ * so it is for one-off pointer hit-testing, never for per-frame work.
+ */
 export function ghosttyBlockGeometry(
   leafId: number,
 ): { top: number; height: number } | null {

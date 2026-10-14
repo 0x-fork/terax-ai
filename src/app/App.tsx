@@ -99,9 +99,12 @@ import {
   writeToSession,
 } from "@/modules/terminal";
 import type { TerminalSearchController } from "@/modules/terminal/search/TerminalSearchController";
+import { bindTerminalWindowFocus } from "@/modules/terminal/ghostty/renderScheduling";
+import { subscribeWindowPresentation } from "@/modules/terminal/ghostty/windowPresentation";
 import {
   ThemeProvider,
   useThemeFileEditing,
+  WindowActivityBridge,
   WindowVibrancyBridge,
 } from "@/modules/theme";
 import { UpdaterDialog } from "@/modules/updater";
@@ -313,6 +316,7 @@ export default function App() {
     sidebarRef,
     sidebarWidthRef,
     sidebarView,
+    sidebarCollapsed,
     initialSidebarCollapsed,
     persistSidebarView,
     persistSidebarCollapsed,
@@ -789,6 +793,9 @@ export default function App() {
     openSourceControl,
     openCommitHistoryTab,
   });
+  const explorerGitDecorations = usePreferencesStore(
+    (s) => s.explorerGitDecorations,
+  );
   const { sourceControl, toggleSourceControl, openGitGraphFromContext } =
     useSourceControlContext({
       activeTab,
@@ -799,13 +806,12 @@ export default function App() {
       launchCwdResolved,
       home,
       sidebarView,
+      sidebarCollapsed,
+      explorerGitDecorations,
       repositoryTarget: sourceControlRepositoryTarget,
       cycleSidebarView,
       openCommitHistoryTab,
     });
-  const explorerGitDecorations = usePreferencesStore(
-    (s) => s.explorerGitDecorations,
-  );
 
   const openPreviewTab = useCallback(
     (url: string) => {
@@ -1458,6 +1464,7 @@ export default function App() {
                           onOpenGitHistory={handleOpenGitHistoryForPath}
                           onAttachToAgent={handleAttachFileToAgent}
                           pathDropTarget={terminalPathDropTarget}
+                          visible={!sidebarCollapsed}
                         />
                       ) : (
                         <SourceControlPanel
@@ -1543,6 +1550,10 @@ export default function App() {
           )}
 
           <WindowVibrancyBridge />
+          <WindowActivityBridge
+            bindFocus={bindTerminalWindowFocus}
+            subscribePresentation={subscribeWindowPresentation}
+          />
 
           <AgentNotificationsBridge
             tabs={tabs}

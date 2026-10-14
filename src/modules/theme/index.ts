@@ -1,6 +1,10 @@
 export { ThemeProvider, useTheme, type Theme } from "./ThemeProvider";
 export { WindowVibrancyBridge } from "./WindowVibrancyBridge";
 export {
+  useWindowInactive,
+  WindowActivityBridge,
+} from "./WindowActivityBridge";
+export {
   resolveTerminalFont,
   type TerminalFont,
 } from "./resolveTerminalFont";

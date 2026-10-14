@@ -41,7 +41,7 @@ import {
   relativePath,
   revealInFinder,
 } from "./lib/contextActions";
-import { fileIconUrl, folderIconUrl } from "./lib/iconResolver";
+import { FileIcon, FolderIcon } from "./FileIcon";
 import { COMPACT_CONTENT, COMPACT_ITEM } from "./lib/menuItemClass";
 import { useExplorerDnd } from "./lib/useExplorerDnd";
 import { useExplorerFileDrop } from "./lib/useExplorerFileDrop";
@@ -72,6 +72,12 @@ type Props = {
   onAttachToAgent?: (path: string) => void;
   pathDropTarget?: TerminalPathDropTarget;
   gitStatus?: GitStatusSnapshot | null;
+  /**
+   * The explorer is on screen (default true). It stays mounted when the sidebar
+   * collapses to keep its tree and selection, but while hidden it holds no fs
+   * watchers or drop listener and does no reloads; showing it resyncs once.
+   */
+  visible?: boolean;
 };
 
 type Row =
@@ -213,6 +219,7 @@ export const FileExplorer = memo(
       onAttachToAgent,
       pathDropTarget,
       gitStatus,
+      visible = true,
     },
     ref,
   ) {
@@ -220,6 +227,7 @@ export const FileExplorer = memo(
       onPathRenamed,
       onPathsDeleted,
       canReplacePath,
+      active: visible,
     });
     const gitDecorations = usePreferencesStore((s) => s.explorerGitDecorations);
     const { lookup: lookupGitStatus } = useGitStatus(
@@ -358,6 +366,7 @@ export const FileExplorer = memo(
 
     const fileDrop = useExplorerFileDrop({
       rootPath,
+      enabled: visible,
       isDir: isDirAt,
       onCopied: tree.refresh,
     });
@@ -614,9 +623,8 @@ export const FileExplorer = memo(
             className="flex flex-1 items-center truncate text-xs font-medium text-foreground/80"
             title={rootPath}
           >
-            <img
-              src={folderIconUrl(basename(rootPath), false)}
-              alt=""
+            <FolderIcon
+              name={basename(rootPath)}
               height={15}
               width={15}
               className="mx-1.5"
@@ -726,15 +734,17 @@ export const FileExplorer = memo(
                     style={{ paddingLeft: 6 }}
                   >
                     <span className="size-3.5 shrink-0" />
-                    <img
-                      src={
-                        pendingAtRoot.kind === "dir"
-                          ? folderIconUrl("", false)
-                          : fileIconUrl("untitled")
-                      }
-                      alt=""
-                      className="size-4 shrink-0 opacity-70"
-                    />
+                    {pendingAtRoot.kind === "dir" ? (
+                      <FolderIcon
+                        name=""
+                        className="size-4 shrink-0 opacity-70"
+                      />
+                    ) : (
+                      <FileIcon
+                        name="untitled"
+                        className="size-4 shrink-0 opacity-70"
+                      />
+                    )}
                     <InlineInput
                       initial=""
                       placeholder={

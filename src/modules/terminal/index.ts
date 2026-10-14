@@ -1,5 +1,6 @@
 export {
   type AgentTabStatus,
+  subscribeAgentSignals,
   tabAgentStatus,
   useAgentActivityStore,
 } from "./lib/agentActivity";
