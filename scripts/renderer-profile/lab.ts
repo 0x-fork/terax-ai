@@ -3,6 +3,7 @@ import { WebGpuTerminalSurface } from "@/modules/terminal/ghostty/gpu/WebGpuTerm
 import { webGpuTerminalRuntimeDiagnostics } from "@/modules/terminal/ghostty/gpu/WebGpuTerminalRuntime";
 import type { GhosttyTerminalModelApi } from "@/modules/terminal/ghostty/GhosttyTerminalModel";
 import type { TerminalGpuTheme } from "@/modules/terminal/ghostty/gpu/terminalVisuals";
+import { runNamedWorkload } from "./workloads";
 declare global {
   interface Window {
     webkit: {
@@ -68,6 +69,11 @@ const metrics = {
     letterSpacing: 0,
     weight: "400",
   },
+  // Device-pixel fields are required by newer renderer revisions and ignored by older ones.
+  scale: devicePixelRatio,
+  deviceCellWidth: Math.round(8 * devicePixelRatio),
+  deviceCellHeight: Math.round(17 * devicePixelRatio),
+  deviceBaseline: Math.round(13 * devicePixelRatio),
   cellWidth: 8,
   cellHeight: 17,
   baseline: 13,
@@ -178,6 +184,19 @@ async function run() {
   await pause(10000);
   report("done");
 }
-run().catch((error) =>
+// The default workload above is unchanged; named workloads live in workloads.ts.
+const workload = new URLSearchParams(location.search).get("workload") ?? "default";
+(workload === "default"
+  ? run()
+  : runNamedWorkload(workload, {
+      core,
+      host,
+      theme,
+      metrics,
+      params: new URLSearchParams(location.search),
+      paneCount,
+      report,
+    })
+).catch((error) =>
   report("error", { error: String(error), stack: error.stack }),
 );
