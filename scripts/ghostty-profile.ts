@@ -12,6 +12,8 @@ it("profiles identical isolated core workloads against optional baseline artifac
   ];
   const results = [];
   const encode = (value: string) => new TextEncoder().encode(value);
+  // TERAX_PROFILE_FORMAT=gpu times the GPU cell-record format instead of SoA.
+  const gpuFormat = process.env.TERAX_PROFILE_FORMAT === "gpu";
   const workloads = {
     row: [encode("\x1b[10;1Hagent frame A"), encode("\x1b[10;1Hagent frame B")],
     scrolling: [encode("agent output: analyzing repository\r\n")],
@@ -45,13 +47,20 @@ it("profiles identical isolated core workloads against optional baseline artifac
             maxScrollbackLines: 10_000,
           });
           try {
+            if (gpuFormat) model.setRenderFormat("gpu");
+            const update = () => {
+              if (!gpuFormat) return model.updateRenderState();
+              const state = model.updateGpuRenderState();
+              model.acknowledgeGpuGlyphs();
+              return state;
+            };
             model.write(encode("initial output\r\n".repeat(40)));
-            model.updateRenderState();
+            update();
             const start = performance.now();
             for (let index = 0; index < 10_000; index++) {
               model.write(fixtures[index % fixtures.length]);
               model.drainEvents();
-              model.updateRenderState();
+              update();
             }
             if (sample > 0) samples.push(performance.now() - start);
           } finally {
@@ -64,6 +73,7 @@ it("profiles identical isolated core workloads against optional baseline artifac
         directory,
         artifact,
         sha256: createHash("sha256").update(bytes).digest("hex"),
+        renderFormat: gpuFormat ? "gpu" : "soa",
         allocations,
         timings,
       });

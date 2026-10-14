@@ -11,10 +11,10 @@ per-terminal frame loop, or per-pane GPU lifecycle.
 - Restty commit: `7700b14a7643ba9240818209ef1e0aa90d83ad77`
 - Zig: `0.16.0`
 - Optimization: `ReleaseFast`, WebAssembly SIMD and scalar variants
-- SIMD artifact size: `738052` bytes
-- Scalar artifact size: `735879` bytes
-- SIMD SHA-256: `c8bc4342c9a08c7ea908ecaa1646ca32bff891204f0684ef58972c62a9fdc55c`
-- Scalar SHA-256: `50b06006674e31eb095e0fac1dff97398fc82f026779137a91a7f6fc0969ecd3`
+- SIMD artifact size: `754648` bytes
+- Scalar artifact size: `752584` bytes
+- SIMD SHA-256: `fe59b66192ed1e2ecaf4e96b23f3d46be9af58a2798d21a90c1f62d7f1c4bc2a`
+- Scalar SHA-256: `af3261061f3b3bb3481d132a9a523d28f73e512eee3f473631fb136100b48ec2`
 
 Terax-specific changes include:
 
@@ -65,6 +65,22 @@ Terax-specific changes include:
 - persistent hyperlink interning by owned buffer offsets, avoiding both repeated
   URI retention on dirty rows and borrowed pointers into recycled terminal pages;
 - direct typed render-state consumption without a per-frame JS cell repack;
+- a per-terminal render format (`restty_set_render_format`): 0 keeps the
+  structure-of-arrays cells for the WebGL fallback, 1 writes GPU cell records
+  and none of the SoA arrays (hyperlink ids, wrap flags and the cursor stay);
+- GPU cell records: 16 bytes per cell in one persistent capacity-managed
+  buffer (`glyph_id | attrs << 24`, then fg, bg and underline RGBA8 with
+  inverse applied and faint as alpha 128), laid out for WGSL `unpack4x8unorm`;
+- exact row dirtiness: rows Ghostty marks dirty but rewrites with identical
+  content are compared word by word and not reported, so Ink-style redraws
+  cost one native compare; stale records (first frame, resize, release, new
+  glyph epoch) report full damage;
+- per-terminal glyph interning (codepoint or grapheme content x bold x italic,
+  dense ids from 1, capped at 16,384 with an epoch reset) delivered as a
+  `[id][style][count][codepoints...]` stream, plus a visible blinking-glyph
+  count so text-blink timers arm only when needed;
+- viewport-independent buffer line reads (`restty_line_cells_*`) for word and
+  line selection, block search and URL detection in either format;
 - extended underline styles and colors, overline, inverse-aware decoration
   colors, text blink, graphemes, and wide-cell state;
 - a raw `.wasm` asset instead of a multi-megabyte JavaScript string literal.
@@ -96,6 +112,10 @@ both variants with zero plateau growth. Artifacts grew by 4,099 (SIMD) and 4,172
 (scalar) bytes. This source update is not claimed as an application CPU or RAM
 saving. Native canvas reuse and row-staging measurements are recorded separately
 in `docs/architecture/ghostty-resource-efficiency.md`.
+
+The GPU cell-record format (`TERAX_SOAK_FORMAT=gpu`, `TERAX_PROFILE_FORMAT=gpu`)
+keeps the blank allocation and plateaus 786,432 bytes lower (67.4375 MiB) with
+zero plateau growth. The format added about 16 KiB to each artifact.
 
 ## September memory regression gate
 

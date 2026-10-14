@@ -12,6 +12,8 @@ import type {
 } from "@/modules/terminal/backend/contracts";
 import type {
   TeraxGhostty,
+  TeraxGhosttyGpuRenderState,
+  TeraxGhosttyRenderBase,
   TeraxGhosttyRenderState,
   TeraxGhosttyTerminal,
 } from "@terax/ghostty-core/adapted";
@@ -30,6 +32,10 @@ import {
 import { SynchronizedOutputPresentationGate } from "./core/SynchronizedOutputPresentationGate";
 import { clearTerminalBufferSequence } from "./core/terminalActions";
 import type {
+  GhosttyGpuFrame,
+  GhosttyGpuFrameOptions,
+  GhosttyGpuGlyph,
+  GhosttyRenderFormat,
   GhosttySearchStatus,
   GhosttySearchViewportSpan,
   GhosttyTerminalModelApi,
@@ -45,6 +51,8 @@ const MAX_SCROLLBACK_BYTES = 64 * 1024 * 1024;
 const APPROXIMATE_BYTES_PER_SCROLLBACK_CELL = 8;
 const NO_DAMAGE: TerminalDamage = { kind: "none" };
 const FULL_DAMAGE: TerminalDamage = { kind: "full" };
+const NO_GLYPHS: readonly GhosttyGpuGlyph[] = Object.freeze([]);
+const NO_RANGES: readonly TerminalRowRange[] = Object.freeze([]);
 
 type BufferLine = {
   readonly cells: string[];
@@ -90,6 +98,10 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
   private onDispose: (() => void) | null;
   private pendingDamage: TerminalDamage = FULL_DAMAGE;
   private renderState: TeraxGhosttyRenderState | null = null;
+  private gpuState: TeraxGhosttyGpuRenderState | null = null;
+  private renderFormatValue: GhosttyRenderFormat = "soa";
+  /** Record changes (GPU format) accumulated across updates since the last frame. */
+  private pendingCellDamage: TerminalDamage = FULL_DAMAGE;
   private renderStateCurrent = false;
   private packedViewport = new Uint8Array(0);
   private packedRenderVersion = -1;
@@ -173,6 +185,7 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
     if (this.presentationResourcesReleased) return;
     this.plainLinks = null;
     this.renderState = null;
+    this.gpuState = null;
     this.directCellReader.clear();
     this.renderStateCurrent = false;
     this.packedViewport = new Uint8Array(0);
@@ -180,6 +193,7 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
     this.terminal.releaseRenderState();
     this.presentationResourcesReleased = true;
     this.pendingDamage = FULL_DAMAGE;
+    this.pendingCellDamage = FULL_DAMAGE;
     this.damageNeedsResolution = false;
   }
 
@@ -188,10 +202,12 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
     this.directCellReader.clear();
     this.terminal.compactRenderState();
     this.renderState = null;
+    this.gpuState = null;
     this.renderStateCurrent = false;
     this.packedViewport = new Uint8Array(0);
     this.packedRenderVersion = -1;
     this.pendingDamage = FULL_DAMAGE;
+    this.pendingCellDamage = FULL_DAMAGE;
     this.damageNeedsResolution = false;
   }
 
@@ -311,6 +327,52 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
     return damage;
   }
 
+  renderFormat(): GhosttyRenderFormat {
+    this.assertLive();
+    return this.renderFormatValue;
+  }
+
+  consumeGpuFrame(options: GhosttyGpuFrameOptions = {}): GhosttyGpuFrame {
+    this.assertLive();
+    const state = this.ensureGpuState();
+
+    const cellDamage = options.resync ? FULL_DAMAGE : this.pendingCellDamage;
+    const damage = options.resync
+      ? FULL_DAMAGE
+      : mergeDamage(this.pendingDamage, cellDamage);
+    this.pendingDamage = NO_DAMAGE;
+    this.pendingCellDamage = NO_DAMAGE;
+    this.damageNeedsResolution = false;
+    this.damageNotificationPending = false;
+
+    // Read the pending window now: `state.newGlyphs` is a snapshot from the
+    // update, which an earlier frame may already have delivered.
+    const pending = options.resync
+      ? this.terminal.gpuGlyphTable()
+      : this.terminal.pendingGpuGlyphs();
+    const newGlyphs = pending.isEmpty ? NO_GLYPHS : pending.toArray();
+    this.terminal.acknowledgeGpuGlyphs();
+
+    const fullDamage = cellDamage.kind === "full";
+    return {
+      rows: state.rows,
+      cols: state.cols,
+      epoch: state.epoch,
+      fullDamage,
+      dirtyRanges: fullDamage
+        ? [{ start: 0, end: state.rows - 1 }]
+        : cellDamage.kind === "rows"
+          ? cellDamage.ranges
+          : NO_RANGES,
+      damage,
+      cells: state.cellsBytes,
+      memory: this.terminal.wasmMemory,
+      blinkingCells: state.blinkingCells,
+      glyphCount: state.glyphCount,
+      newGlyphs,
+    };
+  }
+
   viewport(): PackedTerminalViewport {
     this.assertLive();
     const state = this.ensureRenderState();
@@ -335,7 +397,7 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
 
   cursor(): TerminalCursor {
     this.assertLive();
-    const cursor = this.ensureRenderState().cursor;
+    const cursor = this.ensureCurrentState().cursor;
     return {
       x: cursor.column,
       y: cursor.row,
@@ -366,6 +428,10 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
     ) {
       return "";
     }
+    if (this.renderFormatValue === "gpu") {
+      const line = this.readBufferLine(this.viewportOriginLine() + row);
+      return line.cells[column] ?? "";
+    }
     const state = this.ensureRenderState();
     return this.terminal.graphemeAt(state, row * state.cols + column);
   }
@@ -380,7 +446,7 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
     ) {
       return null;
     }
-    const state = this.ensureRenderState();
+    const state = this.ensureCurrentState();
     const explicit = this.terminal.hyperlinkAt(
       state,
       row * state.cols + column,
@@ -408,12 +474,13 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
         endRow++;
       let text = "";
       const offsets: number[] = [];
+      const lines = this.readBufferLines(origin + startRow, origin + endRow);
       for (let y = startRow; y <= endRow; y++) {
+        const cells = lines.get(origin + y)?.cells;
         for (let x = 0; x < state.cols; x++) {
           offsets.push(text.length);
-          const index = y * state.cols + x;
-          if (state.widths[index] !== 2 && state.widths[index] !== 3)
-            text += this.terminal.graphemeAt(state, index) || " ";
+          // Wide-character spacers read as "" and contribute no text.
+          text += cells?.[x] ?? " ";
         }
       }
       cache = {
@@ -704,6 +771,7 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
     this.replySink = null;
     this.eventSink = null;
     this.renderState = null;
+    this.gpuState = null;
     this.directCellReader.clear();
     this.plainLinks = null;
     this.blockMatch = null;
@@ -740,7 +808,15 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
     }
   }
 
+  /** Render state in whichever format the model currently produces. */
+  private ensureCurrentState(): TeraxGhosttyRenderBase {
+    return this.renderFormatValue === "gpu"
+      ? this.ensureGpuState()
+      : this.ensureRenderState();
+  }
+
   private ensureRenderState(): TeraxGhosttyRenderState {
+    if (this.renderFormatValue !== "soa") this.switchRenderFormat("soa");
     const state = this.renderState;
     if (
       !this.renderStateCurrent ||
@@ -752,10 +828,58 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
       this.renderVersion += 1;
       this.renderStateUpdateCount += 1;
       this.presentationResourcesReleased = false;
+      // Dirty rows describe only the latest update; keep earlier ones that no
+      // frame has consumed yet (for example after a hover forced an update).
+      if (this.damageNeedsResolution) {
+        this.pendingDamage = mergeDamage(
+          this.pendingDamage,
+          damageFromRenderState(this.renderState),
+        );
+      }
     }
     const current = this.renderState;
     if (!current) throw new Error("Ghostty render state is unavailable");
     return current;
+  }
+
+  private ensureGpuState(): TeraxGhosttyGpuRenderState {
+    if (this.renderFormatValue !== "gpu") this.switchRenderFormat("gpu");
+    const state = this.gpuState;
+    if (!this.renderStateCurrent || !state) {
+      const next = this.terminal.updateGpuRenderState();
+      this.gpuState = next;
+      this.renderStateCurrent = true;
+      this.renderVersion += 1;
+      this.renderStateUpdateCount += 1;
+      this.presentationResourcesReleased = false;
+      // Exact dirtiness is per update; accumulate it until a frame consumes it.
+      this.pendingCellDamage = mergeDamage(
+        this.pendingCellDamage,
+        damageFromRenderState(next),
+      );
+      return next;
+    }
+    // Any WASM allocation (another terminal's output, a line read) can grow
+    // the shared memory and detach every earlier view; the records themselves
+    // are intact, so re-read the views without updating.
+    if (state.cellsBytes.buffer !== this.terminal.wasmMemory.buffer) {
+      this.gpuState = this.terminal.readGpuRenderState();
+      return this.gpuState;
+    }
+    return state;
+  }
+
+  private switchRenderFormat(format: GhosttyRenderFormat): void {
+    this.terminal.setRenderFormat(format);
+    this.renderFormatValue = format;
+    this.renderState = null;
+    this.gpuState = null;
+    this.directCellReader.clear();
+    this.renderStateCurrent = false;
+    this.packedViewport = new Uint8Array(0);
+    this.packedRenderVersion = -1;
+    this.pendingDamage = FULL_DAMAGE;
+    this.pendingCellDamage = FULL_DAMAGE;
   }
 
   private invalidateRenderState(): void {
@@ -815,48 +939,16 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
     lastLine: number,
   ): Map<number, BufferLine> {
     const result = new Map<number, BufferLine>();
-    const initialScrollbar = this.terminal.scrollbar();
-    if (initialScrollbar.total === 0 || lastLine < firstLine) return result;
+    const total = this.terminal.scrollbar().total;
+    if (total === 0 || lastLine < firstLine) return result;
 
-    const first = clampInteger(firstLine, 0, initialScrollbar.total - 1);
-    const last = clampInteger(lastLine, first, initialScrollbar.total - 1);
-    const originalOffset = initialScrollbar.offset;
-    const history = Math.max(
-      0,
-      initialScrollbar.total - initialScrollbar.length,
-    );
-    let line = first;
-    try {
-      while (line <= last) {
-        this.terminal.scrollViewportTo(Math.min(line, history));
-        const state = this.terminal.updateRenderState();
-        this.renderStateUpdateCount += 1;
-        this.presentationResourcesReleased = false;
-        if (this.damageNeedsResolution) {
-          this.pendingDamage = mergeDamage(
-            this.pendingDamage,
-            damageFromRenderState(state),
-          );
-        }
-        const viewportOffset = this.terminal.scrollbar().offset;
-        const firstRow = Math.max(0, line - viewportOffset);
-        const lastRow = Math.min(state.rows - 1, last - viewportOffset);
-        if (firstRow > lastRow) break;
-        for (let row = firstRow; row <= lastRow; row += 1) {
-          result.set(
-            viewportOffset + row,
-            snapshotRow(this.terminal, state, row),
-          );
-        }
-        const next = viewportOffset + lastRow + 1;
-        if (next <= line) break;
-        line = next;
-      }
-    } finally {
-      this.terminal.scrollViewportTo(originalOffset);
-      this.scrollPositionValue = scrollPositionFromScrollbar(initialScrollbar);
-      this.scrollPositionCurrent = true;
-      this.invalidateRenderState();
+    const first = clampInteger(firstLine, 0, total - 1);
+    const last = clampInteger(lastLine, first, total - 1);
+    // Decoded straight from the screen: the viewport, the render state and
+    // pending damage are untouched, and no presentation buffers are rebuilt.
+    const lines = this.terminal.readLines(first, last);
+    for (let index = 0; index < lines.length; index += 1) {
+      result.set(first + index, lines[index]);
     }
     return result;
   }
@@ -976,27 +1068,6 @@ class GhosttyRenderCellView implements TerminalCellReader {
   }
 }
 
-function snapshotRow(
-  terminal: TeraxGhosttyTerminal,
-  state: TeraxGhosttyRenderState,
-  row: number,
-): BufferLine {
-  const cells = new Array<string>(state.cols);
-  const rowOffset = row * state.cols;
-  for (let column = 0; column < state.cols; column += 1) {
-    const index = rowOffset + column;
-    if (rendererWidth(state.widths[index]) === 0) {
-      cells[column] = "";
-    } else if (state.graphemeLengths[index] > 0) {
-      cells[column] = terminal.graphemeAt(state, index);
-    } else {
-      const codepoint = state.codepoints[index];
-      cells[column] = codepoint === 0 ? " " : String.fromCodePoint(codepoint);
-    }
-  }
-  return { cells, wrapped: state.rowWrapped[row] !== 0 };
-}
-
 function emptyBufferLine(cols: number): BufferLine {
   return { cells: Array.from({ length: cols }, () => ""), wrapped: false };
 }
@@ -1037,7 +1108,7 @@ function encodePalette(palette: readonly number[]): Uint8Array {
   return colors;
 }
 
-function damageFromRenderState(state: TeraxGhosttyRenderState): TerminalDamage {
+function damageFromRenderState(state: TeraxGhosttyRenderBase): TerminalDamage {
   if (state.fullDamage) return FULL_DAMAGE;
   const ranges: TerminalRowRange[] = [];
   let first = -1;

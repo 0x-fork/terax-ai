@@ -1,6 +1,10 @@
 import type {
+  TeraxGhosttyGpuRenderState,
+  TeraxGhosttyLine,
   TeraxGhosttyLoadOptions,
   TeraxGhosttyKeyEvent,
+  TeraxGhosttyRenderBase,
+  TeraxGhosttyRenderFormat,
   TeraxGhosttyRenderState,
   TeraxGhosttySearchStatus,
   TeraxGhosttySearchViewportSpan,
@@ -12,6 +16,8 @@ import type {
   TypedArrayConstructor,
   ViewCacheEntry,
 } from "./types";
+import { GPU_CELL_BYTES, GPU_CELL_WORDS } from "./gpuCells";
+import { GpuGlyphBatch } from "./gpuGlyphs";
 import { createViewCacheEntry, getCachedView } from "./viewCache";
 import type { GhosttyTerminalEvent } from "../types";
 
@@ -20,10 +26,10 @@ export const ADAPTED_GHOSTTY_COMMIT =
 export const ADAPTED_RESTTY_COMMIT =
   "7700b14a7643ba9240818209ef1e0aa90d83ad77";
 export const ADAPTED_GHOSTTY_WASM_SHA256 =
-  "c8bc4342c9a08c7ea908ecaa1646ca32bff891204f0684ef58972c62a9fdc55c";
+  "fe59b66192ed1e2ecaf4e96b23f3d46be9af58a2798d21a90c1f62d7f1c4bc2a";
 
 export const ADAPTED_GHOSTTY_SCALAR_WASM_SHA256 =
-  "50b06006674e31eb095e0fac1dff97398fc82f026779137a91a7f6fc0969ecd3";
+  "af3261061f3b3bb3481d132a9a523d28f73e512eee3f473631fb136100b48ec2";
 
 let wasmSimdAvailable: boolean | undefined;
 
@@ -55,6 +61,7 @@ const EVENT_HEADER_BYTES = 5;
 const SEARCH_STATUS_BYTES = 16;
 const SEARCH_VIEWPORT_SPAN_BYTES = 8;
 const MAX_EVENT_PAYLOAD_BYTES = 256 * 1024;
+const LINE_CHUNK_LINES = 64;
 
 const requiredExports = [
   "memory",
@@ -144,6 +151,24 @@ const requiredExports = [
   "restty_link_buffer_ptr",
   "restty_link_count",
   "restty_link_buffer_len",
+  "restty_set_render_format",
+  "restty_render_format",
+  "restty_gpu_cell_stride",
+  "restty_gpu_cells_ptr",
+  "restty_gpu_any_dirty",
+  "restty_gpu_epoch",
+  "restty_gpu_blinking_cells",
+  "restty_gpu_glyph_count",
+  "restty_gpu_glyph_overflow",
+  "restty_gpu_new_glyphs_ptr",
+  "restty_gpu_new_glyphs_len",
+  "restty_gpu_glyphs_ack",
+  "restty_gpu_glyphs_ptr",
+  "restty_gpu_glyphs_len",
+  "restty_line_cells_prepare",
+  "restty_line_cells_ptr",
+  "restty_line_cells_len",
+  "restty_line_cells_release",
 ] as const;
 
 const textDecoder = new TextDecoder();
@@ -172,6 +197,10 @@ type RenderViewCache = {
   readonly linkOffsets: ViewCacheEntry<Uint32Array>;
   readonly linkLengths: ViewCacheEntry<Uint32Array>;
   readonly linkBytes: ViewCacheEntry<Uint8Array>;
+  readonly gpuCells: ViewCacheEntry<Uint8Array>;
+  readonly gpuCellWords: ViewCacheEntry<Uint32Array>;
+  readonly gpuNewGlyphs: ViewCacheEntry<Uint32Array>;
+  readonly gpuAllGlyphs: ViewCacheEntry<Uint32Array>;
 };
 
 export class TeraxGhostty {
@@ -247,6 +276,15 @@ export class TeraxGhostty {
     return this.memory.buffer.byteLength;
   }
 
+  /**
+   * The module's linear memory, shared by every terminal of this instance.
+   * `memory.buffer` is replaced (and the old buffer detached) whenever the
+   * module grows; read it again after any call that can allocate.
+   */
+  get wasmMemory(): WebAssembly.Memory {
+    return this.memory;
+  }
+
   private static fromInstance(
     instance: WebAssembly.Instance,
     memoryRef: { current: WebAssembly.Memory | null },
@@ -268,6 +306,7 @@ export class TeraxGhosttyTerminal {
   private inputPointer = 0;
   private inputCapacity = 0;
   private readonly textEncoder = new TextEncoder();
+  private format: TeraxGhosttyRenderFormat = "soa";
   private disposed = false;
 
   constructor(
@@ -362,13 +401,142 @@ export class TeraxGhosttyTerminal {
     );
   }
 
+  /** The linear memory this terminal lives in (see `TeraxGhostty.wasmMemory`). */
+  get wasmMemory(): WebAssembly.Memory {
+    return this.memory;
+  }
+
+  /** The cell format written by the next update. New terminals use `"soa"`. */
+  get renderFormat(): TeraxGhosttyRenderFormat {
+    return this.format;
+  }
+
+  /**
+   * Selects the per-cell format. Switching releases the previous format's
+   * buffers, invalidates every borrowed view and forces full damage on the
+   * next update (and a new glyph epoch when leaving the GPU format).
+   */
+  setRenderFormat(format: TeraxGhosttyRenderFormat): void {
+    this.assertLive();
+    if (format === this.format) return;
+    checkResult(
+      this.exports.restty_set_render_format(
+        this.handle,
+        format === "gpu" ? 1 : 0,
+      ),
+      "set render format",
+    );
+    this.format = format;
+  }
+
   updateRenderState(): TeraxGhosttyRenderState {
     this.assertLive();
+    this.assertFormat("soa", "updateRenderState");
     checkResult(
       this.exports.restty_render_update(this.handle),
       "update render state",
     );
     return this.readRenderState();
+  }
+
+  /**
+   * Updates the render state in the GPU format: one 16-byte record per cell
+   * (see `gpuCells.ts`), exact per-row dirtiness and interned glyph ids. The
+   * terminal must be in the `"gpu"` format (`setRenderFormat`).
+   */
+  updateGpuRenderState(): TeraxGhosttyGpuRenderState {
+    this.assertLive();
+    this.assertFormat("gpu", "updateGpuRenderState");
+    checkResult(
+      this.exports.restty_render_update(this.handle),
+      "update GPU render state",
+    );
+    return this.readGpuRenderState();
+  }
+
+  /**
+   * Glyphs interned since the last `acknowledgeGpuGlyphs()`, read now (the
+   * `newGlyphs` of an earlier state is a snapshot taken at its update).
+   * Borrowed; valid until the next call that can allocate.
+   */
+  pendingGpuGlyphs(): GpuGlyphBatch {
+    this.assertLive();
+    return new GpuGlyphBatch(
+      this.optionalView(
+        this.cache.gpuNewGlyphs,
+        this.exports.restty_gpu_new_glyphs_ptr(this.handle),
+        this.exports.restty_gpu_new_glyphs_len(this.handle),
+        Uint32Array,
+        emptyUint32,
+      ),
+    );
+  }
+
+  /** Marks every glyph delivered by `newGlyphs` so far as consumed. */
+  acknowledgeGpuGlyphs(): void {
+    this.assertLive();
+    this.exports.restty_gpu_glyphs_ack(this.handle);
+  }
+
+  /**
+   * The complete glyph table of the current epoch, for rebuilding an id map
+   * (for example after a renderer is attached to an already-running terminal).
+   * Borrowed; valid until the next call that can allocate.
+   */
+  gpuGlyphTable(): GpuGlyphBatch {
+    this.assertLive();
+    const length = this.exports.restty_gpu_glyphs_len(this.handle);
+    return new GpuGlyphBatch(
+      this.optionalView(
+        this.cache.gpuAllGlyphs,
+        this.exports.restty_gpu_glyphs_ptr(this.handle),
+        length,
+        Uint32Array,
+        emptyUint32,
+      ),
+    );
+  }
+
+  /**
+   * Reads buffer lines `firstLine..lastLine` (absolute, scrollback included)
+   * straight from the screen: the viewport and the render state are left
+   * untouched, in either render format. Lines past the end are omitted.
+   */
+  readLines(firstLine: number, lastLine: number): TeraxGhosttyLine[] {
+    this.assertLive();
+    if (
+      !Number.isSafeInteger(firstLine) ||
+      !Number.isSafeInteger(lastLine) ||
+      firstLine < 0 ||
+      lastLine < firstLine
+    ) {
+      return [];
+    }
+    const cols = this.cols;
+    const lines: TeraxGhosttyLine[] = [];
+    const total = this.scrollbar().total;
+    const last = Math.min(lastLine, total - 1);
+    for (let first = firstLine; first <= last; first += LINE_CHUNK_LINES) {
+      const chunkLast = Math.min(last, first + LINE_CHUNK_LINES - 1);
+      checkResult(
+        this.exports.restty_line_cells_prepare(this.handle, first, chunkLast),
+        "read buffer lines",
+      );
+      const length = this.exports.restty_line_cells_len(this.handle);
+      try {
+        if (length === 0) continue;
+        const pointer = this.exports.restty_line_cells_ptr(this.handle);
+        validateRange(this.memory.buffer, pointer, length * 4);
+        decodeLines(
+          new Uint32Array(this.memory.buffer, pointer, length),
+          cols,
+          lines,
+        );
+      } finally {
+        this.exports.restty_line_cells_release(this.handle);
+      }
+    }
+    return lines;
   }
 
   releaseRenderState(): void {
@@ -390,6 +558,9 @@ export class TeraxGhosttyTerminal {
       cellCapacity: this.exports.restty_cell_capacity(this.handle),
       rowCapacity: this.exports.restty_row_capacity(this.handle),
       renderStateResets: this.exports.restty_render_reset_count(this.handle),
+      renderFormat: this.format,
+      glyphCount: this.exports.restty_gpu_glyph_count(this.handle),
+      glyphEpoch: this.exports.restty_gpu_epoch(this.handle),
     };
   }
 
@@ -829,7 +1000,7 @@ export class TeraxGhosttyTerminal {
   }
 
   hyperlinkAt(
-    state: TeraxGhosttyRenderState,
+    state: TeraxGhosttyRenderBase,
     cellIndex: number,
   ): string | null {
     const linkId = state.linkIds[validateCellIndex(state, cellIndex)];
@@ -1011,6 +1182,112 @@ export class TeraxGhosttyTerminal {
     };
   }
 
+  /**
+   * Re-reads the GPU render state of the last update without updating. Use it
+   * to refresh borrowed views after another terminal grew the shared WASM
+   * memory (which detaches every earlier `ArrayBuffer`).
+   */
+  readGpuRenderState(): TeraxGhosttyGpuRenderState {
+    this.assertLive();
+    this.assertFormat("gpu", "readGpuRenderState");
+    const rows = this.exports.restty_rows(this.handle);
+    const cols = this.exports.restty_cols(this.handle);
+    validateDimensions(cols, rows);
+    const cellCount = rows * cols;
+    const buffer = this.memory.buffer;
+    const linkCount = this.exports.restty_link_count(this.handle);
+    const linkBytesLength = this.exports.restty_link_buffer_len(this.handle);
+    const cursorPointer = this.exports.restty_cursor_info_ptr(this.handle);
+    validateRange(buffer, cursorPointer, CURSOR_BYTES);
+    const cursorView = new DataView(buffer, cursorPointer, CURSOR_BYTES);
+    const cellsPtr = this.exports.restty_gpu_cells_ptr(this.handle);
+
+    return {
+      rows,
+      cols,
+      cellCount,
+      epoch: this.exports.restty_gpu_epoch(this.handle),
+      anyDirty: this.exports.restty_gpu_any_dirty(this.handle) !== 0,
+      cellsPtr,
+      cellsBytes: this.view(
+        this.cache.gpuCells,
+        cellsPtr,
+        cellCount * GPU_CELL_BYTES,
+        Uint8Array,
+      ),
+      cellWords: this.view(
+        this.cache.gpuCellWords,
+        cellsPtr,
+        cellCount * GPU_CELL_WORDS,
+        Uint32Array,
+      ),
+      blinkingCells: this.exports.restty_gpu_blinking_cells(this.handle),
+      glyphCount: this.exports.restty_gpu_glyph_count(this.handle),
+      glyphOverflow: this.exports.restty_gpu_glyph_overflow(this.handle),
+      newGlyphs: this.pendingGpuGlyphs(),
+      linkIds: this.view(
+        this.cache.linkIds,
+        this.exports.restty_cell_link_ids_ptr(this.handle),
+        cellCount,
+        Uint32Array,
+      ),
+      rowWrapped: this.view(
+        this.cache.rowWrapped,
+        this.exports.restty_row_wrapped_ptr(this.handle),
+        rows,
+        Uint8Array,
+      ),
+      dirtyRows: this.view(
+        this.cache.dirtyRows,
+        this.exports.restty_row_dirty_ptr(this.handle),
+        rows,
+        Uint8Array,
+      ),
+      fullDamage: this.exports.restty_damage_full(this.handle) !== 0,
+      linkOffsets: this.optionalView(
+        this.cache.linkOffsets,
+        this.exports.restty_link_offsets_ptr(this.handle),
+        linkCount,
+        Uint32Array,
+        emptyUint32,
+      ),
+      linkLengths: this.optionalView(
+        this.cache.linkLengths,
+        this.exports.restty_link_lengths_ptr(this.handle),
+        linkCount,
+        Uint32Array,
+        emptyUint32,
+      ),
+      linkBytes: this.optionalView(
+        this.cache.linkBytes,
+        this.exports.restty_link_buffer_ptr(this.handle),
+        linkBytesLength,
+        Uint8Array,
+        emptyBytes,
+      ),
+      cursor: {
+        row: cursorView.getUint16(0, true),
+        column: cursorView.getUint16(2, true),
+        visible: cursorView.getUint8(4) !== 0,
+        style: decodeCursorStyle(cursorView.getUint8(5)),
+        blinking: cursorView.getUint8(6) !== 0,
+        wideTail: cursorView.getUint8(7) !== 0,
+        colorRgba: cursorView.getUint32(8, true),
+      },
+    };
+  }
+
+  private assertFormat(
+    expected: TeraxGhosttyRenderFormat,
+    operation: string,
+  ): void {
+    if (this.format !== expected) {
+      throw new Error(
+        `Adapted Ghostty ${operation} requires the "${expected}" render format (current: "${this.format}")`,
+      );
+    }
+  }
+
   private view<T extends TypedArray>(
     entry: ViewCacheEntry<T>,
     pointer: number,
@@ -1109,6 +1386,10 @@ function createRenderViewCache(): RenderViewCache {
     linkOffsets: createViewCacheEntry(),
     linkLengths: createViewCacheEntry(),
     linkBytes: createViewCacheEntry(),
+    gpuCells: createViewCacheEntry(),
+    gpuCellWords: createViewCacheEntry(),
+    gpuNewGlyphs: createViewCacheEntry(),
+    gpuAllGlyphs: createViewCacheEntry(),
   };
 }
 
@@ -1182,7 +1463,7 @@ function decodeCursorStyle(value: number): "block" | "underline" | "bar" {
 }
 
 function validateCellIndex(
-  state: TeraxGhosttyRenderState,
+  state: TeraxGhosttyRenderBase,
   cellIndex: number,
 ): number {
   if (
@@ -1193,6 +1474,38 @@ function validateCellIndex(
     throw new RangeError(`Invalid Ghostty cell index: ${cellIndex}`);
   }
   return cellIndex;
+}
+
+function decodeLines(
+  words: Uint32Array,
+  cols: number,
+  into: TeraxGhosttyLine[],
+): void {
+  let index = 0;
+  while (index < words.length) {
+    const wrapped = words[index++] !== 0;
+    const cells = new Array<string>(cols);
+    for (let column = 0; column < cols; column += 1) {
+      if (index >= words.length) {
+        throw new RangeError("Truncated Ghostty line cell data");
+      }
+      const count = words[index++];
+      if (index + count > words.length) {
+        throw new RangeError("Invalid Ghostty line cell data");
+      }
+      if (count === 0) {
+        cells[column] = "";
+      } else if (count === 1) {
+        cells[column] = String.fromCodePoint(words[index]);
+      } else {
+        cells[column] = String.fromCodePoint(
+          ...words.subarray(index, index + count),
+        );
+      }
+      index += count;
+    }
+    into.push({ cells, wrapped });
+  }
 }
 
 function decodeTerminalEvent(
