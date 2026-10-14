@@ -10,24 +10,29 @@ import {
   terminalWindowFocused,
 } from "../renderScheduling";
 import { GlyphAtlas } from "./GlyphAtlas";
+import type { RasterBudget } from "./GlyphMap";
 import { WebGpuCanvasPool } from "@/modules/terminal/ghostty/gpu/WebGpuCanvasPool";
-import { COLOR_SHADER, GLYPH_SHADER } from "./shaders";
+import { BACKGROUND_SHADER, GLYPH_SHADER } from "./shaders";
 import type { TerminalFontMetrics } from "./terminalVisuals";
-import { CELL_INSTANCE_BYTES, PACKED_INSTANCE_BYTES } from "./WebGpuCellBuffer";
 
 const MAX_ATLAS_COUNT = 8;
 const MAX_WARM_UNUSED_ATLASES = 1;
 const ATLAS_IDLE_TTL_MS = 30_000;
 const MAX_IN_FLIGHT_FRAMES = 2;
+/** Glyph rasterization allowed per frame across all surfaces. */
+export const RASTER_BUDGET_MS = 2;
+/** Larger allowance for a surface's first frame, so text appears whole. */
+export const FIRST_FRAME_RASTER_BUDGET_MS = 8;
+const ATLAS_FLUSH_COOLDOWN_MS = 250;
 
 export type WebGpuSharedResources = {
   readonly device: GPUDevice;
   readonly format: GPUTextureFormat;
-  readonly colorPipeline: GPURenderPipeline;
+  readonly backgroundPipeline: GPURenderPipeline;
   readonly glyphPipeline: GPURenderPipeline;
-  readonly colorBindGroupLayout: GPUBindGroupLayout;
-  readonly glyphBindGroupLayout: GPUBindGroupLayout;
-  readonly glyphSampler: GPUSampler;
+  readonly bindGroupLayout: GPUBindGroupLayout;
+  /** Stands in for the search mask while no search is active. */
+  readonly emptyStorage: GPUBuffer;
   readonly generation: number;
 };
 
@@ -36,6 +41,7 @@ export interface WebGpuRuntimeSurface {
   renderFrame(
     getEncoder: () => GPUCommandEncoder,
     resources: WebGpuSharedResources,
+    budget?: RasterBudget,
   ): boolean;
   handleRuntimeReset(resources: WebGpuSharedResources): void;
   handleRuntimeError(error: Error): void;
@@ -45,19 +51,22 @@ export interface WebGpuRuntimeSurface {
 
 type AtlasEntry = {
   readonly key: string;
-  readonly metrics: TerminalFontMetrics;
-  readonly scale: number;
-  readonly isolated: boolean;
   readonly users: Set<WebGpuRuntimeSurface>;
-  atlas: GlyphAtlas;
+  readonly atlas: GlyphAtlas;
   references: number;
   lastUsed: number;
+  flushRequested: boolean;
+  lastFlush: number;
 };
 
 export type GlyphAtlasLease = {
   readonly key: string;
   readonly atlas: GlyphAtlas;
-  readonly isolated: boolean;
+  /**
+   * The atlas is full at its largest size. The runtime flushes it before the
+   * next frame; every user then re-rasterizes the glyphs it shows.
+   */
+  requestFlush(): void;
   release(): void;
 };
 
@@ -72,8 +81,8 @@ export type WebGpuRuntimeStats = {
   readonly atlasUploads: number;
   readonly atlasUploadedBytes: number;
   readonly unusedAtlasCount: number;
-  readonly isolatedAtlasCount: number;
-  readonly atlasResets: number;
+  readonly atlasFlushes: number;
+  readonly atlasGrowths: number;
   readonly atlasCapacityFailures: number;
   readonly submittedFrames: number;
   readonly deviceRecoveries: number;
@@ -97,11 +106,10 @@ export class WebGpuTerminalRuntime {
   private readonly atlases = new Map<string, AtlasEntry>();
   private device: GPUDevice | null = null;
   private format: GPUTextureFormat = "bgra8unorm";
-  private colorPipeline: GPURenderPipeline | null = null;
+  private backgroundPipeline: GPURenderPipeline | null = null;
   private glyphPipeline: GPURenderPipeline | null = null;
-  private colorBindGroupLayout: GPUBindGroupLayout | null = null;
-  private glyphBindGroupLayout: GPUBindGroupLayout | null = null;
-  private glyphSampler: GPUSampler | null = null;
+  private bindGroupLayout: GPUBindGroupLayout | null = null;
+  private emptyStorage: GPUBuffer | null = null;
   private animationFrame: number | null = null;
   private frameTimer: ReturnType<typeof setTimeout> | null = null;
   private atlasReapDeferred = false;
@@ -180,30 +188,10 @@ export class WebGpuTerminalRuntime {
 
   acquireGlyphAtlas(
     metrics: TerminalFontMetrics,
-    scale: number,
-    user?: WebGpuRuntimeSurface,
-  ): GlyphAtlasLease {
-    return this.acquireAtlas(metrics, scale, null, user);
-  }
-
-  acquireIsolatedGlyphAtlas(
-    metrics: TerminalFontMetrics,
-    scale: number,
-    ownerKey: string,
-    user?: WebGpuRuntimeSurface,
-  ): GlyphAtlasLease {
-    return this.acquireAtlas(metrics, scale, ownerKey, user);
-  }
-
-  private acquireAtlas(
-    metrics: TerminalFontMetrics,
-    scale: number,
-    ownerKey: string | null,
     user?: WebGpuRuntimeSurface,
   ): GlyphAtlasLease {
     this.assertLive();
-    const baseKey = fontAtlasKey(metrics, scale);
-    const key = ownerKey === null ? baseKey : `${baseKey}|owner:${ownerKey}`;
+    const key = fontAtlasKey(metrics);
     let entry = this.atlases.get(key);
     if (!entry) {
       this.evictUnusedAtlas();
@@ -212,38 +200,48 @@ export class WebGpuTerminalRuntime {
           `Terminal glyph atlas budget exhausted (${MAX_ATLAS_COUNT} active atlases)`,
         );
       }
-      const users = new Set<WebGpuRuntimeSurface>();
       entry = {
         key,
-        metrics,
-        scale,
-        isolated: ownerKey !== null,
-        users,
-        atlas: this.createAtlas(metrics, scale, users),
+        users: new Set<WebGpuRuntimeSurface>(),
+        atlas: new GlyphAtlas(this.resources().device, metrics),
         references: 0,
         lastUsed: performance.now(),
+        flushRequested: false,
+        lastFlush: Number.NEGATIVE_INFINITY,
       };
       this.atlases.set(key, entry);
     }
-    entry.atlas.resume(this.resources().device);
-    entry.references += 1;
-    if (user) entry.users.add(user);
-    entry.lastUsed = performance.now();
+    const owned = entry;
+    owned.atlas.resume(this.resources().device);
+    owned.references += 1;
+    if (user) owned.users.add(user);
+    owned.lastUsed = performance.now();
     this.scheduleAtlasReap();
 
     let released = false;
     return {
       key,
-      isolated: entry.isolated,
-      get atlas() {
-        return entry.atlas;
+      atlas: owned.atlas,
+      requestFlush: () => {
+        if (released || owned.flushRequested) return;
+        owned.flushRequested = true;
+        const wait =
+          owned.lastFlush + ATLAS_FLUSH_COOLDOWN_MS - performance.now();
+        if (wait <= 0) {
+          for (const surface of owned.users) this.schedule(surface);
+          return;
+        }
+        // A working set larger than the atlas must not flush every frame.
+        setTimeout(() => {
+          for (const surface of owned.users) this.schedule(surface);
+        }, wait);
       },
       release: () => {
         if (released) return;
         released = true;
-        entry.references = Math.max(0, entry.references - 1);
-        if (user) entry.users.delete(user);
-        entry.lastUsed = performance.now();
+        owned.references = Math.max(0, owned.references - 1);
+        if (user) owned.users.delete(user);
+        owned.lastUsed = performance.now();
         this.scheduleAtlasReap();
       },
     };
@@ -253,22 +251,20 @@ export class WebGpuTerminalRuntime {
     this.assertLive();
     if (
       !this.device ||
-      !this.colorPipeline ||
+      !this.backgroundPipeline ||
       !this.glyphPipeline ||
-      !this.colorBindGroupLayout ||
-      !this.glyphBindGroupLayout ||
-      !this.glyphSampler
+      !this.bindGroupLayout ||
+      !this.emptyStorage
     ) {
       throw new Error("WebGPU terminal runtime is not ready");
     }
     return {
       device: this.device,
       format: this.format,
-      colorPipeline: this.colorPipeline,
+      backgroundPipeline: this.backgroundPipeline,
       glyphPipeline: this.glyphPipeline,
-      colorBindGroupLayout: this.colorBindGroupLayout,
-      glyphBindGroupLayout: this.glyphBindGroupLayout,
-      glyphSampler: this.glyphSampler,
+      bindGroupLayout: this.bindGroupLayout,
+      emptyStorage: this.emptyStorage,
       generation: this.generation,
     };
   }
@@ -280,8 +276,8 @@ export class WebGpuTerminalRuntime {
     let atlasUploads = 0;
     let atlasUploadedBytes = 0;
     let unusedAtlasCount = 0;
-    let isolatedAtlasCount = 0;
-    let atlasResets = 0;
+    let atlasFlushes = 0;
+    let atlasGrowths = 0;
     let atlasCapacityFailures = 0;
     let stagingBytes = 0;
     for (const entry of this.atlases.values()) {
@@ -290,11 +286,11 @@ export class WebGpuTerminalRuntime {
       glyphCount += entry.atlas.glyphCount;
       atlasUploads += entry.atlas.uploadCount;
       atlasUploadedBytes += entry.atlas.uploadedBytes;
-      atlasResets += entry.atlas.resetCount;
+      atlasFlushes += entry.atlas.flushCount;
+      atlasGrowths += entry.atlas.growthCount;
       atlasCapacityFailures += entry.atlas.capacityFailureCount;
-      stagingBytes += entry.atlas.stagingBytes;
+      stagingBytes += entry.atlas.retiredBytes;
       if (entry.references === 0) unusedAtlasCount += 1;
-      if (entry.isolated) isolatedAtlasCount += 1;
     }
     return {
       canvases: this.canvasPool.diagnostics(),
@@ -307,8 +303,8 @@ export class WebGpuTerminalRuntime {
       atlasUploads,
       atlasUploadedBytes,
       unusedAtlasCount,
-      isolatedAtlasCount,
-      atlasResets,
+      atlasFlushes,
+      atlasGrowths,
       atlasCapacityFailures,
       submittedFrames: this.submittedFrames,
       inFlightFrames: this.inFlightFrames,
@@ -430,6 +426,10 @@ export class WebGpuTerminalRuntime {
           label: "Terax terminal window frame",
         }));
       let rendered = false;
+      // Flushes happen before any surface encodes, so no draw in this frame
+      // can read indices that a later flush would invalidate.
+      this.applyAtlasFlushes();
+      const budget = createRasterBudget(RASTER_BUDGET_MS);
 
       for (const surface of batch) {
         if (!this.surfaces.has(surface)) continue;
@@ -438,7 +438,7 @@ export class WebGpuTerminalRuntime {
           continue;
         }
         try {
-          if (surface.renderFrame(getEncoder, resources)) {
+          if (surface.renderFrame(getEncoder, resources, budget)) {
             this.pacer.presented(surface, frameAt);
             rendered = true;
           }
@@ -447,10 +447,8 @@ export class WebGpuTerminalRuntime {
         }
       }
 
-      let uploads = false;
-      for (const entry of this.atlases.values())
-        uploads ||= entry.atlas.hasEncodedUploads;
-      if (frame.encoder && (rendered || uploads)) {
+      let completion: Promise<unknown> | null = null;
+      if (frame.encoder && rendered) {
         resources.device.queue.submit([frame.encoder.finish()]);
         this.inFlightFrames += 1;
         this.peakInFlightFrames = Math.max(
@@ -458,11 +456,7 @@ export class WebGpuTerminalRuntime {
           this.inFlightFrames,
         );
         const generation = this.generation;
-        const completion = resources.device.queue.onSubmittedWorkDone();
-        for (const entry of this.atlases.values()) {
-          if (!entry.atlas.hasEncodedUploads) continue;
-          entry.atlas.completeSubmission(completion);
-        }
+        completion = resources.device.queue.onSubmittedWorkDone();
         void completion.then(
           () => {
             if (this.disposed || generation !== this.generation) return;
@@ -481,6 +475,11 @@ export class WebGpuTerminalRuntime {
         );
         this.submittedFrames += 1;
       }
+      // Anything an atlas replaced this frame may still be named by commands
+      // just submitted; without a submission nothing can reference it.
+      for (const entry of this.atlases.values()) {
+        entry.atlas.releaseRetired(completion);
+      }
     } catch (error) {
       this.disable(toError(error));
     }
@@ -490,6 +489,18 @@ export class WebGpuTerminalRuntime {
       this.scheduleAtlasReap();
     }
     this.requestFrame();
+  }
+
+  private applyAtlasFlushes(): void {
+    const now = performance.now();
+    for (const entry of this.atlases.values()) {
+      if (!entry.flushRequested || !entry.atlas.active) continue;
+      if (now < entry.lastFlush + ATLAS_FLUSH_COOLDOWN_MS) continue;
+      entry.flushRequested = false;
+      entry.lastFlush = now;
+      entry.atlas.flush();
+      for (const surface of entry.users) this.dirtySurfaces.add(surface);
+    }
   }
 
   private hasFocusedSurface(): boolean {
@@ -562,110 +573,87 @@ export class WebGpuTerminalRuntime {
     device: GPUDevice,
     format: GPUTextureFormat,
   ): Promise<void> {
-    this.colorBindGroupLayout = device.createBindGroupLayout({
-      label: "Terax terminal color bindings",
+    const visibility = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
+    const storage = (binding: number): GPUBindGroupLayoutEntry => ({
+      binding,
+      visibility,
+      buffer: { type: "read-only-storage" },
+    });
+    const atlasTexture = (binding: number): GPUBindGroupLayoutEntry => ({
+      binding,
+      visibility: GPUShaderStage.FRAGMENT,
+      texture: { sampleType: "unfilterable-float" },
+    });
+    this.bindGroupLayout = device.createBindGroupLayout({
+      label: "Terax terminal bindings",
       entries: [
-        {
-          binding: 0,
-          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-          buffer: { type: "uniform" },
-        },
+        { binding: 0, visibility, buffer: { type: "uniform" } },
+        storage(1),
+        storage(2),
+        storage(3),
+        storage(4),
+        atlasTexture(5),
+        atlasTexture(6),
       ],
     });
-    this.glyphBindGroupLayout = device.createBindGroupLayout({
-      label: "Terax terminal glyph bindings",
-      entries: [
-        {
-          binding: 0,
-          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-          buffer: { type: "uniform" },
-        },
-        {
-          binding: 1,
-          visibility: GPUShaderStage.FRAGMENT,
-          texture: { sampleType: "float" },
-        },
-        {
-          binding: 2,
-          visibility: GPUShaderStage.FRAGMENT,
-          texture: { sampleType: "float" },
-        },
-        {
-          binding: 3,
-          visibility: GPUShaderStage.FRAGMENT,
-          sampler: { type: "filtering" },
-        },
-      ],
+    const layout = device.createPipelineLayout({
+      bindGroupLayouts: [this.bindGroupLayout],
     });
 
-    const colorModule = device.createShaderModule({
-      label: "Terax terminal color shader",
-      code: COLOR_SHADER,
+    const backgroundModule = device.createShaderModule({
+      label: "Terax terminal background shader",
+      code: BACKGROUND_SHADER,
     });
     const glyphModule = device.createShaderModule({
       label: "Terax terminal glyph shader",
       code: GLYPH_SHADER,
     });
-    const colorPipelineDescriptor: GPURenderPipelineDescriptor = {
-      label: "Terax terminal color pipeline",
-      layout: device.createPipelineLayout({
-        bindGroupLayouts: [this.colorBindGroupLayout],
+    const [backgroundPipeline, glyphPipeline] = await Promise.all([
+      device.createRenderPipelineAsync({
+        label: "Terax terminal background pipeline",
+        layout,
+        vertex: { module: backgroundModule, entryPoint: "vertex_main" },
+        fragment: {
+          module: backgroundModule,
+          entryPoint: "fragment_main",
+          targets: [{ format }],
+        },
+        primitive: { topology: "triangle-list" },
       }),
-      vertex: {
-        module: colorModule,
-        entryPoint: "vertex_main",
-        buffers: [colorVertexLayout()],
-      },
-      fragment: {
-        module: colorModule,
-        entryPoint: "fragment_main",
-        targets: [{ format }],
-      },
-      primitive: { topology: "triangle-list" },
-    };
-    const glyphPipelineDescriptor: GPURenderPipelineDescriptor = {
-      label: "Terax terminal glyph pipeline",
-      layout: device.createPipelineLayout({
-        bindGroupLayouts: [this.glyphBindGroupLayout],
-      }),
-      vertex: {
-        module: glyphModule,
-        entryPoint: "vertex_main",
-        buffers: [glyphVertexLayout()],
-      },
-      fragment: {
-        module: glyphModule,
-        entryPoint: "fragment_main",
-        targets: [
-          {
-            format,
-            blend: {
-              color: {
-                srcFactor: "src-alpha",
-                dstFactor: "one-minus-src-alpha",
-              },
-              alpha: {
-                srcFactor: "one",
-                dstFactor: "one-minus-src-alpha",
+      device.createRenderPipelineAsync({
+        label: "Terax terminal glyph pipeline",
+        layout,
+        vertex: { module: glyphModule, entryPoint: "vertex_main" },
+        fragment: {
+          module: glyphModule,
+          entryPoint: "fragment_main",
+          targets: [
+            {
+              format,
+              blend: {
+                color: {
+                  srcFactor: "src-alpha",
+                  dstFactor: "one-minus-src-alpha",
+                },
+                alpha: {
+                  srcFactor: "one",
+                  dstFactor: "one-minus-src-alpha",
+                },
               },
             },
-          },
-        ],
-      },
-      primitive: { topology: "triangle-list" },
-    };
-    const [colorPipeline, glyphPipeline] = await Promise.all([
-      device.createRenderPipelineAsync(colorPipelineDescriptor),
-      device.createRenderPipelineAsync(glyphPipelineDescriptor),
+          ],
+        },
+        primitive: { topology: "triangle-list" },
+      }),
     ]);
     this.assertLive();
     this.assertHealthy();
-    this.colorPipeline = colorPipeline;
+    this.backgroundPipeline = backgroundPipeline;
     this.glyphPipeline = glyphPipeline;
-    this.glyphSampler = device.createSampler({
-      label: "Terax terminal glyph sampler",
-      minFilter: "linear",
-      magFilter: "linear",
+    this.emptyStorage = device.createBuffer({
+      label: "Terax terminal empty storage",
+      size: 16,
+      usage: GPUBufferUsage.STORAGE,
     });
   }
 
@@ -706,22 +694,11 @@ export class WebGpuTerminalRuntime {
     return this.recovering;
   }
 
-  private createAtlas(
-    metrics: TerminalFontMetrics,
-    scale: number,
-    users: ReadonlySet<WebGpuRuntimeSurface>,
-  ): GlyphAtlas {
-    const device = this.resources().device;
-    return new GlyphAtlas(device, metrics, scale, () => {
-      for (const surface of users) this.schedule(surface);
-    });
-  }
-
   private evictUnusedAtlas(): void {
     if (this.atlases.size < MAX_ATLAS_COUNT) return;
     let oldest: AtlasEntry | null = null;
     for (const entry of this.atlases.values()) {
-      if (entry.references > 0 || entry.atlas.hasEncodedUploads) continue;
+      if (entry.references > 0 || entry.atlas.hasRetired) continue;
       if (!oldest || entry.lastUsed < oldest.lastUsed) oldest = entry;
     }
     if (!oldest) return;
@@ -738,7 +715,7 @@ export class WebGpuTerminalRuntime {
       .filter((entry) => entry.references === 0)
       .sort((left, right) => right.lastUsed - left.lastUsed);
     for (const entry of unused.slice(MAX_WARM_UNUSED_ATLASES)) {
-      if (entry.atlas.hasEncodedUploads) {
+      if (entry.atlas.hasRetired) {
         this.atlasReapDeferred = true;
         continue;
       }
@@ -748,7 +725,7 @@ export class WebGpuTerminalRuntime {
 
     const warm = unused[0];
     if (!warm || !this.atlases.has(warm.key)) return;
-    if (warm.atlas.hasEncodedUploads) {
+    if (warm.atlas.hasRetired) {
       this.atlasReapDeferred = true;
       return;
     }
@@ -767,7 +744,7 @@ export class WebGpuTerminalRuntime {
     const now = performance.now();
     for (const entry of this.atlases.values()) {
       if (entry.references === 0 && now - entry.lastUsed >= ATLAS_IDLE_TTL_MS) {
-        if (entry.atlas.hasEncodedUploads) {
+        if (entry.atlas.hasRetired) {
           this.atlasReapDeferred = true;
           continue;
         }
@@ -800,11 +777,10 @@ export class WebGpuTerminalRuntime {
     this.inFlightFrames = 0;
     this.device?.destroy();
     this.device = null;
-    this.colorPipeline = null;
+    this.backgroundPipeline = null;
     this.glyphPipeline = null;
-    this.colorBindGroupLayout = null;
-    this.glyphBindGroupLayout = null;
-    this.glyphSampler = null;
+    this.bindGroupLayout = null;
+    this.emptyStorage = null;
   }
 
   private assertHealthy(): void {
@@ -851,37 +827,7 @@ if (import.meta.hot) {
   });
 }
 
-function colorVertexLayout(): GPUVertexBufferLayout {
-  return {
-    arrayStride: PACKED_INSTANCE_BYTES,
-    stepMode: "instance",
-    attributes: [
-      { shaderLocation: 0, offset: 0, format: "float32x2" },
-      { shaderLocation: 1, offset: 8, format: "float32x2" },
-      { shaderLocation: 2, offset: 16, format: "unorm8x4" },
-      { shaderLocation: 3, offset: 20, format: "unorm8x4" },
-      { shaderLocation: 4, offset: 24, format: "unorm8x4" },
-      { shaderLocation: 5, offset: 28, format: "uint32" },
-    ],
-  };
-}
-
-function glyphVertexLayout(): GPUVertexBufferLayout {
-  return {
-    arrayStride: PACKED_INSTANCE_BYTES,
-    stepMode: "instance",
-    attributes: [
-      { shaderLocation: 0, offset: CELL_INSTANCE_BYTES, format: "float32x2" },
-      { shaderLocation: 1, offset: 40, format: "float32x2" },
-      { shaderLocation: 2, offset: 48, format: "unorm16x2" },
-      { shaderLocation: 3, offset: 52, format: "unorm16x2" },
-      { shaderLocation: 4, offset: 56, format: "unorm8x4" },
-      { shaderLocation: 5, offset: 60, format: "uint32" },
-    ],
-  };
-}
-
-function fontAtlasKey(metrics: TerminalFontMetrics, scale: number): string {
+function fontAtlasKey(metrics: TerminalFontMetrics): string {
   const font = metrics.font;
   return [
     font.family,
@@ -889,8 +835,20 @@ function fontAtlasKey(metrics: TerminalFontMetrics, scale: number): string {
     font.weight,
     font.lineHeight,
     font.letterSpacing,
-    scale,
+    metrics.scale,
+    metrics.deviceCellWidth,
+    metrics.deviceCellHeight,
+    metrics.deviceBaseline,
   ].join("|");
+}
+
+/** A per-frame wall-clock allowance for glyph rasterization. */
+export function createRasterBudget(limitMs: number): RasterBudget {
+  const start = performance.now();
+  return {
+    exhausted: (allowanceMs = limitMs) =>
+      performance.now() - start >= allowanceMs,
+  };
 }
 
 function toError(error: unknown): Error {

@@ -39,7 +39,11 @@ describe("WebGL surface renderer ownership", () => {
       expect(h.onError).toHaveBeenCalledOnce();
       expect(h.surface.diagnostics().renderer).toBeNull();
       expect(h.renderer.resize).toHaveBeenCalledTimes(calls);
-      h.surface.setFontMetrics({ ...METRICS, cellWidth: 10 });
+      h.surface.setFontMetrics({
+        ...METRICS,
+        deviceCellWidth: 10,
+        cellWidth: 10,
+      });
       h.resize();
       expect(
         h.surface.renderFrame(h.renderer as unknown as WebGlCellRenderer),
@@ -78,6 +82,10 @@ const METRICS = {
     letterSpacing: 0,
     weight: "400",
   },
+  scale: 1,
+  deviceCellWidth: 8,
+  deviceCellHeight: 16,
+  deviceBaseline: 12,
   cellWidth: 8,
   cellHeight: 16,
   baseline: 12,
@@ -101,6 +109,23 @@ function renderer() {
   };
 }
 
+function measuringContext() {
+  const context = {
+    font: "",
+    measureText: () => {
+      const size = Number.parseFloat(
+        /([\d.]+)px/.exec(context.font)?.[1] ?? "14",
+      );
+      return {
+        width: size * 0.6,
+        actualBoundingBoxAscent: size * 0.8,
+        actualBoundingBoxDescent: size * 0.2,
+      };
+    },
+  };
+  return context;
+}
+
 function harness() {
   vi.useFakeTimers();
   const element = () =>
@@ -113,6 +138,7 @@ function harness() {
       appendChild: vi.fn(),
       remove: vi.fn(),
       getBoundingClientRect: () => ({ width: 960, height: 640 }),
+      getContext: () => measuringContext(),
     });
   const media = new EventTarget();
   vi.stubGlobal("document", { createElement: element });
@@ -189,7 +215,11 @@ function harness() {
       if (trigger === "theme")
         surface.setTheme({ ...THEME, background: [1, 2, 3] });
       if (trigger === "font")
-        surface.setFontMetrics({ ...METRICS, cellWidth: 9 });
+        surface.setFontMetrics({
+          ...METRICS,
+          deviceCellWidth: 9,
+          cellWidth: 9,
+        });
       if (trigger === "resume") {
         bridge.visibility({ visible: false, reclaim: false });
         bridge.visibility({ visible: true, reclaim: false });

@@ -22,7 +22,12 @@ import type {
   TerminalFontMetrics,
   TerminalGpuTheme,
 } from "../gpu/terminalVisuals";
-import { rgbToCss } from "../gpu/terminalVisuals";
+import {
+  devicePixelScale,
+  metricsEqual,
+  metricsForScale,
+  rgbToCss,
+} from "../gpu/terminalVisuals";
 import { GhosttySearchController } from "../search/GhosttySearchController";
 import { TerminalSelectionController } from "../selection/TerminalSelectionController";
 import {
@@ -89,7 +94,6 @@ export class WebGlTerminalSurface
   private host: HTMLElement | null = null;
   private scale = 1;
   private visible = true;
-  private synchronizedScrollTop: number | null = null;
   private readonly scrollbarSync = new TerminalScrollbarSync();
   private scrollbarViewportHeight = 0;
   private focused = false;
@@ -208,7 +212,8 @@ export class WebGlTerminalSurface
     if (this.host) this.detach();
     this.host = container;
     container.appendChild(this.root);
-    this.scale = Math.max(1, window.devicePixelRatio || 1);
+    this.syncScale();
+    this.scrollbarSync.forget();
     this.pixelRatioMonitor.start();
     this.resizeObserver.observe(container);
     if (this.visible && !this.documentSuspended) {
@@ -265,7 +270,7 @@ export class WebGlTerminalSurface
     if (visible) {
       if (!this.documentSuspended) this.search.resume();
       if (this.host && !this.renderer && !this.documentSuspended) {
-        this.scale = Math.max(1, window.devicePixelRatio || 1);
+        this.syncScale();
         try {
           this.acquireRenderer();
           this.resizeToHost();
@@ -310,8 +315,9 @@ export class WebGlTerminalSurface
   }
 
   setFontMetrics(metrics: TerminalFontMetrics): void {
-    if (fontMetricsKey(this.metrics) === fontMetricsKey(metrics)) return;
-    this.metrics = metrics;
+    const next = metricsForScale(metrics, this.scale);
+    if (metricsEqual(this.metrics, next)) return;
+    this.metrics = next;
     if (this.renderer && this.host && !this.documentSuspended) {
       try {
         this.acquireRenderer();
@@ -474,6 +480,7 @@ export class WebGlTerminalSurface
     this.unsubscribeResizeInteraction();
     this.search.dispose();
     this.selection.dispose();
+    this.scrollbarSync.dispose();
     this.unsubscribeInteraction();
     this.root.removeEventListener("pointerdown", this.handlePointerDown);
     this.root.removeEventListener("mousemove", this.handleLinkMouseMove);
@@ -537,7 +544,7 @@ export class WebGlTerminalSurface
     if (!wasSuspended || !this.visible || !this.host) return;
     this.search.resume();
     try {
-      this.scale = Math.max(1, window.devicePixelRatio || 1);
+      this.syncScale();
       this.acquireRenderer();
       this.resizeToHost();
       this.renderer?.requestPresentation();
@@ -555,10 +562,12 @@ export class WebGlTerminalSurface
 
   private readonly handleScroll = (): void => {
     if (!this.host || !this.visible || this.documentSuspended) return;
-    if (this.scrollbar.scrollTop === this.synchronizedScrollTop) return;
+    const scrollTop = this.scrollbar.scrollTop;
+    if (scrollTop === this.scrollbarSync.writtenScrollTop) return;
     this.scrollbarSync.invalidate();
+    this.scrollbarSync.observe(scrollTop);
     const { history, offset } = this.options.model.scrollPosition();
-    const line = Math.round(this.scrollbar.scrollTop / this.metrics.cellHeight);
+    const line = Math.round(scrollTop / this.metrics.cellHeight);
     if (history - line !== offset) {
       this.handleInteraction();
       this.options.model.scrollTo(history - line);
@@ -649,9 +658,8 @@ export class WebGlTerminalSurface
   ): void {
     if (!this.host || !this.renderer || this.documentSuspended) return;
     this.fitQueue.clear();
-    const nextScale = Math.max(1, window.devicePixelRatio || 1);
-    if (nextScale !== this.scale) {
-      this.scale = nextScale;
+    if (devicePixelScale() !== this.scale) {
+      this.syncScale();
       this.runtime.release(this);
       this.acquireRenderer();
     }
@@ -659,12 +667,7 @@ export class WebGlTerminalSurface
     const bounds = measuredBounds ?? this.host.getBoundingClientRect();
     this.scrollbarSync.invalidate();
     this.scrollbarViewportHeight = Math.round(bounds.height);
-    const fit = fitTerminalViewport(
-      bounds.width,
-      bounds.height,
-      this.metrics,
-      this.scale,
-    );
+    const fit = fitTerminalViewport(bounds.width, bounds.height, this.metrics);
     if (!fit) return;
     const { cols, rows, pixelWidth, pixelHeight } = fit;
     if (cols * rows > MAX_SURFACE_CELLS) {
@@ -702,9 +705,15 @@ export class WebGlTerminalSurface
     }
   }
 
+  /** Adopts the current ratio and re-measures the font at it. */
+  private syncScale(): void {
+    this.scale = devicePixelScale();
+    this.metrics = metricsForScale(this.metrics, this.scale);
+  }
+
   private updateScrollbar(): void {
     if (!this.host || !this.visible || this.documentSuspended) return;
-    this.synchronizedScrollTop = this.scrollbarSync.sync(
+    this.scrollbarSync.sync(
       this.scrollbarViewportHeight,
       this.scrollbar,
       this.scrollbarContent,
@@ -786,19 +795,6 @@ export class WebGlTerminalSurface
   private assertLive(): void {
     if (this.disposed) throw new Error("WebGL terminal surface is disposed");
   }
-}
-
-function fontMetricsKey(metrics: TerminalFontMetrics): string {
-  return [
-    metrics.font.family,
-    metrics.font.size,
-    metrics.font.lineHeight,
-    metrics.font.letterSpacing,
-    metrics.font.weight,
-    metrics.cellWidth,
-    metrics.cellHeight,
-    metrics.baseline,
-  ].join("|");
 }
 
 function toError(error: unknown): Error {

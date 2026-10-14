@@ -238,12 +238,13 @@ describe("WebGpuTerminalRuntime", () => {
     vi.useFakeTimers();
     createHarness();
     const runtime = await createRuntime();
-    const lease = runtime.acquireGlyphAtlas(METRICS, 1);
+    const lease = runtime.acquireGlyphAtlas(METRICS);
 
     expect(runtime.diagnostics()).toMatchObject({
       atlasCount: 1,
       unusedAtlasCount: 0,
     });
+    expect(runtime.diagnostics().atlasBytes).toBeGreaterThan(1_048_576);
     lease.release();
     expect(runtime.diagnostics().unusedAtlasCount).toBe(1);
 
@@ -256,19 +257,19 @@ describe("WebGpuTerminalRuntime", () => {
     runtime.dispose();
   });
 
-  it("defers idle atlas reclamation while uploads are encoded but unsubmitted", async () => {
+  it("defers idle atlas reclamation while replaced resources await a submission", async () => {
     vi.useFakeTimers();
     const h = createHarness();
     const runtime = await createRuntime();
-    const lease = runtime.acquireGlyphAtlas(METRICS, 1);
-    const pending = vi
-      .spyOn(lease.atlas, "hasEncodedUploads", "get")
+    const lease = runtime.acquireGlyphAtlas(METRICS);
+    const retired = vi
+      .spyOn(lease.atlas, "hasRetired", "get")
       .mockReturnValue(true);
     lease.release();
     await vi.advanceTimersByTimeAsync(30_000);
     expect(runtime.diagnostics().atlasCount).toBe(1);
     expect(vi.getTimerCount()).toBe(0);
-    pending.mockReturnValue(false);
+    retired.mockReturnValue(false);
     const surface = createSurface();
     runtime.register(surface);
     runtime.schedule(surface);
@@ -277,11 +278,12 @@ describe("WebGpuTerminalRuntime", () => {
     expect(runtime.diagnostics().atlasCount).toBe(0);
   });
 
-  it("releases hidden atlas textures while retaining one bounded warm glyph cache", async () => {
+  it("releases every atlas byte while hidden and rebuilds on resume", async () => {
     vi.useFakeTimers();
     const harness = createHarness();
     const runtime = await createRuntime();
-    const lease = runtime.acquireGlyphAtlas(METRICS, 1);
+    const lease = runtime.acquireGlyphAtlas(METRICS);
+    const epoch = lease.atlas.epoch;
     lease.release();
 
     harness.setVisible(false);
@@ -291,18 +293,19 @@ describe("WebGpuTerminalRuntime", () => {
     expect(runtime.diagnostics()).toMatchObject({
       atlasCount: 1,
       atlasBytes: 0,
-      atlasCpuBytes: 1_048_576,
+      atlasCpuBytes: 0,
     });
     harness.setVisible(true);
     harness.notifyVisibility();
-    const restored = runtime.acquireGlyphAtlas(METRICS, 1);
+    const restored = runtime.acquireGlyphAtlas(METRICS);
     expect(restored.atlas).toBe(lease.atlas);
-    expect(runtime.diagnostics().atlasBytes).toBe(1_048_580);
+    expect(restored.atlas.epoch).toBeGreaterThan(epoch);
+    expect(runtime.diagnostics().atlasBytes).toBeGreaterThan(1_048_576);
     restored.release();
     runtime.dispose();
   });
 
-  it("rearms deferred atlas cleanup after submission without another dirty surface", async () => {
+  it("releases replaced atlas resources after the frame's submission completes, or at once without one", async () => {
     vi.useFakeTimers();
     const h = createHarness();
     let complete = () => {};
@@ -313,78 +316,113 @@ describe("WebGpuTerminalRuntime", () => {
         }),
     );
     const runtime = await createRuntime();
-    const lease = runtime.acquireGlyphAtlas(METRICS, 1);
+    const lease = runtime.acquireGlyphAtlas(METRICS);
+    const release = vi.spyOn(lease.atlas, "releaseRetired");
     const surface = createSurface();
-    surface.renderFrame.mockImplementation((getEncoder) => {
-      const encoder = getEncoder();
-      lease.atlas.glyph(65, null, 0);
-      lease.atlas.encodePendingUploads(encoder);
-      expect(lease.atlas.hasEncodedUploads).toBe(true);
-      lease.release();
-      expect(vi.getTimerCount()).toBe(0);
-      return true;
-    });
     runtime.register(surface);
     runtime.schedule(surface);
     h.flushFrame();
     expect(h.submit).toHaveBeenCalledOnce();
-    expect(lease.atlas.hasEncodedUploads).toBe(false);
-    expect(vi.getTimerCount()).toBe(1);
-    expect(runtime.diagnostics().pendingSurfaces).toBe(0);
+    expect(release).toHaveBeenLastCalledWith(expect.any(Promise));
     complete();
-    await vi.advanceTimersByTimeAsync(30_000);
-    expect(runtime.diagnostics().atlasCount).toBe(0);
-    expect(h.frames.size).toBe(0);
-    expect(vi.getTimerCount()).toBe(0);
+    await Promise.resolve();
+
+    surface.renderFrame.mockReturnValue(false);
+    runtime.schedule(surface);
+    h.flushFrame();
+    expect(release).toHaveBeenLastCalledWith(null);
+    lease.release();
+    runtime.dispose();
   });
 
-  it("isolates a contended surface without duplicating normal atlas leases", async () => {
+  it("shares one atlas per font and ratio and keeps ratios apart", async () => {
     createHarness();
     const runtime = await createRuntime();
-    const first = runtime.acquireGlyphAtlas(METRICS, 1);
-    const second = runtime.acquireGlyphAtlas(METRICS, 1);
-    const isolated = runtime.acquireIsolatedGlyphAtlas(METRICS, 1, "surface-2");
+    const first = runtime.acquireGlyphAtlas(METRICS);
+    const second = runtime.acquireGlyphAtlas(METRICS);
+    const other = runtime.acquireGlyphAtlas({
+      ...METRICS,
+      scale: 2,
+      deviceCellWidth: 16,
+      deviceCellHeight: 32,
+      deviceBaseline: 24,
+    });
 
     expect(first.atlas).toBe(second.atlas);
-    expect(isolated.atlas).not.toBe(first.atlas);
-    expect(first.isolated).toBe(false);
-    expect(isolated.isolated).toBe(true);
+    expect(other.atlas).not.toBe(first.atlas);
     expect(runtime.diagnostics()).toMatchObject({
       atlasCount: 2,
-      isolatedAtlasCount: 1,
-      atlasResets: 0,
+      atlasFlushes: 0,
       atlasCapacityFailures: 0,
     });
 
     first.release();
     second.release();
-    isolated.release();
+    other.release();
     runtime.dispose();
   });
 
-  it("redraws only the owner of an isolated atlas reset", async () => {
+  it("flushes a full atlas between frames, redraws its users and rate limits flushes", async () => {
+    vi.useFakeTimers();
     const harness = createHarness();
     const runtime = await createRuntime();
     const first = createSurface();
     const second = createSurface();
     runtime.register(first);
     runtime.register(second);
-    const shared = runtime.acquireGlyphAtlas(METRICS, 1, first);
-    const isolated = runtime.acquireIsolatedGlyphAtlas(
-      METRICS,
-      1,
-      "surface-2",
-      second,
-    );
+    const lease = runtime.acquireGlyphAtlas(METRICS, first);
+    const other = runtime.acquireGlyphAtlas(METRICS, second);
+    const epoch = lease.atlas.epoch;
+    const order: string[] = [];
+    first.renderFrame.mockImplementation((getEncoder) => {
+      order.push(`first epoch ${lease.atlas.epoch}`);
+      getEncoder();
+      return true;
+    });
 
-    isolated.atlas.resetForRebuild();
-    expect(runtime.diagnostics().pendingSurfaces).toBe(1);
+    lease.requestFlush();
+    expect(runtime.diagnostics().pendingSurfaces).toBe(2);
     harness.flushFrame();
-    expect(first.renderFrame).not.toHaveBeenCalled();
-    expect(second.renderFrame).toHaveBeenCalledOnce();
+    expect(lease.atlas.epoch).toBe(epoch + 1);
+    expect(order).toEqual([`first epoch ${epoch + 1}`]);
+    expect(runtime.diagnostics().atlasFlushes).toBe(1);
 
-    shared.release();
-    isolated.release();
+    lease.requestFlush();
+    vi.advanceTimersByTime(17);
+    harness.flushFrame();
+    expect(lease.atlas.epoch).toBe(epoch + 1);
+    await vi.advanceTimersByTimeAsync(300);
+    expect(runtime.diagnostics().pendingSurfaces).toBeGreaterThan(0);
+    harness.flushFrame();
+    expect(lease.atlas.epoch).toBe(epoch + 2);
+
+    lease.release();
+    other.release();
+    runtime.dispose();
+  });
+
+  it("gives every surface in a frame one shared rasterization budget", async () => {
+    const harness = createHarness();
+    const runtime = await createRuntime();
+    const budgets = new Set<unknown>();
+    const first = createSurface();
+    const second = createSurface();
+    for (const surface of [first, second]) {
+      surface.renderFrame.mockImplementation(
+        (getEncoder, _resources, budget) => {
+          budgets.add(budget);
+          getEncoder();
+          return true;
+        },
+      );
+      runtime.register(surface);
+      runtime.schedule(surface);
+    }
+    harness.flushFrame();
+    expect(budgets.size).toBe(1);
+    const [budget] = [...budgets] as Array<{ exhausted(ms?: number): boolean }>;
+    expect(budget.exhausted(1_000_000)).toBe(false);
+    expect(budget.exhausted(0)).toBe(true);
     runtime.dispose();
   });
 
@@ -452,20 +490,31 @@ function createHarness() {
       unmap: vi.fn(),
       destroy: vi.fn(),
     })),
+    createBindGroup: vi.fn(() => ({})),
     createCommandEncoder: vi.fn(() => ({
       finish: vi.fn(() => ({})),
-      copyBufferToTexture: vi.fn(),
+      copyTextureToTexture: vi.fn(),
     })),
+    limits: { maxTextureDimension2D: 8_192 },
     destroy: destroyDevice,
     lost: new Promise<GPUDeviceLostInfo>((resolve) => {
       loseDevice = resolve;
     }),
-    queue: { submit, onSubmittedWorkDone },
+    queue: {
+      submit,
+      onSubmittedWorkDone,
+      writeBuffer: vi.fn(),
+      writeTexture: vi.fn(),
+    },
   } as unknown as GPUDevice;
 
   vi.stubGlobal("GPUShaderStage", { VERTEX: 1, FRAGMENT: 2 });
-  vi.stubGlobal("GPUTextureUsage", { COPY_DST: 1, TEXTURE_BINDING: 2 });
-  vi.stubGlobal("GPUBufferUsage", { COPY_SRC: 1 });
+  vi.stubGlobal("GPUTextureUsage", {
+    COPY_DST: 1,
+    TEXTURE_BINDING: 2,
+    COPY_SRC: 4,
+  });
+  vi.stubGlobal("GPUBufferUsage", { STORAGE: 1, COPY_DST: 2 });
   const requestDevice = vi.fn(async () => device);
   vi.stubGlobal("navigator", {
     gpu: {
@@ -561,6 +610,10 @@ const METRICS = {
     letterSpacing: 0,
     weight: "400",
   },
+  scale: 1,
+  deviceCellWidth: 8,
+  deviceCellHeight: 16,
+  deviceBaseline: 12,
   cellWidth: 8,
   cellHeight: 16,
   baseline: 12,
@@ -572,6 +625,7 @@ function createSurface() {
       (
         getEncoder: () => GPUCommandEncoder,
         _resources: WebGpuSharedResources,
+        _budget?: unknown,
       ) => {
         getEncoder();
         return true;

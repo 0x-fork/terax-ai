@@ -295,14 +295,14 @@ export class WebGlGlyphAtlas {
     const measurement = context.measureText(text);
     const left = Math.max(0, Math.ceil(measurement.actualBoundingBoxLeft || 0));
     const right = Math.ceil(
-      measurement.actualBoundingBoxRight || this.metrics.cellWidth * this.scale,
+      measurement.actualBoundingBoxRight || this.metrics.deviceCellWidth,
     );
     const ascent = Math.ceil(
-      measurement.actualBoundingBoxAscent || this.metrics.baseline * this.scale,
+      measurement.actualBoundingBoxAscent || this.metrics.deviceBaseline,
     );
     const descent = Math.ceil(
       measurement.actualBoundingBoxDescent ||
-        (this.metrics.cellHeight - this.metrics.baseline) * this.scale,
+        this.metrics.deviceCellHeight - this.metrics.deviceBaseline,
     );
     const width = Math.min(
       RASTER_SIZE,
@@ -368,8 +368,7 @@ export class WebGlGlyphAtlas {
 
     return {
       originOffsetX: -left - GLYPH_PADDING,
-      originOffsetY:
-        this.metrics.baseline * this.scale - ascent - GLYPH_PADDING,
+      originOffsetY: this.metrics.deviceBaseline - ascent - GLYPH_PADDING,
       width,
       height,
       uvMinX: region.x / atlasSize,

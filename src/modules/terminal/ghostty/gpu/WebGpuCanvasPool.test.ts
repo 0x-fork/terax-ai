@@ -12,7 +12,7 @@ describe("WebGpuCanvasPool", () => {
   it("reuses configured presentation storage across 100 tab switches", () => {
     const h = harness();
     let lease = h.pool.acquire(h.configuration);
-    lease.backingStore.stage(2000, 1300, 1000, 650);
+    lease.backingStore.stage(2000, 1300, 2);
     lease.backingStore.commit();
     const canvas = lease.canvas;
     lease.present();
@@ -53,7 +53,7 @@ describe("WebGpuCanvasPool", () => {
       h.pool.acquire(h.configuration),
     );
     for (const lease of leases) {
-      lease.backingStore.stage(2000, 1300, 1000, 650);
+      lease.backingStore.stage(2000, 1300, 2);
       lease.backingStore.commit();
       lease.release();
     }
@@ -74,7 +74,7 @@ describe("WebGpuCanvasPool", () => {
   it("does not retain oversized targets or targets reclaimed on sleep", () => {
     const h = harness();
     const large = h.pool.acquire(h.configuration);
-    large.backingStore.stage(8000, 4000, 4000, 2000);
+    large.backingStore.stage(8000, 4000, 2);
     large.backingStore.commit();
     large.release();
     expect(h.pool.diagnostics().idle).toBe(0);

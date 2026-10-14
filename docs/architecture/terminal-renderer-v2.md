@@ -1,6 +1,9 @@
 # Terminal renderer v2: native cell stream, pixel-exact grid
 
-Status: in implementation on `perf/resource-efficiency`.
+Status: implemented on `perf/resource-efficiency` for WebGPU: the Zig and
+TypeScript bridge, and the GPU side in `src/modules/terminal/ghostty/gpu/`. The
+WebGL fallback keeps the structure-of-arrays path and gains integer device cells.
+Platform coverage is macOS only; see "As built" for what was and was not checked.
 
 ## Why
 
@@ -226,3 +229,130 @@ armBlinkTimer(frame.blinkingCells > 0);
 call into the model that can allocate. `dirtyRanges` holds only record changes;
 `damage` also covers selection, block-search and cursor-option overlays, which
 never touch the records.
+
+## As built
+
+### Data path
+
+`WebGpuTerminalSurface.renderFrame` calls `deferPresentation()` and
+`consumeGpuFrame({ resync })`, uploads `dirtyRanges` with
+`queue.writeBuffer(cells, offset, frame.cells, offset, length)` and scans the same
+view for evicted glyphs before any other model call, then updates `glyph_map`,
+the search mask and the uniform. It redraws when `frame.damage` is not none or
+any uniform, mask, map or binding changed, and otherwise acquires no texture.
+`resync` is sent for a new or re-leased surface, a replaced cell buffer, and
+after an atlas flush. The surface never calls `renderCells`, `consumeDamage` or
+`viewport`, so the model stays in the GPU format; failover to WebGL flips it to
+the structure-of-arrays format and back without resetting the terminal.
+
+### Shaders
+
+One bind group serves both passes: uniform, `cells` (`array<vec4u>`), `glyph_map`,
+`glyph_table` (four words per glyph: rect x and y, width and height, bearing,
+flags), `search_mask` (a four-byte stand-in when inactive) and the two atlas
+textures. The background pass is one fullscreen triangle. A wide character's
+trailing half takes selection and search state from its lead, as before.
+The glyph pass is one instanced draw over `cols * rows`; glyph 0, a pending or
+evicted glyph, and a blink-hidden glyph collapse to a degenerate triangle. The
+left-overhang clip compares displayed backgrounds, including search and
+selection, exactly as the old per-cell loop did. The uniform is 176 bytes; a
+test checks the WGSL struct offsets against the TypeScript packer.
+Sampling uses `textureLoad`. The previous glyph shader called `textureSample`
+inside non-uniform control flow, which current Chromium (152) rejects at shader
+creation, so the old path would have fallen back to WebGL there.
+
+### Geometry
+
+Fonts are measured at `size * ratio`. Device cell size is
+`ceil(advance + letterSpacing * ratio)` by
+`max(ceil(ascent + descent) + 2, ceil(size * ratio * lineHeight))`. At ratio 2
+this differs from the old `2 * ceil(css cell)` by up to one device pixel per
+cell, so column and row counts can change by a cell or two; glyph rendering at
+identical geometry is unchanged. Underline, strikethrough and overline strokes
+are `max(1, round(ratio))` device pixels and the bar and underline cursors
+`max(2, round(ratio))`; at ratio 2 they equal the old values. The canvas is
+translated by the rounded device offset of the container, computed in the
+`ResizeObserver` callback (where layout is clean), on a ratio change and on
+window resize, never per frame. Layout moves that neither resize the container
+nor fire a window resize keep the previous offset until the next of those events.
+`devicePixelContentBoxSize` supplies the exact fit when the engine reports it.
+
+`CanvasBackingStore` keeps its nearby-size reuse, now defined so it cannot scale
+text: the CSS size is always `backing / ratio`, drawing uses a viewport of exactly
+`cols * cellW` by `rows * cellH`, and the surplus (up to 255 device pixels per
+axis after a shrink, aligned to 128) is cleared to the background and clipped by the container.
+A test drags a pane across 400 device pixels in 3 pixel steps and requires fewer
+than a tenth as many swapchain reallocations as steps.
+
+### Glyph atlas
+
+Pixels are written with `queue.writeTexture` and no CPU copy is retained, so a
+hidden atlas holds no pixels and the first surface to return re-rasterizes what it
+shows. Growth creates the larger texture, copies the old one on the GPU in its
+own submission, and destroys the old texture only after the frame that may name
+it completes. When the largest atlas (or the device limit) is full the owner
+flushes between frames, never mid-frame, at most every 250 ms. Every surface then
+resyncs, marks its mappings evicted, rescans its visible cells and
+re-rasterizes only those; other glyphs return when they next appear in a changed
+row. This is epoch eviction with the visible set as recency, not a per-glyph LRU,
+because tracking per-glyph use would need per-cell JavaScript. When more than 256
+glyphs wait, only the ones the viewport shows stay queued, so scrolled-away output
+cannot delay the current screen. Rasterization stops after about 2 ms per frame
+across surfaces (8 ms for a surface's first frame so text appears whole).
+The isolated per-surface atlas and its fallback are gone.
+
+### Text contrast
+
+`DWrite_EnhanceContrast` scaled by foreground lightness, then a blend toward
+`DWrite_ApplyAlphaCorrection` with the 1.8 gamma ratios from Windows Terminal's
+`dwrite_helpers.hlsl`, both uniform controlled. Defaults are 0.5 and 0.5 on
+Windows, Linux and any ratio below 2, and zero elsewhere (macOS Retina is
+unchanged). The Windows values were chosen from the reference implementation and
+have not been looked at on Windows; `localStorage["terax:terminal-text-contrast"]`
+(`off`, `on` or a strength) exists to tune them without a build.
+
+### Scrollbar
+
+`TerminalScrollbarSync` keeps the last written `scrollTop` in JavaScript and
+reads the DOM only in the scroll handler. Writing `scrollTop` forces a layout, so
+growth under a bottom-pinned view moves the thumb at most every 100 ms, and ARIA
+values change at most every 250 ms; invalidation keeps the known position,
+re-attachment forgets it.
+
+### Verification
+
+`scripts/terminal-visual` renders a fixed pattern (ASCII, box drawing, bold and
+italic, all underline styles, strikethrough, overline, faint, blink, inverse,
+wide CJK, emoji, combining marks, selection, search, cursor styles) through any
+source tree and reads the presented canvas back as exact RGBA.
+
+| Check (macOS, Chromium 152, ratio 2 unless noted) | Result |
+| --- | --- |
+| v1 and v2 at identical cell geometry: full pattern, rectangular selection, search mask, bar and underline cursors, letter spacing | every difference is at most 3 of 255 on glyph edges (v1 quantizes UVs to 16 bits); backgrounds, decorations, selection and cursor are identical |
+| Same text at two columns at ratio 1.25 and 1.5 (mean absolute difference) | v1 6.8 and 11.2; v2 0 and 0 |
+| Atlas capped at 1024, 10 pages of 1,900 distinct glyphs, flush mid-run | final frame pixel-identical to a fresh run |
+| Atlas grown 1024 to 2048 to 4096, then flushed | final frame pixel-identical to a fresh run |
+| Live ratio changes 1.25, 1.5, 1.75, 2.25, 1 | font re-measured, grid and canvas re-fit each time, no errors |
+| WebGPU to WebGL to WebGPU on one model | format flips `gpu`, `soa`, `gpu`; content intact |
+
+The images are in `terminal-renderer-v2-evidence/`: `ratio2-v1.png` and
+`ratio2-v2.png` (full pattern), `ratio2-diff-x8.png` (their difference, amplified
+eight times), `ratio2-underlines-*` (all underline styles), and
+`ratio1.25-*-crop-x6.png` (the same text at ratio 1.25, six times enlarged).
+
+Main-thread time per tick (model write plus `renderFrame` plus submit; 400 ticks
+after warm-up, batched because `performance.now()` is 0.1 ms resolution):
+
+| Workload | 3,885 cells v1 | v2 | 12,027 cells v1 | v2 |
+| --- | --- | --- | --- | --- |
+| Ink-like repaint, one character changes | 0.98 ms | 0.14 ms | 2.51 ms | 0.36 ms |
+| Identical full repaint | 3.64 ms | 0.15 ms | | |
+| Scrolling output | 0.93 ms | 0.16 ms | | |
+
+### Not verified
+
+Windows and Linux were not run: DirectWrite-like contrast, the
+`devicePixelContentBoxSize` path against real fractional ratios, WebView2 and
+WebKitGTK behaviour, and whether compositors already snap the canvas. Real
+fractional display ratios were checked only through readback of the canvas
+(the page cannot emulate a display ratio), not through a physical display.

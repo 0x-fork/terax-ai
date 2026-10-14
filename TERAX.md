@@ -38,18 +38,48 @@ WebGPU canvases are leased from a shared pool rather than owned by persistent
 models. Up to eight unused targets share a 32 MiB color-storage budget and
 individual two-second deadlines; driver/compositor costs are separate. Reused
 targets stay hidden until the new owner's frame is encoded. Nearby backing sizes
-reuse storage without scaling text. Exact row comparisons suppress redundant
-uploads and presentation, including full repaints with unchanged pixels.
+reuse storage; the canvas is always styled backing/ratio and drawn through an
+exact viewport, so text is never scaled.
+
+The WebGPU path (renderer v2, `docs/architecture/terminal-renderer-v2.md`) runs
+no per-cell JavaScript. Ghostty encodes 16-byte cell records natively and
+reports only rows whose bytes changed. The surface uploads those ranges straight
+from WASM memory (`consumeGpuFrame`) into a storage buffer, and nothing may call
+the model between that frame and the upload because the view is borrowed. It
+never touches the structure-of-arrays APIs, which would flip the model's format;
+only the WebGL fallback uses them. A background pass derives each cell from its
+pixel (background, search, selection, cursor, decorations) and an instanced
+glyph pass draws integer-pixel quads with unfiltered `textureLoad`. Selection and
+cursor are uniforms and the search highlight is a mask buffer that exists only
+while something is highlighted, so none of them rewrites cell records.
+Geometry is pixel exact. Fonts are measured at size times ratio and cells are
+whole device pixels (`TerminalFontMetrics.deviceCell*`). `cellWidth` and
+`cellHeight` are the CSS size, device divided by ratio, and are what fit,
+hit-testing, selection, links and block overlays use. The backing store is exactly
+cols by rows device cells and the canvas origin is translated onto the device
+pixel grid when the observer, ratio or window size changes. A ratio change
+re-measures the font and rebuilds atlas and buffers.
+Each terminal maps Ghostty glyph ids to a glyph atlas shared per font and ratio.
+The atlas grows (coverage 1024 to 2048 to 4096, colour 512 to 2048) before it
+flushes into a new epoch; after a flush each surface rescans its visible cells and
+re-rasterizes only what it shows. Rasterization is limited to about two
+milliseconds per frame across surfaces, leftover glyphs draw on follow-up frames,
+and a backlog from scrolled-away output keeps only visible glyphs queued.
+Grayscale text gets a DirectWrite-style contrast curve when the ratio is below 2
+or on Windows and Linux (`localStorage["terax:terminal-text-contrast"]` is
+`off`, `on` or a strength); macOS Retina is unchanged.
 Native cell, grapheme and hyperlink presentation buffers allocate on first use
 and return to the WASM allocator when presentation is reclaimed. Hidden parsing
 does not rebuild them. Short visibility pauses retain uploaded cell data.
 Unchanged frames do not acquire presentation textures or draw; cursor-only
-updates retain cell buffers. WebGL background and decoration geometry uses
+updates upload only the uniform. WebGL background and decoration geometry uses
 row range uploads while rectangle counts are stable; structural changes rebuild
-the compact stream. Scrollbar synchronization reads no DOM on unchanged frames.
-Blink timers stop in unfocused windows, and native
-cursor hiding stops cursor timers. Selection damages only its old and new rows;
-streaming search invalidations coalesce instead of rebuilding per output chunk.
+the compact stream. Scrollbar synchronization never reads the DOM on presented
+frames; moving the thumb under a bottom-pinned view costs at most ten position
+writes and four ARIA updates a second. Blink timers stop in unfocused windows,
+and native cursor hiding stops cursor timers. Selection is a uniform and needs no
+row damage; streaming search invalidations coalesce instead of rebuilding per
+output chunk.
 WebGL surface and renderer code load only when selected, needed for fallback,
 or explicitly requested by diagnostics. Delayed imports cannot install into a
 closed, restarted, or replaced session.
@@ -176,6 +206,8 @@ without launching the application. `pnpm profile:ghostty` compares allocation
 and parsing workloads in a fresh process per artifact and optional baseline.
 `pnpm profile:renderer:macos` exercises the real renderer in an isolated native
 WKWebView, including optional four-pane layouts and live visual inspection.
+`scripts/terminal-visual` draws a fixed pattern through any source tree and reads
+the canvas back as exact pixels for comparison.
 `pnpm test:ipc:macos` verifies binary AI streaming, cancellation, and conversation
 storage in a separate Tauri profile with synthetic local HTTP responses.
 Resource evidence and limitations live in

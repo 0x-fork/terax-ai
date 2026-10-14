@@ -220,19 +220,12 @@ export class WebGlCellRenderer {
     const changed = cols !== this.cols || rows !== this.rows;
     this.cols = cols;
     this.rows = rows;
-    const width = Math.max(
-      1,
-      Math.round(cols * this.profile.metrics.cellWidth * this.profile.scale),
-    );
-    const height = Math.max(
-      1,
-      Math.round(rows * this.profile.metrics.cellHeight * this.profile.scale),
-    );
+    const width = Math.max(1, cols * this.profile.metrics.deviceCellWidth);
+    const height = Math.max(1, rows * this.profile.metrics.deviceCellHeight);
     const backingStoreChanged = this.backingStore.stage(
       width,
       height,
-      cols * this.profile.metrics.cellWidth,
-      rows * this.profile.metrics.cellHeight,
+      this.profile.scale,
     );
     if (backingStoreChanged) this.viewportDirty = true;
     if (changed) this.resizeModel(cols, rows);
@@ -714,8 +707,7 @@ export class WebGlCellRenderer {
       const decoration = this.decorations[index];
       const underlineStyle = decoration & 7;
       if (underlineStyle !== 0) {
-        const pixelLine =
-          1 / (this.profile.metrics.cellHeight * this.profile.scale);
+        const pixelLine = 1 / this.profile.metrics.deviceCellHeight;
         const patterned = underlineStyle >= 2;
         this.writeRectangle(
           vertices,
@@ -736,10 +728,7 @@ export class WebGlCellRenderer {
           column,
           row + 0.5,
           1,
-          Math.max(
-            1 / (this.profile.metrics.cellHeight * this.profile.scale),
-            0.05,
-          ),
+          Math.max(1 / this.profile.metrics.deviceCellHeight, 0.05),
           this.foregrounds[index],
           1,
         );
@@ -751,10 +740,7 @@ export class WebGlCellRenderer {
           column,
           row + 0.08,
           1,
-          Math.max(
-            1 / (this.profile.metrics.cellHeight * this.profile.scale),
-            0.05,
-          ),
+          Math.max(1 / this.profile.metrics.deviceCellHeight, 0.05),
           this.foregrounds[index],
           1,
         );
@@ -1167,9 +1153,9 @@ export function rendererProfileKey(profile: WebGlRendererProfile): string {
     font.weight,
     font.lineHeight,
     font.letterSpacing,
-    profile.metrics.cellWidth,
-    profile.metrics.cellHeight,
-    profile.metrics.baseline,
+    profile.metrics.deviceCellWidth,
+    profile.metrics.deviceCellHeight,
+    profile.metrics.deviceBaseline,
     profile.scale,
   ].join("|");
 }

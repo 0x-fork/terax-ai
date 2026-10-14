@@ -7,6 +7,13 @@ type CanvasTarget = {
   };
 };
 
+/**
+ * Stages and commits a canvas backing store whose CSS size is always exactly
+ * `backing / scale`, so one canvas pixel is one device pixel. Nearby required
+ * sizes reuse a slightly larger store instead of reallocating the swapchain on
+ * every drag step; renderers draw into the exact sub-rectangle (a viewport)
+ * and the surplus is cleared to the background and clipped by the host.
+ */
 export class CanvasBackingStore {
   private presented = false;
   private targetWidth: number;
@@ -30,22 +37,18 @@ export class CanvasBackingStore {
     );
   }
 
-  stage(
-    pixelWidth: number,
-    pixelHeight: number,
-    cssWidth: number,
-    cssHeight: number,
-  ): boolean {
+  stage(pixelWidth: number, pixelHeight: number, scale: number): boolean {
     const requiredWidth = positivePixelSize(pixelWidth);
     const requiredHeight = positivePixelSize(pixelHeight);
+    const ratio = Number.isFinite(scale) && scale > 0 ? scale : 1;
     const nextTargetWidth = this.presented
       ? reusableDimension(this.targetWidth, requiredWidth)
       : requiredWidth;
     const nextTargetHeight = this.presented
       ? reusableDimension(this.targetHeight, requiredHeight)
       : requiredHeight;
-    const targetCssWidth = `${(positiveCssSize(cssWidth) * nextTargetWidth) / requiredWidth}px`;
-    const targetCssHeight = `${(positiveCssSize(cssHeight) * nextTargetHeight) / requiredHeight}px`;
+    const targetCssWidth = `${nextTargetWidth / ratio}px`;
+    const targetCssHeight = `${nextTargetHeight / ratio}px`;
     const changed =
       this.targetWidth !== nextTargetWidth ||
       this.targetHeight !== nextTargetHeight ||
@@ -83,7 +86,7 @@ export class CanvasBackingStore {
   }
 }
 
-// Nearby sizes reuse storage instead of accumulating retired WebKit presentation buffers.
+// Nearby sizes reuse storage instead of accumulating retired presentation buffers.
 function reusableDimension(current: number, required: number): number {
   const alignment = required < 256 ? 32 : 128;
   if (required <= current && current - required < alignment * 2) return current;
@@ -93,9 +96,4 @@ function reusableDimension(current: number, required: number): number {
 function positivePixelSize(value: number): number {
   if (!Number.isFinite(value)) return 1;
   return Math.max(1, Math.round(value));
-}
-
-function positiveCssSize(value: number): number {
-  if (!Number.isFinite(value)) return 0;
-  return Math.max(0, value);
 }

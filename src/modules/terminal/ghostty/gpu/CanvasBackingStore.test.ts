@@ -1,11 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { CanvasBackingStore } from "./CanvasBackingStore";
 
+function fakeCanvas(width: number, height: number) {
+  return { width, height, style: { width: "", height: "" } };
+}
+
 describe("CanvasBackingStore", () => {
   it("releases hidden canvas storage while retaining the exact next presentation size", () => {
     const canvas = fakeCanvas(300, 150);
     const backing = new CanvasBackingStore(canvas);
-    backing.stage(3840, 2160, 1920, 1080);
+    backing.stage(3840, 2160, 2);
     backing.commit();
     backing.release();
     expect(canvas).toMatchObject({
@@ -14,7 +18,7 @@ describe("CanvasBackingStore", () => {
       style: { width: "1920px", height: "1080px" },
     });
     expect(backing.pending).toBe(true);
-    backing.stage(2560, 1440, 1280, 720);
+    backing.stage(2560, 1440, 2);
     backing.commit();
     expect(canvas).toMatchObject({ width: 2560, height: 1440 });
     expect(backing.pending).toBe(false);
@@ -24,7 +28,7 @@ describe("CanvasBackingStore", () => {
     const canvas = fakeCanvas(300, 150);
     const backing = new CanvasBackingStore(canvas);
 
-    expect(backing.stage(900, 540, 450, 270)).toBe(true);
+    expect(backing.stage(900, 540, 2)).toBe(true);
 
     expect(canvas).toMatchObject({
       width: 300,
@@ -46,9 +50,9 @@ describe("CanvasBackingStore", () => {
     const canvas = fakeCanvas(300, 150);
     const backing = new CanvasBackingStore(canvas);
 
-    backing.stage(600, 300, 300, 150);
-    backing.stage(800, 400, 400, 200);
-    backing.stage(700, 350, 350, 175);
+    backing.stage(600, 300, 2);
+    backing.stage(800, 400, 2);
+    backing.stage(700, 350, 2);
 
     expect(canvas.width).toBe(300);
     expect(canvas.height).toBe(150);
@@ -76,75 +80,55 @@ describe("CanvasBackingStore", () => {
         intrinsicWrites += 1;
         height = value;
       },
-      style: { width: "", height: "" },
+      style: { width: "640px", height: "480px" },
     };
     const backing = new CanvasBackingStore(canvas);
-
-    expect(backing.stage(640, 480, 320, 240)).toBe(true);
-    expect(backing.stage(640, 480, 320, 240)).toBe(false);
-
-    expect(backing.pending).toBe(true);
-    expect(backing.commit()).toBe(true);
-    expect(canvas).toMatchObject({
-      width: 640,
-      height: 480,
-      style: { width: "320px", height: "240px" },
-    });
+    expect(backing.stage(640, 480, 1)).toBe(false);
+    expect(backing.commit()).toBe(false);
     expect(intrinsicWrites).toBe(0);
   });
 
-  it("uses exact dimensions for the first presentation", () => {
-    const canvas = fakeCanvas(1_024, 768);
-    canvas.style.width = "512px";
-    canvas.style.height = "384px";
-    const backing = new CanvasBackingStore(canvas);
-
-    expect(backing.stage(700, 500, 350, 250)).toBe(true);
-    expect(backing.commit()).toBe(true);
-    expect(canvas).toMatchObject({
-      width: 700,
-      height: 500,
-      style: { width: "350px", height: "250px" },
-    });
+  it("always styles the canvas at exactly backing size over the ratio", () => {
+    for (const scale of [1, 1.25, 1.5, 1.75, 2, 2.25, 3]) {
+      const canvas = fakeCanvas(300, 150);
+      const backing = new CanvasBackingStore(canvas);
+      // First presentation: exact, no surplus.
+      backing.stage(1111, 777, scale);
+      backing.commit();
+      expect(canvas.width).toBe(1111);
+      expect(Number.parseFloat(canvas.style.width) * scale).toBeCloseTo(
+        canvas.width,
+        6,
+      );
+      // After presenting, nearby sizes reuse the surplus but stay 1:1.
+      backing.stage(1100, 770, scale);
+      backing.commit();
+      expect(Number.parseFloat(canvas.style.width) * scale).toBeCloseTo(
+        canvas.width,
+        6,
+      );
+      expect(Number.parseFloat(canvas.style.height) * scale).toBeCloseTo(
+        canvas.height,
+        6,
+      );
+    }
   });
 
-  it("bounds allocation changes during adjacent resizing without stretching pixels", () => {
+  it("reallocates the swapchain only every few device pixels during a drag resize", () => {
     const canvas = fakeCanvas(300, 150);
     const backing = new CanvasBackingStore(canvas);
-    backing.stage(2000, 1300, 1000, 650);
+    backing.stage(1000, 600, 1.5);
     backing.commit();
     let allocations = 0;
-    for (let index = 0; index < 100; index++) {
-      const width = 1600 + (index % 20) * 10;
-      const height = 900 + (index % 15) * 10;
-      backing.stage(width, height, width / 2, height / 2);
-      if (backing.commit()) allocations++;
+    let previousWidth = canvas.width;
+    for (let width = 1000; width <= 1400; width += 3) {
+      backing.stage(width, 600, 1.5);
+      backing.commit();
+      if (canvas.width !== previousWidth) allocations += 1;
+      previousWidth = canvas.width;
       expect(canvas.width).toBeGreaterThanOrEqual(width);
-      expect(canvas.height).toBeGreaterThanOrEqual(height);
-      expect(canvas.width - width).toBeLessThan(256);
-      expect(canvas.height - height).toBeLessThan(256);
-      expect(Number.parseFloat(canvas.style.width) * 2).toBe(canvas.width);
-      expect(Number.parseFloat(canvas.style.height) * 2).toBe(canvas.height);
     }
-    expect(allocations).toBeLessThan(10);
-  });
-
-  it("reclaims a substantially oversized viewport and restores exact storage after release", () => {
-    const canvas = fakeCanvas(300, 150);
-    const backing = new CanvasBackingStore(canvas);
-    backing.stage(6000, 4000, 3000, 2000);
-    backing.commit();
-    backing.stage(900, 600, 450, 300);
-    backing.commit();
-    expect(canvas.width).toBeLessThan(1025);
-    expect(canvas.height).toBeLessThan(729);
-    backing.release();
-    backing.stage(900, 600, 450, 300);
-    backing.commit();
-    expect(canvas).toMatchObject({ width: 900, height: 600 });
+    const steps = Math.floor(400 / 3) + 1;
+    expect(allocations).toBeLessThan(steps / 10);
   });
 });
-
-function fakeCanvas(width: number, height: number) {
-  return { width, height, style: { width: "", height: "" } };
-}

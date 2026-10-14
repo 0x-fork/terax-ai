@@ -7,45 +7,57 @@ import {
   subscribeTerminalResizeInteraction,
   terminalResizeInteractionActive,
 } from "@/modules/terminal/lib/terminalResizeInteraction";
-import { CellFlags } from "@terax/ghostty-core/protocol";
-import type { Rgb, TerminalCellReader } from "../core/packedCells";
-import type { GhosttyTerminalModelApi } from "../GhosttyTerminalModel";
+import type { Rgb } from "../core/packedCells";
+import type {
+  GhosttyGpuFrame,
+  GhosttyTerminalModelApi,
+} from "../GhosttyTerminalModel";
 import { GhosttySearchController } from "../search/GhosttySearchController";
-import {
-  selectionBoundsContain,
-  TerminalSelectionController,
-} from "../selection/TerminalSelectionController";
+import { TerminalSelectionController } from "../selection/TerminalSelectionController";
 import type { WebGpuCanvasLease } from "@/modules/terminal/ghostty/gpu/WebGpuCanvasPool";
 import { DevicePixelRatioMonitor } from "./DevicePixelRatioMonitor";
-import { GlyphAtlasCapacityError } from "./GlyphAtlas";
-import { fitTerminalViewport } from "./TerminalFit";
+import { TerminalGlyphMap, type RasterBudget } from "./GlyphMap";
+import { ScreenUniform } from "./ScreenUniform";
+import { SCREEN_UNIFORM_BYTES } from "./shaders";
+import { fitTerminalViewport, snapOffsetCss } from "./TerminalFit";
 import {
   TerminalFitQueue,
+  type TerminalFitBounds,
   type TerminalFitQueueDiagnostics,
 } from "./TerminalFitQueue";
 import {
+  cursorRect,
+  decorationMetrics,
+  leftOverhangPadding,
+  NO_SELECTION,
+  selectionUniform,
+} from "./terminalGeometry";
+import {
+  devicePixelScale,
+  metricsEqual,
+  metricsForScale,
   rgbToCss,
   type TerminalFontMetrics,
   type TerminalGpuTheme,
 } from "./terminalVisuals";
 import {
-  CELL_FLAG_OVERLINE,
-  CELL_FLAG_STRIKETHROUGH,
-  CELL_FLAG_UNDERLINE_MASK,
+  detectPlatform,
+  textContrastFor,
+  type TextContrast,
+} from "./textContrast";
+import {
+  CELL_RECORD_BYTES,
   compactWebGpuCellCapacity,
-  GLYPH_FLAG_BLINK,
-  GLYPH_FLAG_COVERAGE_RED,
-  GLYPH_FLAG_INTRINSIC_COLOR,
   MAX_WEBGPU_SURFACE_CELLS,
   nextWebGpuCellCapacity,
-  PACKED_INSTANCE_BYTES,
-  SCREEN_UNIFORM_BYTES,
-  writeCellInstance,
-  writeGlyphInstance,
+  packSearchMask,
 } from "./WebGpuCellBuffer";
 import {
+  createRasterBudget,
+  FIRST_FRAME_RASTER_BUDGET_MS,
   type GlyphAtlasLease,
   getWebGpuTerminalRuntime,
+  RASTER_BUDGET_MS,
   type WebGpuRuntimeSurface,
   type WebGpuSharedResources,
   type WebGpuTerminalRuntime,
@@ -53,9 +65,7 @@ import {
 
 const CURSOR_BLINK_MS = 600;
 const TEXT_BLINK_MS = 600;
-const SEARCH_MATCH_BACKGROUND = 0x515c6a;
-const SEARCH_ACTIVE_MATCH_BACKGROUND = 0xd18616;
-let nextAtlasOwnerId = 1;
+const TEXT_CONTRAST_STORAGE_KEY = "terax:terminal-text-contrast";
 
 export type WebGpuTerminalSurfaceOptions = {
   readonly model: GhosttyTerminalModelApi;
@@ -83,11 +93,15 @@ export type WebGpuTerminalSurfaceStats = {
   readonly estimatedSwapchainBytes: number;
   readonly cols: number;
   readonly rows: number;
+  readonly scale: number;
+  readonly deviceCellWidth: number;
+  readonly deviceCellHeight: number;
   readonly visible: boolean;
   readonly documentSuspended: boolean;
   readonly focused: boolean;
   readonly uploads: number;
   readonly uploadedBytes: number;
+  readonly pendingGlyphs: number;
   readonly fit: TerminalFitQueueDiagnostics;
 };
 
@@ -109,34 +123,27 @@ export class WebGpuTerminalSurface
   private readonly search: GhosttySearchController;
   private readonly pixelRatioMonitor: DevicePixelRatioMonitor;
   private readonly fitQueue = new TerminalFitQueue();
-  private readonly atlasOwnerKey = String(nextAtlasOwnerId++);
   private atlasLease: GlyphAtlasLease | null = null;
+  private glyphMap = new TerminalGlyphMap();
+  private atlasBlocked = false;
   private uniformBuffer: GPUBuffer | null = null;
-  private instanceBuffer: GPUBuffer | null = null;
-  private colorBindGroup: GPUBindGroup | null = null;
-  private glyphBindGroup: GPUBindGroup | null = null;
-  private instanceData = new ArrayBuffer(0);
-  private rowViews: Uint32Array[] = [];
-  private rowScratch = new Uint32Array(0);
-  private rowScratchView = new DataView(new ArrayBuffer(0));
-  private changedRows = new Uint8Array(0);
-  private readonly screenData = new Float32Array(SCREEN_UNIFORM_BYTES / 4);
-  private readonly uploadedScreenData = new Float32Array(
-    SCREEN_UNIFORM_BYTES / 4,
-  );
-  private uniformUploaded = false;
+  private cellsBuffer: GPUBuffer | null = null;
+  private glyphMapBuffer: GPUBuffer | null = null;
+  private searchBuffer: GPUBuffer | null = null;
+  private bindGroup: GPUBindGroup | null = null;
+  private bindGroupDirty = true;
+  private readonly screen = new ScreenUniform();
+  private searchScratch = new Uint8Array(0);
+  private searchRevision = -1;
   private forcePresent = true;
-  private blinkingRows = new Uint8Array(0);
+  private needsResync = true;
+  private blinkingCells = 0;
   private theme: TerminalGpuTheme;
   private metrics: TerminalFontMetrics;
-  private themeBackground: number;
-  private themeCursor: number;
-  private selectionColor: number;
+  private contrast: TextContrast;
   private cellCapacity = 0;
   private host: HTMLElement | null = null;
-  private scale = 1;
   private visible = true;
-  private synchronizedScrollTop: number | null = null;
   private readonly scrollbarSync = new TerminalScrollbarSync();
   private scrollbarViewportHeight = 0;
   private focused = false;
@@ -152,9 +159,7 @@ export class WebGpuTerminalSurface
   private cursorTimer: number | null = null;
   private textBlinkVisible = true;
   private textBlinkTimer: number | null = null;
-  private blinkingRowCount = 0;
   private forceFullRedraw = true;
-  private atlasGeneration = 0;
   private runtimeGeneration = 0;
   private frameCount = 0;
   private backingStoreResizeCount = 0;
@@ -167,20 +172,20 @@ export class WebGpuTerminalSurface
   private mouseDownLink: string | null = null;
   private applyingFit = false;
   private disposed = false;
+  private appliedTransform = "";
+  private snapOrigin: { left: number; top: number } | null = null;
 
   private constructor(
     private readonly runtime: WebGpuTerminalRuntime,
     private readonly options: WebGpuTerminalSurfaceOptions,
   ) {
-    this.metrics = options.metrics;
+    this.metrics = metricsForScale(options.metrics, devicePixelScale());
+    this.contrast = currentTextContrast(this.metrics.scale);
     this.pixelRatioMonitor = new DevicePixelRatioMonitor(() =>
       this.resizeToHost(),
     );
     this.cursorBlinking = options.cursorBlink;
     this.theme = options.theme;
-    this.themeBackground = packRgb(options.theme.background);
-    this.themeCursor = packRgb(options.theme.cursor);
-    this.selectionColor = packRgb(options.theme.selection.color);
     options.model.setCursorOptions(options.cursorStyle, options.cursorBlink);
     this.contentRevision = options.model.revision();
     this.root.className = "absolute inset-0 overflow-hidden";
@@ -219,13 +224,12 @@ export class WebGpuTerminalSurface
     });
     this.search = new GhosttySearchController(options.model, () => {
       if (this.applyingFit) return;
-      this.forceFullRedraw = true;
       this.runtime.schedule(this);
     });
 
     this.resizeObserver = new ResizeObserver((entries) => {
-      const bounds = entries[entries.length - 1]?.contentRect;
-      this.queueFit(bounds);
+      const entry = entries[entries.length - 1];
+      if (entry) this.queueFit(this.boundsFromEntry(entry));
     });
     this.unsubscribeDamage = options.model.subscribeDamage(() => {
       if (!this.visible || this.documentSuspended || !this.host) return;
@@ -265,8 +269,10 @@ export class WebGpuTerminalSurface
 
     this.host = container;
     container.appendChild(this.root);
-    this.resizeObserver.observe(container);
+    observeHost(this.resizeObserver, container);
+    window.addEventListener?.("resize", this.handleWindowResize);
     this.pixelRatioMonitor.start();
+    this.scrollbarSync.forget();
     if (this.visible) {
       this.activateGpuResources();
       if (!this.documentSuspended) this.resizeToHost();
@@ -279,6 +285,7 @@ export class WebGpuTerminalSurface
   detach(): void {
     if (!this.host) return;
     this.resizeObserver.disconnect();
+    window.removeEventListener?.("resize", this.handleWindowResize);
     this.fitQueue.clear();
     this.pixelRatioMonitor.stop();
     this.clearCursorTimer();
@@ -354,16 +361,14 @@ export class WebGpuTerminalSurface
   setTheme(theme: TerminalGpuTheme): void {
     this.theme = theme;
     this.updateRootBackground();
-    this.themeBackground = packRgb(theme.background);
-    this.themeCursor = packRgb(theme.cursor);
-    this.selectionColor = packRgb(theme.selection.color);
     this.forceFullRedraw = true;
     this.runtime.schedule(this);
   }
 
   setFontMetrics(metrics: TerminalFontMetrics): void {
-    if (fontMetricsKey(this.metrics) === fontMetricsKey(metrics)) return;
-    this.metrics = metrics;
+    const next = metricsForScale(metrics, devicePixelScale());
+    if (metricsEqual(this.metrics, next)) return;
+    this.metrics = next;
     if (this.documentSuspended) {
       this.releaseGpuResources();
       this.releaseCanvas(true);
@@ -378,6 +383,7 @@ export class WebGpuTerminalSurface
     this.updateScrollbar();
   }
 
+  /** CSS-pixel cell size (device cell / ratio); hit-testing and overlays use it. */
   cellSize(): { readonly width: number; readonly height: number } {
     return { width: this.metrics.cellWidth, height: this.metrics.cellHeight };
   }
@@ -418,25 +424,28 @@ export class WebGpuTerminalSurface
   renderFrame(
     getEncoder: () => GPUCommandEncoder,
     resources: WebGpuSharedResources,
+    budget: RasterBudget = createRasterBudget(RASTER_BUDGET_MS),
   ): boolean {
     if (
       this.disposed ||
       !this.visible ||
       this.documentSuspended ||
       !this.target ||
-      !this.instanceBuffer ||
-      !this.colorBindGroup ||
-      !this.glyphBindGroup ||
+      !this.cellsBuffer ||
+      !this.uniformBuffer ||
       !this.atlasLease
     ) {
       return false;
     }
     if (resources.generation !== this.runtimeGeneration) {
       this.handleRuntimeReset(resources);
+      // The replacement canvas has no staged size yet.
+      this.resizeToHost(undefined, false);
     }
     this.applyQueuedFit();
-    if (this.options.model.deferPresentation()) return false;
-    const revision = this.options.model.revision();
+    const model = this.options.model;
+    if (model.deferPresentation()) return false;
+    const revision = model.revision();
     if (revision !== this.contentRevision) {
       this.contentRevision = revision;
       if (this.hoveredCell >= 0) this.clearHoveredLink();
@@ -449,60 +458,100 @@ export class WebGpuTerminalSurface
       this.backingStoreResizeCount += 1;
       this.forceFullRedraw = true;
     }
+    const lease = this.atlasLease;
+    const device = resources.device;
+    if (!lease || !this.cellsBuffer) return false;
 
-    const damage = this.options.model.consumeDamage();
-    const atlas = this.atlasLease.atlas;
-    const atlasChanged = atlas.generation !== this.atlasGeneration;
-    const needsCells =
-      this.forceFullRedraw || atlasChanged || damage.kind !== "none";
-    let cellsChanged = false;
-    if (needsCells) {
-      cellsChanged = this.updateCellInstances(
-        this.forceFullRedraw || atlasChanged ? { kind: "full" } : damage,
-        resources,
+    // The frame's cell view borrows WASM memory: upload it and scan it before
+    // any other call into the model.
+    const atlasStale = lease.atlas.epoch !== this.glyphMap.atlasEpoch;
+    const resync = this.needsResync || atlasStale;
+    const frame = model.consumeGpuFrame({ resync });
+    this.needsResync = false;
+    const expectedCells = frame.rows * frame.cols;
+    if (expectedCells > MAX_WEBGPU_SURFACE_CELLS) {
+      throw new Error(
+        `Terminal surface exceeds ${MAX_WEBGPU_SURFACE_CELLS} visible cells`,
       );
     }
+    const bufferReplaced = this.ensureCellCapacity(expectedCells, device);
+    const cellsUploaded = this.uploadCells(
+      frame,
+      bufferReplaced || resync,
+      device,
+    );
+    this.blinkingCells = frame.blinkingCells;
+    const glyphsChanged = this.updateGlyphs(
+      frame,
+      atlasStale,
+      resync,
+      budget,
+      device,
+    );
+
+    const cursor = model.cursor();
+    const viewportOrigin = model.viewportOriginLine();
     this.syncTextBlink();
-    const uniformChanged = this.updateScreenUniform(resources);
-    if (
-      !cellsChanged &&
-      !uniformChanged &&
-      !this.forcePresent &&
-      !this.forceFullRedraw
-    ) {
+    const searchChanged = this.updateSearchMask(device);
+    const uniformChanged = this.updateScreenUniform(
+      frame,
+      cursor,
+      viewportOrigin,
+      device,
+    );
+    const bindingsChanged = this.updateBindGroup(resources);
+
+    const redraw =
+      frame.damage.kind !== "none" ||
+      cellsUploaded ||
+      glyphsChanged ||
+      searchChanged ||
+      uniformChanged ||
+      bindingsChanged ||
+      this.forcePresent ||
+      this.forceFullRedraw;
+    if (!redraw || !this.bindGroup) {
       this.options.onFrame?.();
       return false;
     }
-    const encoder = getEncoder();
-    this.atlasLease.atlas.encodePendingUploads(encoder);
 
-    const target = this.target.context.getCurrentTexture().createView();
+    const viewportWidth = Math.min(
+      frame.cols * this.metrics.deviceCellWidth,
+      this.target.canvas.width,
+    );
+    const viewportHeight = Math.min(
+      frame.rows * this.metrics.deviceCellHeight,
+      this.target.canvas.height,
+    );
+    const encoder = getEncoder();
     const pass = encoder.beginRenderPass({
       label: "Terax terminal surface pass",
       colorAttachments: [
         {
-          view: target,
+          view: this.target.context.getCurrentTexture().createView(),
           clearValue: rgbClear(this.theme.background),
           loadOp: "clear",
           storeOp: "store",
         },
       ],
     });
-    const cellCount = this.options.model.cols * this.options.model.rows;
-    pass.setPipeline(resources.colorPipeline);
-    pass.setBindGroup(0, this.colorBindGroup);
-    pass.setVertexBuffer(0, this.instanceBuffer);
-    pass.draw(6, cellCount);
+    pass.setViewport(0, 0, viewportWidth, viewportHeight, 0, 1);
+    pass.setBindGroup(0, this.bindGroup);
+    pass.setPipeline(resources.backgroundPipeline);
+    pass.draw(3);
     pass.setPipeline(resources.glyphPipeline);
-    pass.setBindGroup(0, this.glyphBindGroup);
-    pass.setVertexBuffer(0, this.instanceBuffer);
-    pass.draw(6, cellCount);
+    pass.draw(6, expectedCells);
     pass.end();
     this.target.present();
 
     this.forceFullRedraw = false;
     this.forcePresent = false;
     this.frameCount += 1;
+    // Glyphs left over by the raster budget finish on a follow-up frame; a
+    // full atlas waits for the runtime's flush instead of spinning.
+    if (this.glyphMap.pending > 0 && !this.atlasBlocked) {
+      this.runtime.schedule(this);
+    }
     if (this.frameCount === 1) this.options.onFirstFrame?.();
     this.options.onFrame?.();
     return true;
@@ -556,7 +605,10 @@ export class WebGpuTerminalSurface
 
   diagnostics(): WebGpuTerminalSurfaceStats {
     const retainedBufferBytes =
-      (this.instanceBuffer?.size ?? 0) + (this.uniformBuffer?.size ?? 0);
+      (this.cellsBuffer?.size ?? 0) +
+      (this.uniformBuffer?.size ?? 0) +
+      (this.glyphMapBuffer?.size ?? 0) +
+      (this.searchBuffer?.size ?? 0);
     const canvasColorBytes = this.target
       ? this.target.canvas.width * this.target.canvas.height * 4
       : 0;
@@ -567,22 +619,23 @@ export class WebGpuTerminalSurface
       cellCapacity: this.cellCapacity,
       bufferBytes: retainedBufferBytes,
       cpuBufferBytes:
-        this.instanceData.byteLength +
-        this.screenData.byteLength +
-        this.uploadedScreenData.byteLength +
-        this.rowScratch.byteLength +
-        this.changedRows.byteLength +
-        this.blinkingRows.byteLength,
+        this.screen.data.byteLength +
+        this.glyphMap.byteSize +
+        this.searchScratch.byteLength,
       gpuBufferBytes: retainedBufferBytes,
       canvasColorBytes,
       estimatedSwapchainBytes: canvasColorBytes * 3,
       cols: this.options.model.cols,
       rows: this.options.model.rows,
+      scale: this.metrics.scale,
+      deviceCellWidth: this.metrics.deviceCellWidth,
+      deviceCellHeight: this.metrics.deviceCellHeight,
       visible: this.visible,
       documentSuspended: this.documentSuspended,
       focused: this.focused,
       uploads: this.uploadCount,
       uploadedBytes: this.uploadedBytes,
+      pendingGlyphs: this.glyphMap.pending,
       fit: this.fitQueue.diagnostics(),
     };
   }
@@ -595,6 +648,7 @@ export class WebGpuTerminalSurface
     this.unsubscribeResizeInteraction();
     this.search.dispose();
     this.selection.dispose();
+    this.scrollbarSync.dispose();
     this.unsubscribeInteraction();
     this.root.removeEventListener("pointerdown", this.handlePointerDown);
     this.root.removeEventListener("mousemove", this.handleLinkMouseMove);
@@ -640,12 +694,20 @@ export class WebGpuTerminalSurface
     this.runtime.interact(this);
   };
 
+  private readonly handleWindowResize = (): void => {
+    this.queueFit();
+  };
+
+  // The only place that reads scrollTop: scroll events are rare and the value
+  // is the user's, not ours.
   private readonly handleScroll = (): void => {
     if (!this.host || !this.visible || this.documentSuspended) return;
-    if (this.scrollbar.scrollTop === this.synchronizedScrollTop) return;
+    const scrollTop = this.scrollbar.scrollTop;
+    if (scrollTop === this.scrollbarSync.writtenScrollTop) return;
     this.scrollbarSync.invalidate();
+    this.scrollbarSync.observe(scrollTop);
     const { history, offset } = this.options.model.scrollPosition();
-    const line = Math.round(this.scrollbar.scrollTop / this.metrics.cellHeight);
+    const line = Math.round(scrollTop / this.metrics.cellHeight);
     if (history - line !== offset) {
       this.handleInteraction();
       this.options.model.scrollTo(history - line);
@@ -697,43 +759,33 @@ export class WebGpuTerminalSurface
         this.releaseCanvas(true);
       if (!this.target) {
         this.target = this.runtime.acquireCanvas();
+        this.target.canvas.style.transform = "";
+        this.appliedTransform = "";
         this.root.append(this.target.canvas);
       }
-      this.scale = Math.max(1, window.devicePixelRatio || 1);
-      this.atlasLease = this.runtime.acquireGlyphAtlas(
-        this.metrics,
-        this.scale,
-        this,
-      );
+      this.metrics = metricsForScale(this.metrics, devicePixelScale());
+      this.contrast = currentTextContrast(this.metrics.scale);
+      this.atlasLease = this.runtime.acquireGlyphAtlas(this.metrics, this);
+      this.glyphMap = new TerminalGlyphMap();
+      this.atlasBlocked = false;
+      this.needsResync = true;
       this.forceFullRedraw = true;
-      this.uniformUploaded = false;
+      this.screen.invalidate();
       this.uniformBuffer = resources.device.createBuffer({
         label: "Terax terminal surface uniform",
         size: SCREEN_UNIFORM_BYTES,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
-      this.colorBindGroup = resources.device.createBindGroup({
-        layout: resources.colorBindGroupLayout,
-        entries: [{ binding: 0, resource: { buffer: this.uniformBuffer } }],
-      });
-      this.glyphBindGroup = resources.device.createBindGroup({
-        layout: resources.glyphBindGroupLayout,
-        entries: [
-          { binding: 0, resource: { buffer: this.uniformBuffer } },
-          {
-            binding: 1,
-            resource: this.atlasLease.atlas.coverageTextureView,
-          },
-          { binding: 2, resource: this.atlasLease.atlas.colorTextureView },
-          { binding: 3, resource: resources.glyphSampler },
-        ],
-      });
-      this.runtimeGeneration = resources.generation;
-      this.atlasGeneration = this.atlasLease.atlas.generation;
+      this.glyphMapBuffer = this.createGlyphMapBuffer(
+        resources.device,
+        this.glyphMap.capacity,
+      );
       this.ensureCellCapacity(
         this.options.model.cols * this.options.model.rows,
         resources.device,
       );
+      this.bindGroupDirty = true;
+      this.runtimeGeneration = resources.generation;
     } catch (error) {
       this.releaseGpuResources();
       this.releaseCanvas(true);
@@ -774,36 +826,65 @@ export class WebGpuTerminalSurface
   }
 
   private releaseGpuResources(): void {
-    this.instanceBuffer?.destroy();
+    this.cellsBuffer?.destroy();
     this.uniformBuffer?.destroy();
-    this.instanceBuffer = null;
+    this.glyphMapBuffer?.destroy();
+    this.searchBuffer?.destroy();
+    this.cellsBuffer = null;
     this.uniformBuffer = null;
-    this.colorBindGroup = null;
-    this.glyphBindGroup = null;
+    this.glyphMapBuffer = null;
+    this.searchBuffer = null;
+    this.bindGroup = null;
+    this.bindGroupDirty = true;
+    this.searchRevision = -1;
+    this.searchScratch = new Uint8Array(0);
     this.atlasLease?.release();
     this.atlasLease = null;
+    this.glyphMap = new TerminalGlyphMap();
     this.cellCapacity = 0;
-    this.instanceData = new ArrayBuffer(0);
-    this.rowViews = [];
-    this.rowScratch = new Uint32Array(0);
-    this.rowScratchView = new DataView(new ArrayBuffer(0));
-    this.changedRows = new Uint8Array(0);
-    this.blinkingRows = new Uint8Array(0);
-    this.blinkingRowCount = 0;
+    this.blinkingCells = 0;
     this.forceFullRedraw = true;
+    this.needsResync = true;
   }
 
-  private queueFit(bounds?: Pick<DOMRectReadOnly, "width" | "height">): void {
+  private queueFit(bounds?: TerminalFitBounds): void {
     if (!this.host) return;
     this.fitQueue.request(bounds);
     this.runtime.schedule(this);
   }
 
+  private boundsFromEntry(entry: ResizeObserverEntry): TerminalFitBounds {
+    const device = entry.devicePixelContentBoxSize?.[0];
+    // Layout is clean inside a ResizeObserver callback, so this read is free.
+    const origin = this.root.getBoundingClientRect();
+    return {
+      width: entry.contentRect.width,
+      height: entry.contentRect.height,
+      device: device
+        ? { width: device.inlineSize, height: device.blockSize }
+        : undefined,
+      left: origin.left,
+      top: origin.top,
+    };
+  }
+
+  private measureHost(): TerminalFitBounds {
+    const rect = this.host?.getBoundingClientRect() ?? {
+      width: 0,
+      height: 0,
+    };
+    const origin = this.root.getBoundingClientRect();
+    return {
+      width: rect.width,
+      height: rect.height,
+      left: origin.left,
+      top: origin.top,
+    };
+  }
+
   private applyQueuedFit(): void {
     if (!this.host) return;
-    const bounds = this.fitQueue.take(
-      () => this.host?.getBoundingClientRect() ?? { width: 0, height: 0 },
-    );
+    const bounds = this.fitQueue.take(() => this.measureHost());
     if (bounds) this.resizeToHost(bounds, false);
     if (this.compactAfterResize && !this.resizeInteractionActive) {
       this.compactAfterResize = false;
@@ -814,7 +895,7 @@ export class WebGpuTerminalSurface
   }
 
   private resizeToHost(
-    measuredBounds?: Pick<DOMRectReadOnly, "width" | "height">,
+    measuredBounds?: TerminalFitBounds,
     scheduleRender = true,
   ): void {
     if (
@@ -826,18 +907,23 @@ export class WebGpuTerminalSurface
     )
       return;
     this.fitQueue.clear();
-    const bounds = measuredBounds ?? this.host.getBoundingClientRect();
-    const scale = Math.max(1, window.devicePixelRatio || 1);
+    const bounds = measuredBounds ?? this.measureHost();
+    const scale = devicePixelScale();
     this.scrollbarSync.invalidate();
     this.scrollbarViewportHeight = Math.round(bounds.height);
+    if (scale !== this.metrics.scale) {
+      // New ratio: re-measure the font, then rebuild atlas and buffers.
+      this.metrics = metricsForScale(this.metrics, scale);
+      this.handleRuntimeReset(this.runtime.resources());
+    }
     const fit = fitTerminalViewport(
       bounds.width,
       bounds.height,
       this.metrics,
-      scale,
+      bounds.device,
     );
-    if (!fit) return;
-    const { cols, rows, cssWidth, cssHeight, pixelWidth, pixelHeight } = fit;
+    if (!fit || !this.target) return;
+    const { cols, rows, pixelWidth, pixelHeight } = fit;
     if (cols * rows > MAX_WEBGPU_SURFACE_CELLS) {
       this.options.onError(
         new Error(
@@ -847,9 +933,6 @@ export class WebGpuTerminalSurface
       return;
     }
 
-    if (scale !== this.scale) {
-      this.handleRuntimeReset(this.runtime.resources());
-    }
     const changed =
       cols !== this.options.model.cols || rows !== this.options.model.rows;
     if (changed) {
@@ -866,23 +949,45 @@ export class WebGpuTerminalSurface
     const backingStoreChanged = this.target.backingStore.stage(
       pixelWidth,
       pixelHeight,
-      cssWidth,
-      cssHeight,
+      this.metrics.scale,
     );
+    const snapped = this.applySnap(bounds);
     if (changed || backingStoreChanged) {
       this.options.model.setPixelSize(pixelWidth, pixelHeight);
     }
     if (changed) this.options.onResize(cols, rows);
-    if (changed || backingStoreChanged) this.forceFullRedraw = true;
+    if (changed || backingStoreChanged || snapped) this.forceFullRedraw = true;
     this.updateScrollbar();
     if (scheduleRender && (changed || backingStoreChanged)) {
       this.runtime.schedule(this);
     }
   }
 
+  /**
+   * Moves the canvas onto the device pixel grid. The origin comes from the
+   * observer callback or a measurement, never from a per-frame read.
+   */
+  private applySnap(bounds: TerminalFitBounds): boolean {
+    if (!this.target) return false;
+    if (bounds.left !== undefined && bounds.top !== undefined) {
+      this.snapOrigin = { left: bounds.left, top: bounds.top };
+    }
+    const origin = this.snapOrigin;
+    if (!origin) return false;
+    const offset = snapOffsetCss(origin.left, origin.top, this.metrics.scale);
+    const transform =
+      offset.x === 0 && offset.y === 0
+        ? ""
+        : `translate(${offset.x}px, ${offset.y}px)`;
+    if (transform === this.appliedTransform) return false;
+    this.target.canvas.style.transform = transform;
+    this.appliedTransform = transform;
+    return true;
+  }
+
   private updateScrollbar(): void {
     if (!this.host || !this.visible || this.documentSuspended) return;
-    this.synchronizedScrollTop = this.scrollbarSync.sync(
+    this.scrollbarSync.sync(
       this.scrollbarViewportHeight,
       this.scrollbar,
       this.scrollbarContent,
@@ -891,379 +996,250 @@ export class WebGpuTerminalSurface
     );
   }
 
+  /** Grows the cell buffer; true if it was replaced (every row must upload). */
   private ensureCellCapacity(cellCount: number, device: GPUDevice): boolean {
-    if (cellCount <= this.cellCapacity) return false;
+    if (cellCount <= this.cellCapacity && this.cellsBuffer) return false;
     const capacity = nextWebGpuCellCapacity(this.cellCapacity, cellCount);
     this.replaceCellBuffer(capacity, device);
     return true;
   }
 
   private compactCellCapacity(): void {
-    if (!this.instanceBuffer || !this.host || this.documentSuspended) return;
+    if (!this.cellsBuffer || !this.host || this.documentSuspended) return;
     const required = this.options.model.cols * this.options.model.rows;
     const capacity = compactWebGpuCellCapacity(this.cellCapacity, required);
     if (capacity === null) return;
     this.replaceCellBuffer(capacity, this.runtime.resources().device);
     this.cellCompactionCount += 1;
     this.forceFullRedraw = true;
+    this.needsResync = true;
   }
 
   private replaceCellBuffer(capacity: number, device: GPUDevice): void {
-    this.instanceBuffer?.destroy();
+    this.cellsBuffer?.destroy();
     this.cellCapacity = capacity;
-    this.instanceData = new ArrayBuffer(capacity * PACKED_INSTANCE_BYTES);
-    this.rowViews = [];
-    this.instanceBuffer = createVertexBuffer(
-      device,
-      this.instanceData.byteLength,
-      "Terax terminal packed cell and glyph instances",
-    );
+    this.cellsBuffer = device.createBuffer({
+      label: "Terax terminal cell records",
+      size: capacity * CELL_RECORD_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    this.bindGroupDirty = true;
   }
 
-  private updateCellInstances(
-    damage: ReturnType<GhosttyTerminalModelApi["consumeDamage"]>,
-    resources: WebGpuSharedResources,
+  private createGlyphMapBuffer(device: GPUDevice, entries: number): GPUBuffer {
+    return device.createBuffer({
+      label: "Terax terminal glyph map",
+      size: entries * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+  }
+
+  private uploadCells(
+    frame: GhosttyGpuFrame,
+    everything: boolean,
+    device: GPUDevice,
   ): boolean {
-    if (!this.instanceBuffer || !this.atlasLease) return false;
-    const cells = this.options.model.renderCells();
-    const expectedCells = this.options.model.cols * this.options.model.rows;
-    if (cells.length !== expectedCells) {
-      throw new Error(
-        `Ghostty viewport mismatch: expected ${expectedCells}, received ${cells.length}`,
+    const buffer = this.cellsBuffer;
+    if (!buffer) return false;
+    const rowBytes = frame.cols * CELL_RECORD_BYTES;
+    const ranges = everything
+      ? [{ start: 0, end: frame.rows - 1 }]
+      : frame.dirtyRanges;
+    for (const range of ranges) {
+      const offset = range.start * rowBytes;
+      const length = (range.end - range.start + 1) * rowBytes;
+      device.queue.writeBuffer(buffer, offset, frame.cells, offset, length);
+      this.uploadCount += 1;
+      this.uploadedBytes += length;
+    }
+    return ranges.length > 0;
+  }
+
+  /**
+   * Maintains `glyph_map`: epoch resets, new ids, recovery after an atlas
+   * flush, and rasterization within the frame budget. Returns true if the map
+   * changed in a way that needs a redraw.
+   */
+  private updateGlyphs(
+    frame: GhosttyGpuFrame,
+    atlasStale: boolean,
+    resync: boolean,
+    budget: RasterBudget,
+    device: GPUDevice,
+  ): boolean {
+    const lease = this.atlasLease;
+    if (!lease) return false;
+    const atlas = lease.atlas;
+    const map = this.glyphMap;
+    const grew = map.ensureCapacity(frame.glyphCount);
+    if (frame.epoch !== map.zigEpoch) {
+      map.resetForEpoch(frame.epoch);
+      map.adoptAtlasEpoch(atlas.epoch);
+    } else if (atlasStale) {
+      map.invalidateAtlas(atlas.epoch);
+    }
+    map.add(frame.newGlyphs);
+    if (map.recovering) {
+      map.scanCells(
+        frame.cells,
+        frame.cols,
+        resync ? [{ start: 0, end: frame.rows - 1 }] : frame.dirtyRanges,
       );
     }
-    const capacityChanged = this.ensureCellCapacity(
-      expectedCells,
-      resources.device,
-    );
-    const rowShapeChanged =
-      this.blinkingRows.length !== this.options.model.rows;
-    if (rowShapeChanged) {
-      this.blinkingRows = new Uint8Array(this.options.model.rows);
-      this.blinkingRowCount = 0;
-    }
-    const rowWords = (this.options.model.cols * PACKED_INSTANCE_BYTES) / 4;
-    if (
-      this.rowViews.length !== this.options.model.rows ||
-      this.rowViews[0]?.length !== rowWords
-    ) {
-      this.rowScratch = new Uint32Array(rowWords);
-      this.rowScratchView = new DataView(this.rowScratch.buffer);
-      this.rowViews = Array.from(
-        { length: this.options.model.rows },
-        (_, row) =>
-          new Uint32Array(this.instanceData, row * rowWords * 4, rowWords),
-      );
-      this.changedRows = new Uint8Array(this.options.model.rows).fill(1);
-    } else {
-      this.changedRows.fill(0);
-    }
 
-    let ranges =
-      !capacityChanged && !rowShapeChanged && damage.kind === "rows"
-        ? damage.ranges
-        : [{ start: 0, end: this.options.model.rows - 1 }];
-    let stable = false;
-    let resetIsolatedAtlas = false;
-    for (let attempt = 0; attempt < 5 && !stable; attempt += 1) {
-      const generation = this.atlasLease.atlas.generation;
-      try {
-        for (const range of ranges) {
-          this.buildRows(cells, range.start, range.end);
-        }
-        stable = generation === this.atlasLease.atlas.generation;
-      } catch (error) {
-        if (!(error instanceof GlyphAtlasCapacityError)) throw error;
-        if (!this.atlasLease.isolated) {
-          this.replaceWithIsolatedAtlas();
-        } else if (!resetIsolatedAtlas) {
-          this.atlasLease.atlas.resetForRebuild();
-          resetIsolatedAtlas = true;
-        } else {
-          throw new Error(
-            `Visible glyphs exceed the bounded WebGPU atlas budget: ${error.message}`,
-          );
-        }
-      }
-      if (!stable) {
-        ranges = [{ start: 0, end: this.options.model.rows - 1 }];
-        this.changedRows.fill(1);
-      }
-    }
-    if (!stable) {
-      throw new Error("The WebGPU glyph atlas did not stabilize after rebuild");
-    }
+    map.shedBacklog(frame.cells, frame.cols, frame.rows);
+    const allowance =
+      this.frameCount === 0 || resync
+        ? FIRST_FRAME_RASTER_BUDGET_MS
+        : undefined;
+    const result = map.process(atlas, budget, allowance);
+    atlas.commit();
+    this.atlasBlocked = result.full;
+    if (result.full) lease.requestFlush();
 
-    let changed = false;
-    let firstRow = -1;
-    for (let row = 0; row <= this.changedRows.length; row++) {
-      if (this.changedRows[row]) {
-        if (firstRow < 0) firstRow = row;
-        continue;
-      }
-      if (firstRow < 0) continue;
-      const firstCell = firstRow * this.options.model.cols;
-      const cellCount = (row - firstRow) * this.options.model.cols;
-      firstRow = -1;
-      changed = true;
-      const byteOffset = firstCell * PACKED_INSTANCE_BYTES;
-      const byteLength = cellCount * PACKED_INSTANCE_BYTES;
-      resources.device.queue.writeBuffer(
-        this.instanceBuffer,
-        byteOffset,
-        this.instanceData,
-        byteOffset,
-        byteLength,
+    if (grew || this.glyphMapBuffer === null) {
+      this.glyphMapBuffer?.destroy();
+      this.glyphMapBuffer = this.createGlyphMapBuffer(device, map.capacity);
+      map.markAllDirty();
+      this.bindGroupDirty = true;
+    }
+    const dirty = map.takeDirty();
+    if (dirty && this.glyphMapBuffer) {
+      const count = Math.min(dirty.end, map.capacity - 1) - dirty.start + 1;
+      device.queue.writeBuffer(
+        this.glyphMapBuffer,
+        dirty.start * 4,
+        map.entries,
+        dirty.start,
+        count,
       );
       this.uploadCount += 1;
-      this.uploadedBytes += byteLength;
+      this.uploadedBytes += count * 4;
     }
+    return dirty !== null || result.resolved > 0;
+  }
 
-    if (this.atlasGeneration !== this.atlasLease.atlas.generation) {
-      changed = true;
-      this.glyphBindGroup = resources.device.createBindGroup({
-        layout: resources.glyphBindGroupLayout,
-        entries: [
-          { binding: 0, resource: { buffer: this.uniformBuffer as GPUBuffer } },
-          {
-            binding: 1,
-            resource: this.atlasLease.atlas.coverageTextureView,
-          },
-          {
-            binding: 2,
-            resource: this.atlasLease.atlas.colorTextureView,
-          },
-          { binding: 3, resource: resources.glyphSampler },
-        ],
+  /** Uploads the highlight mask only when it changes; frees it when empty. */
+  private updateSearchMask(device: GPUDevice): boolean {
+    const revision = this.search.maskRevision;
+    if (revision === this.searchRevision) return false;
+    this.searchRevision = revision;
+    const mask = this.search.viewportMaskBytes();
+    if (!mask) {
+      if (!this.searchBuffer) return false;
+      this.searchBuffer.destroy();
+      this.searchBuffer = null;
+      this.searchScratch = new Uint8Array(0);
+      this.bindGroupDirty = true;
+      return true;
+    }
+    const packed = packSearchMask(mask, this.searchScratch);
+    if (packed.buffer !== this.searchScratch.buffer) {
+      this.searchScratch = new Uint8Array(packed.buffer as ArrayBuffer);
+    }
+    if (!this.searchBuffer || this.searchBuffer.size !== packed.byteLength) {
+      this.searchBuffer?.destroy();
+      this.searchBuffer = device.createBuffer({
+        label: "Terax terminal search mask",
+        size: packed.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       });
-      this.atlasGeneration = this.atlasLease.atlas.generation;
+      this.bindGroupDirty = true;
     }
-    return changed;
+    device.queue.writeBuffer(this.searchBuffer, 0, packed);
+    this.uploadCount += 1;
+    this.uploadedBytes += packed.byteLength;
+    return true;
   }
 
-  private replaceWithIsolatedAtlas(): void {
-    const previous = this.atlasLease;
-    const replacement = this.runtime.acquireIsolatedGlyphAtlas(
-      this.metrics,
-      this.scale,
-      this.atlasOwnerKey,
-      this,
-    );
-    this.atlasLease = replacement;
-    this.atlasGeneration = 0;
-    previous?.release();
+  private updateBindGroup(resources: WebGpuSharedResources): boolean {
+    const lease = this.atlasLease;
+    if (
+      !lease ||
+      !this.uniformBuffer ||
+      !this.cellsBuffer ||
+      !this.glyphMapBuffer
+    )
+      return false;
+    const atlas = lease.atlas;
+    if (
+      !this.bindGroupDirty &&
+      this.bindGroup &&
+      atlas.generation === this.boundAtlasGeneration
+    )
+      return false;
+    this.bindGroup = resources.device.createBindGroup({
+      label: "Terax terminal surface bindings",
+      layout: resources.bindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.uniformBuffer } },
+        { binding: 1, resource: { buffer: this.cellsBuffer } },
+        { binding: 2, resource: { buffer: this.glyphMapBuffer } },
+        { binding: 3, resource: { buffer: atlas.tableBuffer } },
+        {
+          binding: 4,
+          resource: { buffer: this.searchBuffer ?? resources.emptyStorage },
+        },
+        { binding: 5, resource: atlas.coverageTextureView },
+        { binding: 6, resource: atlas.colorTextureView },
+      ],
+    });
+    this.boundAtlasGeneration = atlas.generation;
+    this.bindGroupDirty = false;
+    return true;
   }
 
-  private buildRows(
-    cells: TerminalCellReader,
-    firstRow: number,
-    lastRow: number,
-  ): void {
-    const cols = this.options.model.cols;
-    const cellWidth = this.metrics.cellWidth * this.scale;
-    const cellHeight = this.metrics.cellHeight * this.scale;
-    const viewportOriginLine = this.options.model.viewportOriginLine();
-    const selectionBounds = this.selection.normalizedBounds();
-    const leftPadding = Math.max(
-      0,
-      Math.floor((this.metrics.font.letterSpacing * this.scale) / 2),
-    );
-    const first = Math.max(0, firstRow);
-    const last = Math.min(this.options.model.rows - 1, lastRow);
+  private boundAtlasGeneration = 0;
 
-    for (let row = first; row <= last; row += 1) {
-      const previous = this.rowViews[row];
-      this.rowScratch.fill(0);
-      let rowHasBlinkingCell = false;
-      let previousBackground = this.themeBackground;
-      for (let column = 0; column < cols; column += 1) {
-        const index = row * cols + column;
-        const width = cells.width(index);
-        if (width === 0) continue;
-
-        const flags = cells.flags(index);
-        let foreground = cells.foregroundPacked(index);
-        let background = cells.backgroundPacked(index);
-        if ((flags & CellFlags.INVERSE) !== 0) {
-          const originalForeground = foreground;
-          foreground = background;
-          background = originalForeground;
-        }
-        const searchMatch = this.search.matchAt(row, column);
-        if (searchMatch !== 0) {
-          background =
-            searchMatch === 2
-              ? SEARCH_ACTIVE_MATCH_BACKGROUND
-              : SEARCH_MATCH_BACKGROUND;
-        }
-        if (
-          selectionBounds &&
-          selectionBoundsContain(
-            selectionBounds,
-            viewportOriginLine + row,
-            column,
-          )
-        ) {
-          background = blendPackedRgb(
-            background,
-            this.selectionColor,
-            this.theme.selection.alpha,
-          );
-        }
-        const originX = column * cellWidth;
-        const originY = row * cellHeight;
-        const spanWidth = width * cellWidth;
-        const underlineStyle =
-          (flags & CellFlags.UNDERLINE) !== 0
-            ? cells.underlineStyle(index) & CELL_FLAG_UNDERLINE_MASK
-            : 0;
-        const cellFlags =
-          underlineStyle |
-          ((flags & CellFlags.STRIKETHROUGH) !== 0
-            ? CELL_FLAG_STRIKETHROUGH
-            : 0) |
-          (cells.overline(index) ? CELL_FLAG_OVERLINE : 0);
-        writeCellInstance(
-          this.rowScratchView,
-          column,
-          originX,
-          originY,
-          spanWidth,
-          cellHeight,
-          background,
-          cells.underlineColorPacked(index),
-          foreground,
-          cellFlags,
-        );
-
-        const codepoint = cells.codepoint(index);
-        if (
-          codepoint !== 0 &&
-          codepoint !== 32 &&
-          (flags & CellFlags.INVISIBLE) === 0
-        ) {
-          const grapheme =
-            cells.graphemeLength(index) > 0
-              ? this.options.model.grapheme(row, column)
-              : null;
-          const glyph = this.atlasLease?.atlas.glyph(
-            codepoint,
-            grapheme,
-            flags,
-          );
-          if (glyph) {
-            rowHasBlinkingCell ||=
-              (flags & CellFlags.BLINK) !== 0 &&
-              glyph.width > 0 &&
-              glyph.height > 0;
-            let offsetX = glyph.originOffsetX;
-            let glyphWidth = glyph.width;
-            let uvMinX = glyph.uvMinX;
-            if (previousBackground !== background && offsetX < -leftPadding) {
-              const clipped = Math.min(glyphWidth, -leftPadding - offsetX);
-              offsetX += clipped;
-              glyphWidth -= clipped;
-              uvMinX += (glyph.uvMaxX - glyph.uvMinX) * (clipped / glyph.width);
-            }
-            let glyphFlags = glyph.intrinsicColor
-              ? GLYPH_FLAG_INTRINSIC_COLOR
-              : 0;
-            if (this.atlasLease?.atlas.coverageInRed) {
-              glyphFlags |= GLYPH_FLAG_COVERAGE_RED;
-            }
-            if ((flags & CellFlags.BLINK) !== 0) {
-              glyphFlags |= GLYPH_FLAG_BLINK;
-            }
-            writeGlyphInstance(
-              this.rowScratchView,
-              column,
-              originX + offsetX,
-              originY + glyph.originOffsetY,
-              glyphWidth,
-              glyph,
-              uvMinX,
-              foreground,
-              (flags & CellFlags.FAINT) !== 0 ? 0.5 : 1,
-              glyphFlags,
-            );
-          }
-        }
-        previousBackground = background;
-      }
-      if (!this.changedRows[row]) {
-        for (let index = 0; index < previous.length; index++) {
-          if (previous[index] === this.rowScratch[index]) continue;
-          this.changedRows[row] = 1;
-          break;
-        }
-      }
-      if (this.changedRows[row]) previous.set(this.rowScratch);
-      const hadBlinkingCell = this.blinkingRows[row] !== 0;
-      if (hadBlinkingCell !== rowHasBlinkingCell) {
-        this.blinkingRowCount += rowHasBlinkingCell ? 1 : -1;
-        this.blinkingRows[row] = rowHasBlinkingCell ? 1 : 0;
-      }
-    }
-  }
-
-  private updateScreenUniform(resources: WebGpuSharedResources): boolean {
-    if (!this.uniformBuffer || !this.target) return false;
-    this.screenData.fill(0);
-    this.screenData[0] = this.target.canvas.width;
-    this.screenData[1] = this.target.canvas.height;
-    const cursor = this.options.model.cursor();
+  private updateScreenUniform(
+    frame: GhosttyGpuFrame,
+    cursor: ReturnType<GhosttyTerminalModelApi["cursor"]>,
+    viewportOriginLine: number,
+    device: GPUDevice,
+  ): boolean {
+    if (!this.uniformBuffer) return false;
     this.nativeCursorVisible =
       cursor.visible &&
       cursor.x >= 0 &&
-      cursor.x < this.options.model.cols &&
+      cursor.x < frame.cols &&
       cursor.y >= 0 &&
-      cursor.y < this.options.model.rows;
+      cursor.y < frame.rows;
     if (cursor.blinking !== this.cursorBlinking) {
       this.cursorBlinking = cursor.blinking;
       this.cursorVisible = true;
     }
     this.armCursorBlink();
-    if (
-      this.cursorEnabled &&
-      this.cursorVisible &&
-      cursor.visible &&
-      cursor.x >= 0 &&
-      cursor.x < this.options.model.cols &&
-      cursor.y >= 0 &&
-      cursor.y < this.options.model.rows
-    ) {
-      const cellWidth = this.metrics.cellWidth * this.scale;
-      const cellHeight = this.metrics.cellHeight * this.scale;
-      const x = cursor.x * cellWidth;
-      const y = cursor.y * cellHeight;
-      const style = cursor.style;
-      this.screenData[2] = x;
-      this.screenData[3] =
-        style === "underline" ? y + cellHeight - Math.max(2, this.scale) : y;
-      this.screenData[4] =
-        style === "bar" ? Math.max(2, this.scale) : cellWidth;
-      this.screenData[5] =
-        style === "underline" ? Math.max(2, this.scale) : cellHeight;
-    }
-    this.screenData[6] = this.textBlinkVisible ? 1 : 0;
-    this.screenData[7] = 0;
-    this.screenData[8] = ((this.themeCursor >> 16) & 0xff) / 255;
-    this.screenData[9] = ((this.themeCursor >> 8) & 0xff) / 255;
-    this.screenData[10] = (this.themeCursor & 0xff) / 255;
-    this.screenData[11] = 1;
-    this.screenData[12] = this.metrics.baseline * this.scale;
-    this.screenData[13] = Math.max(1, this.scale);
-    this.screenData[14] = Math.floor(
-      this.metrics.cellHeight * this.scale * 0.52,
-    );
-    let changed = !this.uniformUploaded;
-    for (let index = 0; !changed && index < this.screenData.length; index++) {
-      changed = this.screenData[index] !== this.uploadedScreenData[index];
-    }
-    if (!changed) return false;
-    resources.device.queue.writeBuffer(this.uniformBuffer, 0, this.screenData);
-    this.uploadedScreenData.set(this.screenData);
-    this.uniformUploaded = true;
+    const showCursor =
+      this.cursorEnabled && this.cursorVisible && this.nativeCursorVisible;
+    const bounds = this.selection.normalizedBounds();
+    const theme = this.theme;
+    this.screen.pack({
+      cols: frame.cols,
+      rows: frame.rows,
+      cellWidth: this.metrics.deviceCellWidth,
+      cellHeight: this.metrics.deviceCellHeight,
+      textBlinkVisible: this.textBlinkVisible,
+      searchActive: this.searchBuffer !== null,
+      cursor: showCursor
+        ? cursorRect(cursor, cursor.style, this.metrics)
+        : null,
+      cursorColor: theme.cursor,
+      background: theme.background,
+      selection: bounds
+        ? selectionUniform(bounds, viewportOriginLine, frame.rows)
+        : NO_SELECTION,
+      selectionColor: theme.selection.color,
+      selectionAlpha: theme.selection.alpha,
+      decoration: decorationMetrics(this.metrics),
+      leftOverhangPadding: leftOverhangPadding(
+        this.metrics.font.letterSpacing,
+        this.metrics.scale,
+      ),
+      contrast: this.contrast,
+    });
+    if (!this.screen.changed()) return false;
+    device.queue.writeBuffer(this.uniformBuffer, 0, this.screen.data);
+    this.screen.markUploaded();
     this.uploadCount += 1;
     this.uploadedBytes += SCREEN_UNIFORM_BYTES;
     return true;
@@ -1300,7 +1276,7 @@ export class WebGpuTerminalSurface
 
   private syncTextBlink(): void {
     if (
-      this.blinkingRowCount === 0 ||
+      this.blinkingCells === 0 ||
       !this.windowFocused ||
       this.documentSuspended ||
       !this.visible ||
@@ -1334,40 +1310,29 @@ export class WebGpuTerminalSurface
   }
 }
 
-function createVertexBuffer(
-  device: GPUDevice,
-  size: number,
-  label: string,
-): GPUBuffer {
-  return device.createBuffer({
-    label,
-    size,
-    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+function currentTextContrast(scale: number): TextContrast {
+  let override: string | null = null;
+  try {
+    override = window.localStorage?.getItem(TEXT_CONTRAST_STORAGE_KEY) ?? null;
+  } catch {
+    override = null;
+  }
+  return textContrastFor({
+    platform: detectPlatform(
+      typeof navigator === "undefined" ? "" : navigator.userAgent,
+    ),
+    scale,
+    override,
   });
 }
 
-function blendPackedRgb(
-  background: number,
-  foreground: number,
-  alpha: number,
-): number {
-  const amount = Math.max(0, Math.min(1, alpha));
-  const inverse = 1 - amount;
-  const red = Math.round(
-    ((background >> 16) & 0xff) * inverse +
-      ((foreground >> 16) & 0xff) * amount,
-  );
-  const green = Math.round(
-    ((background >> 8) & 0xff) * inverse + ((foreground >> 8) & 0xff) * amount,
-  );
-  const blue = Math.round(
-    (background & 0xff) * inverse + (foreground & 0xff) * amount,
-  );
-  return (red << 16) | (green << 8) | blue;
-}
-
-function packRgb(color: Rgb): number {
-  return (color[0] << 16) | (color[1] << 8) | color[2];
+/** Asks for the exact device-pixel box where the engine supports it. */
+function observeHost(observer: ResizeObserver, host: HTMLElement): void {
+  try {
+    observer.observe(host, { box: "device-pixel-content-box" });
+  } catch {
+    observer.observe(host);
+  }
 }
 
 function rgbClear(color: Rgb): GPUColor {
@@ -1377,19 +1342,6 @@ function rgbClear(color: Rgb): GPUColor {
     b: color[2] / 255,
     a: 1,
   };
-}
-
-function fontMetricsKey(metrics: TerminalFontMetrics): string {
-  return [
-    metrics.font.family,
-    metrics.font.size,
-    metrics.font.lineHeight,
-    metrics.font.letterSpacing,
-    metrics.font.weight,
-    metrics.cellWidth,
-    metrics.cellHeight,
-    metrics.baseline,
-  ].join("|");
 }
 
 function toError(error: unknown): Error {
