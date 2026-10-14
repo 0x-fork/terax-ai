@@ -211,6 +211,13 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_opener::init())
+        .on_page_load(|webview, payload| {
+            if matches!(payload.event(), tauri::webview::PageLoadEvent::Started) {
+                if let Some(state) = webview.try_state::<net::AiStreamState>() {
+                    state.cancel_window(webview.window().label());
+                }
+            }
+        })
         .setup(move |_app| {
             #[cfg(target_os = "macos")]
             modules::window_presentation::macos::install(_app.handle());
@@ -232,6 +239,8 @@ pub fn run() {
             Ok(())
         })
         .manage(pty::PtyState::default())
+        .manage(net::AiStreamState::default())
+        .manage(modules::ai_sessions::SessionFilesState::default())
         .manage(modules::window_presentation::WindowPresentationState::default())
         .manage(control_state)
         .manage(shell::ShellState::default())
@@ -334,6 +343,11 @@ pub fn run() {
             net::lm_ping,
             net::ai_http_request,
             net::ai_http_stream,
+            net::ai_http_cancel,
+            net::ai_http_ack,
+            modules::ai_sessions::ai_session_load,
+            modules::ai_sessions::ai_session_save,
+            modules::ai_sessions::ai_session_delete,
             history::history_suggest,
             history::history_commands,
             history::history_record,
@@ -346,6 +360,15 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             match event {
+                tauri::RunEvent::WindowEvent {
+                    label,
+                    event: tauri::WindowEvent::Destroyed,
+                    ..
+                } => {
+                    if let Some(state) = app.try_state::<net::AiStreamState>() {
+                        state.cancel_window(&label);
+                    }
+                }
                 // Servers exit on stdin EOF, but destructors are not guaranteed
                 // on process exit; kill explicitly.
                 tauri::RunEvent::Exit => {

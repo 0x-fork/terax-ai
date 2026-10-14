@@ -1,5 +1,14 @@
+import { toast } from "sonner";
+import { flushPersist } from "@/modules/ai/store/chatStore";
+import { flushSessionWrites } from "@/modules/ai/lib/sessions";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
+import {
+  type RefObject,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import type { Tab } from "@/modules/tabs";
 import { leafHasForegroundProcess, leafIds } from "@/modules/terminal";
@@ -30,6 +39,24 @@ export function useAppCloseGuard(tabsRef: RefObject<Tab[]>) {
   const [pendingAppClose, setPendingAppClose] =
     useState<AppCloseBlocker | null>(null);
   const forceClose = useRef(false);
+  const closing = useRef(false);
+  const finishClose = useCallback(async () => {
+    if (closing.current) return;
+    closing.current = true;
+    try {
+      flushPersist();
+      await flushSessionWrites();
+      forceClose.current = true;
+      await getCurrentWindow().close();
+    } catch (error) {
+      forceClose.current = false;
+      toast.error("Could not save chat history", {
+        description: String(error),
+      });
+    } finally {
+      closing.current = false;
+    }
+  }, []);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -50,8 +77,7 @@ export function useAppCloseGuard(tabsRef: RefObject<Tab[]>) {
         if (dirtyEditors > 0 || busyTerminal) {
           setPendingAppClose({ dirtyEditors, busyTerminal });
         } else {
-          forceClose.current = true;
-          void getCurrentWindow().close();
+          void finishClose();
         }
       })
       .then((un) => {
@@ -62,13 +88,12 @@ export function useAppCloseGuard(tabsRef: RefObject<Tab[]>) {
       disposed = true;
       unlisten?.();
     };
-  }, [tabsRef]);
+  }, [tabsRef, finishClose]);
 
   const confirmAppClose = useCallback(() => {
     setPendingAppClose(null);
-    forceClose.current = true;
-    void getCurrentWindow().close();
-  }, []);
+    void finishClose();
+  }, [finishClose]);
 
   const cancelAppClose = useCallback(() => setPendingAppClose(null), []);
 

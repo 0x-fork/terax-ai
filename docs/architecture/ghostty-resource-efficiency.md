@@ -1,5 +1,123 @@
 # Ghostty resource efficiency
 
+## October 8 implementation and native measurements
+
+The implementation uses Ghostty nightly `7ec9e26a29399b30ef78f06985fc75045b3cecb6`,
+with rebuilt SIMD and scalar artifacts. It retains Terax's persistent models and
+shared rendering architecture. The baseline is `c510c96`.
+
+A synthetic native WKWebView workload reproduced large presentation allocation
+spikes without React, PTYs, AI providers, or user data. It runs two tabs in a
+1000 by 650 CSS-pixel window at DPR 2, streams output, switches tabs 100 times,
+resizes 100 times, repaints identical rows 100 times, and releases presentation.
+The profiler verifies the host and WebKit helpers' process coalitions before
+sampling physical footprint. It records exact built-asset hashes and raw samples.
+
+| Sample | Baseline | Candidate |
+| --- | ---: | ---: |
+| Two blank terminals | 220.97 MiB | 219.07 MiB |
+| After 100 tab switches | 1315.22 MiB | 223.28 MiB |
+| After 100 resize steps | 765.44 MiB | 195.89 MiB |
+| Ten seconds after disposal | 150.66 MiB | 117.69 MiB |
+| GPU submissions for 100 identical repaints | 100 | 0 |
+| Cell bytes uploaded for those repaints | 20,601,600 | 0 |
+| Renderer callback time for those repaints | 123 ms | 84 ms |
+
+The [baseline](resource-evidence-2026-10-08/renderer-baseline.json) and
+[candidate](resource-evidence-2026-10-08/renderer-candidate.json) reports preserve
+all samples. Earlier candidate runs measured 55 ms for the repaint callbacks;
+a first [row-comparison prototype](resource-evidence-2026-10-08/renderer-row-comparison-prototype.json)
+took 155 ms and was replaced with reusable row staging. Timing variation is
+retained rather than treated as a universal CPU speedup. These are local native
+renderer measurements, not total Terax, battery, or multi-day qualification.
+The small initial two-tab difference is not a demonstrated cold-start RAM gain.
+The clear result is avoidance of the reproduced allocation spikes and redundant
+GPU work.
+
+A separate [four-pane-per-tab run](resource-evidence-2026-10-08/renderer-four-panes.json)
+uses eight models, four visible surfaces, and the same transition workload. It
+measured 245.21 MiB after switching and 202.80 MiB after resizing. It is a
+multi-pane smoke test, not a comparison against the one-pane baseline.
+
+The implementation:
+
+- Pools configured WebGPU canvas targets independently of terminal models.
+  At most eight unused targets share a 32 MiB color-storage budget and individual
+  two-second deadlines. Actual driver/compositor allocations are additional.
+  Hidden panes release their lease; a reused canvas stays invisible until its
+  new owner's frame is encoded. Occlusion reclamation, sleep, and device loss
+  release the relevant targets immediately. Reusing another target does not
+  extend an older target's deadline.
+- Reuses nearby backing sizes with bounded slack while preserving CSS pixel
+  scale and clipping. First presentation uses exact dimensions; large reductions
+  reclaim excess storage. This avoids allocating a new presentation buffer for
+  every adjacent resize step.
+- Builds cells into a reusable row buffer and compares the exact packed values.
+  Unchanged rows neither upload nor trigger presentation. There are no hashes
+  that could hide a real change through collisions. Frames that resolve to
+  unchanged pixels do not create GPU encoders. Invisible blinking text does not
+  arm a text-blink timer.
+- Parses PTY output in slices of at most 32 KiB and yields between slices after
+  a four-millisecond work budget. A shared FIFO MessageChannel scheduler gives
+  other terminals and UI tasks a turn without relying on background timer
+  cadence. It closes its ports when idle. Acknowledgments still correspond only
+  to fully parsed native chunk boundaries. The two-message/2 MiB transport
+  bounds and post-exit drain protocol remain intact.
+- Gates editor, diff, Markdown and history imports on actual live surfaces.
+  Runtime rendering tests cover the lazy loaders, complementing static import
+  graph checks.
+- Uses raw binary AI request and response transport, owner-scoped cancellation,
+  and a two-chunk native credit window. Chunks are at most 64 KiB; the frontend
+  consumer queue has a 192 KiB hard limit. There are at most 16 native requests.
+  Cancellation during startup is retried after native registration is confirmed.
+  Closing or reloading a window cancels its requests, including requests waiting for credit.
+- Stores conversations in individual atomic files. Metadata stays in the small
+  store; migrating legacy messages preserves a backup and never overwrites an
+  existing newer message file. Writes and deletions are ordered per session,
+  a native I/O gate preserves ordering across page reloads, failed latest writes
+  remain retryable, and normal window close flushes queued
+  writes. Startup hydration reports failures and avoids duplicate initial chats.
+
+The [nightly core profile](resource-evidence-2026-10-08/core-profile.json) records
+one additional 64 KiB WASM page compared with the old pin. Twenty blank models
+use 10.4375 MiB. Both [stress variants](resource-evidence-2026-10-08/core-soak.json)
+process 655,360 writes / 62,684,160 bytes, finishing at 68.1875 MiB with zero growth
+across the final 16 samples. Core timing differences are small and do not explain
+the presentation-memory improvement. The official nightly binary is not substituted
+for Terax's custom bridge. The source pin and both checksums remain explicit.
+
+Reproduce the native renderer workload on macOS:
+
+```sh
+pnpm profile:renderer:macos --output /tmp/terax-renderer-current
+pnpm profile:renderer:macos --panes 4 --output /tmp/terax-renderer-four
+pnpm profile:renderer:macos --source /path/to/baseline-checkout --output /tmp/terax-renderer-baseline
+```
+
+A source archive without Git metadata also needs `--revision <commit>`. Baseline
+sources need installed dependencies. `--inspect` keeps the final frame visible for three minutes for live inspection.
+WKWebView's snapshot API returned stale WebGPU pixels in this environment, so
+saved WKWebView snapshots are not used as visual proof. The live window was
+inspected and matched the synthetic terminal model. Keep the benchmark visible
+and focused; suspended or unfocused runs fail qualification. The profiler opens a separate synthetic window and does
+not load Terax settings, terminals, or conversation data.
+
+`pnpm test:ipc:macos` builds a debug Tauri fixture with a unique application id,
+uses a loopback HTTP server, and removes its synthetic profile afterward. The
+[recorded run](resource-evidence-2026-10-08/ipc-smoke.json) verifies UTF-8 request
+bodies, delayed consumption, byte-preserving streaming, cancellation that closes
+the HTTP connection, and conversation save/load/delete through actual Tauri IPC.
+It makes no provider calls. These tools do not ship in the application.
+
+Packaged input/IME/accessibility, real GPU loss, mixed-DPR displays, prolonged
+whole-app workloads, energy, and physical Windows/Linux checks remain release
+qualification requirements. The earlier user's running application's large
+graphics footprint was observed, but the controlled experiment does not prove
+that every source of that application's retention is eliminated.
+
+## Earlier September evidence
+
+
 This pass addresses avoidable presentation churn, GPU backlog, and resource
 ownership around desktop transitions, occlusion, and sleep. It does not yet
 attribute the reported Activity Monitor spike to a specific process or prove

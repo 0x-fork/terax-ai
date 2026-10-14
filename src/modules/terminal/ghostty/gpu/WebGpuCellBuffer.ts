@@ -127,10 +127,14 @@ function writePackedColor(
   color: number,
   alpha: number,
 ): void {
-  view.setUint8(offset, (color >> 16) & 0xff);
-  view.setUint8(offset + 1, (color >> 8) & 0xff);
-  view.setUint8(offset + 2, color & 0xff);
-  view.setUint8(offset + 3, Math.round(clamp01(alpha) * 255));
+  view.setUint32(
+    offset,
+    ((color >>> 16) & 0xff) |
+      (color & 0xff00) |
+      ((color & 0xff) << 16) |
+      (Math.round(clamp01(alpha) * 255) << 24),
+    true,
+  );
 }
 
 function normalizedUint16(value: number): number {

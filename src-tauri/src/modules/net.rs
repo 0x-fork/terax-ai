@@ -2,12 +2,15 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{future::Abortable, StreamExt};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
-use tauri::ipc::Channel;
+use tauri::ipc::{InvokeBody, JavaScriptChannelId, Request, Response};
+use tauri::{State, WebviewWindow};
+
+mod stream;
+pub use stream::AiStreamState;
 
 const HEADER_BLOCKLIST: &[&str] = &[
     "host",
@@ -246,8 +249,7 @@ fn build_safe_client(
     allow_private: bool,
     pinned: &[(String, Vec<IpAddr>)],
 ) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10));
+    let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(10));
     // Pin reqwest's resolver to the IPs we just classified. Without this,
     // reqwest's own DNS lookup could return a different (private/metadata) IP
     // for the same hostname between classify and connect — classic DNS
@@ -340,98 +342,117 @@ pub async fn ai_http_request(
     })
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
-pub enum AiStreamEvent {
-    Headers {
-        status: u16,
-        headers: HashMap<String, String>,
-    },
-    Chunk {
-        bytes: Vec<u8>,
-    },
-    End,
-    Error {
-        message: String,
-    },
+#[derive(Serialize)]
+struct StreamHeaders {
+    status: u16,
+    headers: HashMap<String, String>,
+}
+
+fn stream_packet(kind: u8, bytes: &[u8]) -> Response {
+    let mut packet = Vec::with_capacity(bytes.len() + 1);
+    packet.push(kind);
+    packet.extend_from_slice(bytes);
+    Response::new(packet)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamRequest {
+    request_id: String,
+    url: String,
+    method: String,
+    headers: Option<HashMap<String, String>>,
+    allow_private_network: Option<bool>,
+    on_event: JavaScriptChannelId,
 }
 
 #[tauri::command]
 pub async fn ai_http_stream(
-    url: String,
-    method: String,
-    headers: Option<HashMap<String, String>>,
-    body: Option<Vec<u8>>,
-    allow_private_network: Option<bool>,
-    on_event: Channel<AiStreamEvent>,
+    window: WebviewWindow,
+    state: State<'_, AiStreamState>,
+    request: Request<'_>,
 ) -> Result<(), String> {
-    let allow_private = allow_private_network.unwrap_or(false);
-    let parsed = match validate_url(&url, allow_private) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = on_event.send(AiStreamEvent::Error { message: e.clone() });
-            return Err(e);
-        }
+    let metadata = request
+        .headers()
+        .get("x-terax-ai-request")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.len() <= 64 * 1024)
+        .ok_or("missing or oversized AI request metadata")?;
+    let StreamRequest {
+        request_id,
+        url,
+        method,
+        headers,
+        allow_private_network,
+        on_event,
+    } = serde_json::from_str(metadata).map_err(|e| e.to_string())?;
+    let on_event = on_event.channel_on::<_, Response>(window.as_ref().clone());
+    let InvokeBody::Raw(bytes) = request.body() else {
+        return Err("expected binary AI request body".into());
     };
-    let host = match parsed.host_str() {
-        Some(h) => h.to_string(),
-        None => {
-            let e = "missing host".to_string();
-            let _ = on_event.send(AiStreamEvent::Error { message: e.clone() });
-            return Err(e);
-        }
+    if bytes.len() > 64 * 1024 * 1024 {
+        return Err("AI request body exceeds 64 MiB".into());
+    }
+    let body = if bytes.is_empty() {
+        None
+    } else {
+        Some(bytes.clone())
     };
-    let safe_ips = match classify_and_collect_safe_ips(&host, allow_private).await {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = on_event.send(AiStreamEvent::Error { message: e.clone() });
-            return Err(e);
-        }
-    };
-
-    let client = build_safe_client(allow_private, &[(host, safe_ips)])?;
-
-    let req = build_request(&client, &method, parsed, headers, body)?;
-    let resp = match req.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = on_event.send(AiStreamEvent::Error {
-                message: e.to_string(),
-            });
-            return Err(e.to_string());
-        }
-    };
-
-    let status = resp.status().as_u16();
-    let headers = header_map_to_strings(resp.headers());
-    let _ = on_event.send(AiStreamEvent::Headers { status, headers });
-
-    let mut stream = resp.bytes_stream();
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(chunk) => {
-                let bytes: Bytes = chunk;
-                if on_event
-                    .send(AiStreamEvent::Chunk {
-                        bytes: bytes.to_vec(),
-                    })
-                    .is_err()
-                {
-                    // Channel dropped (frontend aborted) — stop streaming.
-                    return Ok(());
+    let (lease, registration) = state.start(window.label(), &request_id)?;
+    tauri::async_runtime::spawn(async move {
+        let run = async {
+            let allow_private = allow_private_network.unwrap_or(false);
+            let parsed = validate_url(&url, allow_private)?;
+            let host = parsed.host_str().ok_or("missing host")?.to_string();
+            let safe_ips = classify_and_collect_safe_ips(&host, allow_private).await?;
+            let client = build_safe_client(allow_private, &[(host, safe_ips)])?;
+            let request = build_request(&client, &method, parsed, headers, body)?;
+            let response = request.send().await.map_err(|e| e.to_string())?;
+            let metadata = serde_json::to_vec(&StreamHeaders {
+                status: response.status().as_u16(),
+                headers: header_map_to_strings(response.headers()),
+            })
+            .map_err(|e| e.to_string())?;
+            on_event
+                .send(stream_packet(0, &metadata))
+                .map_err(|e| e.to_string())?;
+            let mut chunks = response.bytes_stream();
+            while let Some(chunk) = chunks.next().await {
+                let chunk = chunk.map_err(|e| e.to_string())?;
+                for bytes in chunk.chunks(stream::CHUNK_BYTES) {
+                    lease.control.reserve(bytes.len()).await?;
+                    on_event
+                        .send(stream_packet(1, bytes))
+                        .map_err(|e| e.to_string())?;
                 }
             }
-            Err(e) => {
-                let _ = on_event.send(AiStreamEvent::Error {
-                    message: e.to_string(),
-                });
-                return Err(e.to_string());
-            }
+            lease.control.drained().await?;
+            on_event
+                .send(stream_packet(2, &[]))
+                .map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        };
+        if let Ok(Err(error)) = Abortable::new(run, registration).await {
+            let _ = on_event.send(stream_packet(3, error.as_bytes()));
         }
-    }
-
-    let _ = on_event.send(AiStreamEvent::End);
+        drop(lease);
+    });
     Ok(())
+}
+
+#[tauri::command]
+pub fn ai_http_cancel(window: WebviewWindow, state: State<'_, AiStreamState>, request_id: String) {
+    state.cancel(window.label(), &request_id);
+}
+
+#[tauri::command]
+pub fn ai_http_ack(
+    window: WebviewWindow,
+    state: State<'_, AiStreamState>,
+    request_id: String,
+    bytes: u64,
+) -> Result<(), String> {
+    state.acknowledge(window.label(), &request_id, bytes)
 }
 
 #[cfg(test)]
@@ -457,10 +478,7 @@ mod tests {
             IpKind::BlockedMetadata
         );
         // IPv6 link-local fe80::/10
-        assert_eq!(
-            ip_kind("fe80::1".parse().unwrap()),
-            IpKind::BlockedMetadata
-        );
+        assert_eq!(ip_kind("fe80::1".parse().unwrap()), IpKind::BlockedMetadata);
     }
 
     #[test]
@@ -548,14 +566,8 @@ mod tests {
 
     #[test]
     fn special_ipv4_ranges_do_not_classify_as_public() {
-        assert_eq!(
-            ip_kind(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
-            IpKind::Loopback
-        );
-        assert_eq!(
-            ip_kind(IpAddr::V4(Ipv4Addr::BROADCAST)),
-            IpKind::Loopback
-        );
+        assert_eq!(ip_kind(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), IpKind::Loopback);
+        assert_eq!(ip_kind(IpAddr::V4(Ipv4Addr::BROADCAST)), IpKind::Loopback);
         assert_eq!(
             ip_kind(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1))),
             IpKind::Loopback
@@ -600,10 +612,7 @@ mod tests {
         assert_eq!(ip_kind("fc00::1".parse().unwrap()), IpKind::Private);
         assert_eq!(ip_kind("ff02::1".parse().unwrap()), IpKind::Loopback);
         assert_eq!(ip_kind("::".parse().unwrap()), IpKind::Loopback);
-        assert_eq!(
-            ip_kind("2606:4700::1111".parse().unwrap()),
-            IpKind::Public
-        );
+        assert_eq!(ip_kind("2606:4700::1111".parse().unwrap()), IpKind::Public);
     }
 
     #[test]

@@ -1,5 +1,39 @@
 # Ghostty release readiness
 
+## October 8-9 resource candidate
+
+Branch `codex/resource-efficiency`, based on `c510c96`, adds configured canvas
+pooling, bounded backing-size reuse, exact row staging, fair PTY parsing, real
+feature-load gates, a pinned Ghostty nightly update, bounded/cancellable binary
+AI transport, and atomic conversation files. Measurements and reproducible tools
+are in [resource efficiency](ghostty-resource-efficiency.md#october-8-implementation-and-native-measurements).
+
+Local macOS arm64 checks pass: 170 frontend files / 1,187 tests, type checking,
+363 Rust tests (one existing manual benchmark ignored), Clippy with warnings
+denied, production build, and all asset budgets. Frontend lint passes with the
+existing 89 warnings and one informational diagnostic; this is not warning-free
+lint. The real Tauri IPC fixture verifies body integrity, backpressure, native
+HTTP cancellation, and conversation file operations using only synthetic data.
+The renderer's live window was inspected after streaming and repainting. The
+WKWebView snapshot API produced stale WebGPU images, so snapshot files are not
+accepted as visual proof.
+
+A local release bundle is built as `Terax Resource Candidate.app`, with application
+id `app.crynta.terax.resource-candidate` for separate settings/history storage.
+Its local ad-hoc signature passes deep, strict verification. It is not installed,
+not notarized, and does not constitute a signed updater or release qualification.
+No remote push, merge, or release is part of this pass.
+
+The native renderer workload reproduces and materially reduces allocation spikes.
+It does not establish the complete application's idle footprint, battery savings,
+multi-day stability, or parity on Windows/Linux. Packaged shell/input/IME and
+accessibility, real GPU faults, mixed-DPR displays, long agent workloads, and
+physical platform runs remain open. Editor/LSP hibernation and further rendering
+tradeoffs require their own measurements before changing product behavior.
+
+## Earlier September evidence
+
+
 Status on 2026-09-07: Ghostty-only implementation, with packaged release validation
 still open. xterm and its addons are removed. All terminals, including blocks,
 use Ghostty with WebGPU or Terax WebGL. This is a testable release candidate,

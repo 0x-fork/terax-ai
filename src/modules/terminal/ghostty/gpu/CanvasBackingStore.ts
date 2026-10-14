@@ -8,6 +8,7 @@ type CanvasTarget = {
 };
 
 export class CanvasBackingStore {
+  private presented = false;
   private targetWidth: number;
   private targetHeight: number;
   private targetCssWidth: string;
@@ -35,10 +36,16 @@ export class CanvasBackingStore {
     cssWidth: number,
     cssHeight: number,
   ): boolean {
-    const nextTargetWidth = positivePixelSize(pixelWidth);
-    const nextTargetHeight = positivePixelSize(pixelHeight);
-    const targetCssWidth = `${positiveCssSize(cssWidth)}px`;
-    const targetCssHeight = `${positiveCssSize(cssHeight)}px`;
+    const requiredWidth = positivePixelSize(pixelWidth);
+    const requiredHeight = positivePixelSize(pixelHeight);
+    const nextTargetWidth = this.presented
+      ? reusableDimension(this.targetWidth, requiredWidth)
+      : requiredWidth;
+    const nextTargetHeight = this.presented
+      ? reusableDimension(this.targetHeight, requiredHeight)
+      : requiredHeight;
+    const targetCssWidth = `${(positiveCssSize(cssWidth) * nextTargetWidth) / requiredWidth}px`;
+    const targetCssHeight = `${(positiveCssSize(cssHeight) * nextTargetHeight) / requiredHeight}px`;
     const changed =
       this.targetWidth !== nextTargetWidth ||
       this.targetHeight !== nextTargetHeight ||
@@ -53,6 +60,7 @@ export class CanvasBackingStore {
 
   commit(): boolean {
     if (!this.pending) return false;
+    this.presented = true;
     if (this.canvas.style.width !== this.targetCssWidth) {
       this.canvas.style.width = this.targetCssWidth;
     }
@@ -69,9 +77,17 @@ export class CanvasBackingStore {
   }
 
   release(): void {
+    this.presented = false;
     if (this.canvas.width !== 1) this.canvas.width = 1;
     if (this.canvas.height !== 1) this.canvas.height = 1;
   }
+}
+
+// Nearby sizes reuse storage instead of accumulating retired WebKit presentation buffers.
+function reusableDimension(current: number, required: number): number {
+  const alignment = required < 256 ? 32 : 128;
+  if (required <= current && current - required < alignment * 2) return current;
+  return Math.ceil(required / alignment) * alignment;
 }
 
 function positivePixelSize(value: number): number {

@@ -6,15 +6,15 @@ without importing Restty's application runtime, PTY transport, perpetual
 per-terminal frame loop, or per-pane GPU lifecycle.
 
 - Ghostty source: `https://github.com/ghostty-org/ghostty`
-- Ghostty commit: `f426f6f181ba95f45d33f683fb754b6359d9e04f`
+- Ghostty commit: `7ec9e26a29399b30ef78f06985fc75045b3cecb6`
 - Restty source: `https://github.com/wiedymi/restty`
 - Restty commit: `7700b14a7643ba9240818209ef1e0aa90d83ad77`
 - Zig: `0.16.0`
 - Optimization: `ReleaseFast`, WebAssembly SIMD and scalar variants
-- SIMD artifact size: `696505` bytes
-- Scalar artifact size: `699516` bytes
-- SIMD SHA-256: `b2305e15dcf4bac59eef3e25687444b9678b79b23cf90d5d62718acab61966e7`
-- Scalar SHA-256: `8e9d194130ee714c6ced2ab1ccaff751cad28eea9bb2355dd9844034abe67775`
+- SIMD artifact size: `733953` bytes
+- Scalar artifact size: `731707` bytes
+- SIMD SHA-256: `ac21b4d0ded9d5f33ea956cff404965117c3709127eb046ce1dec80859914ce3`
+- Scalar SHA-256: `30fd8027c9351292238d2c4546485cb092534f74a35be56832503a9c5786ca87`
 
 Terax-specific changes include:
 
@@ -73,7 +73,20 @@ The bridge deliberately stays below Terax's model/surface boundary. Terax
 retains renderer pooling, hidden-tab renderer release, damage-driven frame
 scheduling, shell integration, semantic routing, and fallback selection.
 
-## Memory regression gate
+## October 8 nightly update
+
+Both artifacts use the exact October 8 nightly source revision above. The update
+includes upstream wide-character resize repair, semantic/reset effects, and
+memory-query APIs. Terax continues to use its adapted bulk bridge; it does not
+consume the mutable official nightly binary as a drop-in ABI.
+
+The current profile adds one 64 KiB page to the prior pin: 20 blank 120x40 models
+use 10.4375 MiB. The block-enabled stress workload plateaus at 68.1875 MiB for both
+variants. This source update is not claimed as an application CPU or RAM saving.
+The native canvas reuse and row-staging measurements are recorded separately in
+`docs/architecture/ghostty-resource-efficiency.md`.
+
+## September memory regression gate
 
 The September 7 pin includes upstream page allocation, default-palette sharing
 and fixed terminal allocation reductions. There is no tagged stable standalone

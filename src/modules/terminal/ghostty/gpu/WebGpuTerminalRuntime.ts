@@ -10,6 +10,7 @@ import {
   terminalWindowFocused,
 } from "../renderScheduling";
 import { GlyphAtlas } from "./GlyphAtlas";
+import { WebGpuCanvasPool } from "@/modules/terminal/ghostty/gpu/WebGpuCanvasPool";
 import { COLOR_SHADER, GLYPH_SHADER } from "./shaders";
 import type { TerminalFontMetrics } from "./terminalVisuals";
 import { CELL_INSTANCE_BYTES, PACKED_INSTANCE_BYTES } from "./WebGpuCellBuffer";
@@ -33,7 +34,7 @@ export type WebGpuSharedResources = {
 export interface WebGpuRuntimeSurface {
   handleWindowFocus?(focused: boolean): void;
   renderFrame(
-    encoder: GPUCommandEncoder,
+    getEncoder: () => GPUCommandEncoder,
     resources: WebGpuSharedResources,
   ): boolean;
   handleRuntimeReset(resources: WebGpuSharedResources): void;
@@ -61,6 +62,7 @@ export type GlyphAtlasLease = {
 };
 
 export type WebGpuRuntimeStats = {
+  readonly canvases: ReturnType<WebGpuCanvasPool["diagnostics"]>;
   readonly generation: number;
   readonly surfaceCount: number;
   readonly atlasCount: number;
@@ -88,6 +90,7 @@ export type WebGpuRuntimeStats = {
 };
 
 export class WebGpuTerminalRuntime {
+  private readonly canvasPool = new WebGpuCanvasPool();
   private readonly surfaces = new Set<WebGpuRuntimeSurface>();
   private dirtySurfaces = new Set<WebGpuRuntimeSurface>();
   private renderSurfaces = new Set<WebGpuRuntimeSurface>();
@@ -153,6 +156,10 @@ export class WebGpuTerminalRuntime {
     this.dirtySurfaces.delete(surface);
     this.renderSurfaces.delete(surface);
     if (this.dirtySurfaces.size === 0) this.cancelScheduledFrame();
+  }
+
+  acquireCanvas() {
+    return this.canvasPool.acquire(this.resources());
   }
 
   interact(surface: WebGpuRuntimeSurface): void {
@@ -290,6 +297,7 @@ export class WebGpuTerminalRuntime {
       if (entry.isolated) isolatedAtlasCount += 1;
     }
     return {
+      canvases: this.canvasPool.diagnostics(),
       generation: this.generation,
       surfaceCount: this.surfaces.size,
       atlasCount: this.atlases.size,
@@ -354,6 +362,7 @@ export class WebGpuTerminalRuntime {
       this.pacer.reset();
       this.requestFrame();
     } else if (reclaim) {
+      this.canvasPool.reclaimIdle();
       for (const entry of this.atlases.values()) {
         if (entry.references === 0) entry.atlas.suspend();
       }
@@ -415,7 +424,11 @@ export class WebGpuTerminalRuntime {
     this.renderSurfaces = batch;
     try {
       const resources = this.resources();
-      let encoder: GPUCommandEncoder | null = null;
+      const frame: { encoder: GPUCommandEncoder | null } = { encoder: null };
+      const getEncoder = () =>
+        (frame.encoder ??= resources.device.createCommandEncoder({
+          label: "Terax terminal window frame",
+        }));
       let rendered = false;
 
       for (const surface of batch) {
@@ -425,10 +438,7 @@ export class WebGpuTerminalRuntime {
           continue;
         }
         try {
-          encoder ??= resources.device.createCommandEncoder({
-            label: "Terax terminal window frame",
-          });
-          if (surface.renderFrame(encoder, resources)) {
+          if (surface.renderFrame(getEncoder, resources)) {
             this.pacer.presented(surface, frameAt);
             rendered = true;
           }
@@ -440,8 +450,8 @@ export class WebGpuTerminalRuntime {
       let uploads = false;
       for (const entry of this.atlases.values())
         uploads ||= entry.atlas.hasEncodedUploads;
-      if (encoder && (rendered || uploads)) {
-        resources.device.queue.submit([encoder.finish()]);
+      if (frame.encoder && (rendered || uploads)) {
+        resources.device.queue.submit([frame.encoder.finish()]);
         this.inFlightFrames += 1;
         this.peakInFlightFrames = Math.max(
           this.peakInFlightFrames,
@@ -785,6 +795,7 @@ export class WebGpuTerminalRuntime {
   }
 
   private releaseDevice(): void {
+    this.canvasPool.clear();
     this.generation += 1;
     this.inFlightFrames = 0;
     this.device?.destroy();

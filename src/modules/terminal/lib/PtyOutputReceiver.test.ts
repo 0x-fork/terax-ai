@@ -11,9 +11,100 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+function schedule(callback: () => void): () => void {
+  const timer = setTimeout(callback, 0);
+  return () => clearTimeout(timer);
+}
+
 describe("PTY output delivery", () => {
   beforeEach(() => vi.useFakeTimers());
-  afterEach(() => vi.useRealTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("yields bulk parsing without granting partial-chunk credit or blocking another terminal", async () => {
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const input = Uint8Array.from(
+      { length: 128 * 1024 },
+      (_, index) => index % 251,
+    );
+    const parsed: Uint8Array[] = [];
+    const ack = vi.fn().mockResolvedValue(undefined);
+    const receiver = new PtyOutputReceiver(
+      (bytes) => {
+        parsed.push(bytes);
+        now += 3;
+      },
+      ack,
+      vi.fn(),
+      schedule,
+    );
+    receiver.start();
+    receiver.receive(input);
+    expect(parsed).toHaveLength(2);
+    await Promise.resolve();
+    expect(ack).not.toHaveBeenCalled();
+    const otherParse = vi.fn();
+    const other = new PtyOutputReceiver(
+      otherParse,
+      vi.fn().mockResolvedValue(undefined),
+      vi.fn(),
+    );
+    other.start();
+    other.receive(Uint8Array.of(9));
+    expect(otherParse).toHaveBeenCalledOnce();
+    await vi.runAllTimersAsync();
+    expect(parsed.every((bytes) => bytes.length <= 32 * 1024)).toBe(true);
+    expect(Buffer.concat(parsed)).toEqual(Buffer.from(input));
+    expect(ack.mock.calls).toEqual([[input.length]]);
+    expect(receiver.diagnostics().parseYields).toBeGreaterThan(0);
+    expect(vi.getTimerCount()).toBe(0);
+    receiver.dispose();
+    other.dispose();
+  });
+
+  it("cancels a yielded parser on close without acknowledging its unfinished chunk", async () => {
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const parse = vi.fn(() => {
+      now += 5;
+    });
+    const ack = vi.fn();
+    const receiver = new PtyOutputReceiver(parse, ack, vi.fn(), schedule);
+    receiver.start();
+    receiver.receive(new Uint8Array(128 * 1024));
+    receiver.dispose();
+    await vi.runAllTimersAsync();
+    expect(parse).toHaveBeenCalledOnce();
+    expect(ack).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("reports scheduler failure without granting credit for unfinished output", async () => {
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const ack = vi.fn();
+    const status = vi.fn();
+    const receiver = new PtyOutputReceiver(
+      () => {
+        now += 5;
+      },
+      ack,
+      status,
+      () => {
+        throw new Error("Task scheduling unavailable");
+      },
+    );
+    receiver.start();
+    receiver.receive(new Uint8Array(128 * 1024));
+    await vi.runAllTimersAsync();
+    expect(status).toHaveBeenLastCalledWith("failed");
+    expect(ack).not.toHaveBeenCalled();
+    receiver.dispose();
+  });
 
   it("coalesces synchronous parsing into cumulative credit without an idle timer", async () => {
     const ack = vi.fn().mockResolvedValue(undefined);

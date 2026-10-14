@@ -16,14 +16,14 @@ import { createViewCacheEntry, getCachedView } from "./viewCache";
 import type { GhosttyTerminalEvent } from "../types";
 
 export const ADAPTED_GHOSTTY_COMMIT =
-  "f426f6f181ba95f45d33f683fb754b6359d9e04f";
+  "7ec9e26a29399b30ef78f06985fc75045b3cecb6";
 export const ADAPTED_RESTTY_COMMIT =
   "7700b14a7643ba9240818209ef1e0aa90d83ad77";
 export const ADAPTED_GHOSTTY_WASM_SHA256 =
-  "b2305e15dcf4bac59eef3e25687444b9678b79b23cf90d5d62718acab61966e7";
+  "ac21b4d0ded9d5f33ea956cff404965117c3709127eb046ce1dec80859914ce3";
 
 export const ADAPTED_GHOSTTY_SCALAR_WASM_SHA256 =
-  "8e9d194130ee714c6ced2ab1ccaff751cad28eea9bb2355dd9844034abe67775";
+  "30fd8027c9351292238d2c4546485cb092534f74a35be56832503a9c5786ca87";
 
 let wasmSimdAvailable: boolean | undefined;
 

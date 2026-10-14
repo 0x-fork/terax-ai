@@ -287,6 +287,7 @@ export const useChatStore = create<StoreState>((set, get) => ({
   hydrateSessions: async () => {
     if (get().sessionsHydrated) return;
     const { sessions } = await loadAll();
+    if (get().sessionsHydrated) return;
 
     // Reuse the most recent untitled "New chat" session if one exists from
     // the previous run — no point stacking empty placeholder sessions every

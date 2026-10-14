@@ -3,6 +3,7 @@ import type { TerminalDamage } from "@/modules/terminal/backend/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { GhosttyTerminalModelApi } from "@/modules/terminal/ghostty/GhosttyTerminalModel";
 import { WebGpuTerminalSurface } from "@/modules/terminal/ghostty/gpu/WebGpuTerminalSurface";
+import { WebGpuCanvasPool } from "@/modules/terminal/ghostty/gpu/WebGpuCanvasPool";
 
 const bridge = vi.hoisted(() => ({ runtime: {} as unknown, visible: true }));
 vi.mock("@/modules/terminal/ghostty/gpu/WebGpuTerminalRuntime", () => ({
@@ -16,8 +17,10 @@ vi.mock("@/modules/terminal/ghostty/windowPresentation", () => ({
 }));
 
 const surfaces: WebGpuTerminalSurface[] = [];
+const canvasPools: WebGpuCanvasPool[] = [];
 afterEach(() => {
   for (const surface of surfaces.splice(0)) surface.dispose();
+  for (const pool of canvasPools.splice(0)) pool.clear();
   vi.unstubAllGlobals();
   vi.useRealTimers();
 });
@@ -49,6 +52,8 @@ describe("WebGPU surface resource lifecycle", () => {
     h.render();
     const cells = h.model.renderCells();
     cells.flags = () => CellFlags.BLINK;
+    cells.codepoint = (index: number) =>
+      Math.floor(index / 120) === 2 ? 88 : 0;
     h.model.renderCells.mockReturnValue(cells);
     h.model.consumeDamage.mockReturnValueOnce({
       kind: "rows",
@@ -69,6 +74,28 @@ describe("WebGPU surface resource lifecycle", () => {
     expect(h.schedule).not.toHaveBeenCalled();
     h.surface.handleWindowFocus(true);
     expect(vi.getTimerCount()).toBe(1);
+  });
+
+  it("skips identical repaints and uploads only rows whose final pixels change", async () => {
+    const h = await harness();
+    h.render();
+    h.writeBuffer.mockClear();
+    h.draw.mockClear();
+    for (let index = 0; index < 100; index++) {
+      h.model.consumeDamage.mockReturnValueOnce({ kind: "full" });
+      expect(h.render()).toBe(false);
+    }
+    expect(h.writeBuffer).not.toHaveBeenCalled();
+    expect(h.draw).not.toHaveBeenCalled();
+    const cells = h.model.renderCells();
+    cells.backgroundPacked = (index: number) =>
+      Math.floor(index / 120) === 4 ? 0xff0000 : 0;
+    h.model.renderCells.mockReturnValue(cells);
+    h.model.consumeDamage.mockReturnValueOnce({ kind: "full" });
+    expect(h.render()).toBe(true);
+    expect(h.writeBuffer).toHaveBeenCalledOnce();
+    expect(h.writeBuffer.mock.calls[0][1]).toBe(4 * 120 * 64);
+    expect(h.writeBuffer.mock.calls[0][4]).toBe(120 * 64);
   });
 
   it("redraws retained presentation after a short pause without repacking cells", async () => {
@@ -272,6 +299,17 @@ async function harness() {
       coverageTextureView: {},
       colorTextureView: {},
       encodePendingUploads: vi.fn(),
+      glyph: () => ({
+        originOffsetX: 0,
+        originOffsetY: 0,
+        width: 7,
+        height: 14,
+        uvMinX: 0,
+        uvMinY: 0,
+        uvMaxX: 0.1,
+        uvMaxY: 0.1,
+        intrinsicColor: false,
+      }),
     },
     release: vi.fn(),
   }));
@@ -285,8 +323,12 @@ async function harness() {
       queue: { writeBuffer },
     },
     generation: 1,
+    format: "bgra8unorm" as GPUTextureFormat,
   };
+  const canvasPool = new WebGpuCanvasPool();
+  canvasPools.push(canvasPool);
   bridge.runtime = {
+    acquireCanvas: () => canvasPool.acquire(resources as never),
     register: vi.fn(),
     unregister: vi.fn(),
     schedule,
@@ -308,8 +350,9 @@ async function harness() {
       length: model.cols * model.rows,
       width: () => 1,
       flags: (): number => 0,
-      codepoint: () => 0,
-      backgroundPacked: () => 0,
+      codepoint: (_index: number): number => 0,
+      graphemeLength: () => 0,
+      backgroundPacked: (_index: number): number => 0,
       foregroundPacked: () => 0xffffff,
       underlineColorPacked: () => 0,
       overline: () => false,
@@ -375,7 +418,7 @@ async function harness() {
     draw: pass.draw,
     render: () =>
       surface.renderFrame(
-        encoder as unknown as GPUCommandEncoder,
+        () => encoder as unknown as GPUCommandEncoder,
         resources as never,
       ),
     model,

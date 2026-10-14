@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod ai_sessions;
 #[cfg(target_os = "macos")]
 pub mod app_menu;
 pub mod control;
@@ -12,5 +13,5 @@ pub mod pty;
 pub mod secrets;
 pub mod shell;
 pub mod vibrancy;
-pub mod workspace;
 pub mod window_presentation;
+pub mod workspace;

@@ -19,6 +19,18 @@ describe("WebGpuTerminalRuntime", () => {
     vi.unstubAllGlobals();
   });
 
+  it("creates no encoder when dirty notifications resolve to unchanged pixels", async () => {
+    const h = createHarness();
+    const runtime = await createRuntime();
+    const surface = createSurface();
+    surface.renderFrame.mockReturnValue(false);
+    runtime.register(surface);
+    runtime.schedule(surface);
+    h.flushFrame();
+    expect(h.device.createCommandEncoder).not.toHaveBeenCalled();
+    expect(h.submit).not.toHaveBeenCalled();
+  });
+
   it("coalesces all dirty surfaces into one window submission", async () => {
     const harness = createHarness();
     const runtime = await createRuntime();
@@ -303,7 +315,8 @@ describe("WebGpuTerminalRuntime", () => {
     const runtime = await createRuntime();
     const lease = runtime.acquireGlyphAtlas(METRICS, 1);
     const surface = createSurface();
-    surface.renderFrame.mockImplementation((encoder) => {
+    surface.renderFrame.mockImplementation((getEncoder) => {
+      const encoder = getEncoder();
       lease.atlas.glyph(65, null, 0);
       lease.atlas.encodePendingUploads(encoder);
       expect(lease.atlas.hasEncodedUploads).toBe(true);
@@ -556,7 +569,13 @@ const METRICS = {
 function createSurface() {
   return {
     renderFrame: vi.fn(
-      (_encoder: GPUCommandEncoder, _resources: WebGpuSharedResources) => true,
+      (
+        getEncoder: () => GPUCommandEncoder,
+        _resources: WebGpuSharedResources,
+      ) => {
+        getEncoder();
+        return true;
+      },
     ),
     handleRuntimeReset: vi.fn(),
     handleRuntimeError: vi.fn(),

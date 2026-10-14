@@ -34,6 +34,12 @@ A change to a core subsystem (terminal/shell spawn, workspace auth, git, fs, IPC
 libghostty-vt is the only terminal model. WebGPU is the default renderer and
 Terax WebGL is the compatibility fallback. Each leaf owns one persistent model;
 presentation resources are shared, bounded, and released for hidden leaves.
+WebGPU canvases are leased from a shared pool rather than owned by persistent
+models. Up to eight unused targets share a 32 MiB color-storage budget and
+individual two-second deadlines; driver/compositor costs are separate. Reused
+targets stay hidden until the new owner's frame is encoded. Nearby backing sizes
+reuse storage without scaling text. Exact row comparisons suppress redundant
+uploads and presentation, including full repaints with unchanged pixels.
 Native cell, grapheme and hyperlink presentation buffers allocate on first use
 and return to the WASM allocator when presentation is reclaimed. Hidden parsing
 does not rebuild them. Short visibility pauses retain uploaded cell data.
@@ -102,7 +108,9 @@ the webview supports. Scalar validation explicitly disables SIMD instructions
 and types. This avoids changing OS minimums solely for the WASM SIMD requirement;
 actual older WKWebView and WebKitGTK compatibility still needs platform tests.
 
-PTY output retains a 2 MiB pending plus in-flight byte limit and two-message
+PTY parsing uses at most 32 KiB slices with a four-millisecond work budget and
+a shared FIFO MessageChannel task queue, which closes its ports when idle.
+Only fully parsed original chunks earn credit. PTY output retains a 2 MiB pending plus in-flight byte limit and two-message
 window. Acknowledgments are cumulative parsed-byte offsets validated against
 native chunk boundaries, so duplicates and retries cannot grant extra credit.
 Parser failures stop delivery visibly without acknowledging unconsumed bytes.
@@ -136,6 +144,10 @@ geometry for the next presentation transaction.
 it is never started automatically. `pnpm soak:ghostty` exercises real WASM models
 without launching the application. `pnpm profile:ghostty` compares allocation
 and parsing workloads in a fresh process per artifact and optional baseline.
+`pnpm profile:renderer:macos` exercises the real renderer in an isolated native
+WKWebView, including optional four-pane layouts and live visual inspection.
+`pnpm test:ipc:macos` verifies binary AI streaming, cancellation, and conversation
+storage in a separate Tauri profile with synthetic local HTTP responses.
 Resource evidence and limitations live in
 `docs/architecture/ghostty-resource-efficiency.md`.
 
@@ -225,8 +237,9 @@ BYOK. Cloud providers via `@ai-sdk/*`: **OpenAI, Anthropic, Google, xAI, Cerebra
 - **Key storage**: OS keychain via `keyring` (Rust). Frontend reads/writes through `secrets_*` commands. Service `KEYRING_SERVICE = "terax-ai"`. Never persist keys to disk, settings store, or `localStorage`.
 - **Agent** (`lib/agent.ts`): `Experimental_Agent` with `stopWhen: stepCountIs(MAX_AGENT_STEPS)` and the system prompt from `config.ts`. Provider branching happens here - keep the `Agent` / `DirectChatTransport` shape; the rest of the system depends on AI SDK v6 chat semantics.
 - **Sub-agents** (`agents/registry.ts`, `agents/runSubagent.ts`): named sub-agents with their own system prompts and tool subsets, invoked by the main agent via `run_subagent` tool.
-- **Sessions** (`lib/sessions.ts` + `store/chatStore.ts`): conversations are organized into named sessions, persisted via `tauri-plugin-store` at `terax-ai-sessions.json` (list + `activeId` + per-session `messages:<id>` keys). `chatStore.ts` keeps a module-scoped `Map<sessionId, Chat<UIMessage>>`; `getOrCreateChat(apiKey, sessionId)` lazily constructs a `Chat`, seeded with messages from a hydration map populated by `hydrateSessions()` (called once from `App.tsx`). `AgentRunBridge` mirrors active-session messages to disk on every change and auto-derives titles from the first user message. Switching the API key wipes the chat map; sessions persist.
+- **Sessions** (`lib/sessions.ts` + `store/chatStore.ts`): conversations are organized into named sessions. `terax-ai-sessions.json` retains only metadata and `activeId`; message arrays live in atomically replaced `conversations/session-<id>.json` files owned by Rust. Legacy migration preserves `terax-ai-sessions.before-message-files.json`, removes a legacy key only after its message file is safe, and never overwrites a newer file on retry. Per-session queues and a native I/O gate serialize storage operations across page reloads; failed latest writes remain retryable, and window close flushes pending storage. `chatStore.ts` keeps a module-scoped `Map<sessionId, Chat<UIMessage>>`; `getOrCreateChat(sessionId)` lazily constructs a `Chat`, seeded with messages from a hydration map populated by `hydrateSessions()` (called once from `App.tsx`). `AgentRunBridge` mirrors active-session messages to disk on every change and auto-derives titles from the first user message. Switching the API key wipes the chat map; sessions persist.
 - **Composer** (`lib/composer.tsx`): React context providing shared input state (text, attachments, voice) for both the docked `AiInputBar` and any other surface. Attachments include image, text-file, and `selection` kinds - selections come from `useChatStore.attachSelection(text, source)` (drained into chips, not pasted into the textarea) and are wrapped as `<selection source="terminal|editor">…</selection>` blocks at submit. Composer derives `isBusy` from `agentMeta.status` so it can mount safely before sessions hydrate.
+- **AI HTTP transport**: binary request bodies and response packets avoid JSON byte arrays. Native requests are owned by their calling window, explicitly cancelled on abort, page reload, or window destruction, and bounded to 16 concurrent requests. A two-message credit window carries at most 64 KiB per chunk; acknowledgments are validated cumulative byte boundaries. The frontend consumer queue is capped at 192 KiB, request bodies at 64 MiB, and request metadata at 64 KiB. Consumer cancellation during startup is repeated after native registration completes. SSRF validation and DNS pinning remain in Rust.
 - **Voice input**: streamed transcription pipeline. Toggled from the composer.
 - **Live context bridge**: `App.tsx` calls `setLive({ getCwd, getTerminalContext, … })` so tools can read the *currently active* terminal's cwd + last 300 lines of buffer. Lazy by design - don't pre-snapshot.
 - **Tools** (`tools/tools.ts`): `read_file`, `list_directory`, `fs_search`, `fs_grep` auto-execute. `write_file`, `create_directory`, `rename`, `delete`, `run_command`, `shell_session_run`, `shell_bg_spawn` set `needsApproval: true` and the AI SDK pauses for an in-UI confirmation card. Auto-send after approval uses `lastAssistantMessageIsCompleteWithApprovalResponses`. `lib/security.ts` is a deny-list refusing obvious secret paths (`.env*`, `.ssh/`, credentials, keychain dirs) - apply on **both** read and write paths and don't bypass it.

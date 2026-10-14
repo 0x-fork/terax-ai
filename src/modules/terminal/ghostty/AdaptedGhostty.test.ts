@@ -28,6 +28,22 @@ describe.each([
   });
 
   describe("Terax Ghostty WASM adaptation", () => {
+    it("repairs a wide character split by an alternate-screen resize before editing that row", () => {
+      const terminal = ghostty.createTerminal(132, 4);
+      const write = (text: string) =>
+        terminal.write(new TextEncoder().encode(text));
+      try {
+        write("\x1b[?47h\x1b[1;80H一");
+        write("\x1b[?47l");
+        terminal.resize(80, 4);
+        write("\x1b[?47h\x1b[1;80H\x1b[@\x1b[2;1Hsurvived");
+        terminal.updateRenderState();
+        expect(terminal.readTextRange(0, 0).trim()).toBe("");
+        expect(terminal.readTextRange(1, 1).trim()).toBe("survived");
+      } finally {
+        terminal.dispose();
+      }
+    });
     it("reports when a shell requires direct terminal input", () => {
       const terminal = ghostty.createTerminal(16, 4);
       try {
@@ -143,7 +159,7 @@ describe.each([
     });
     it("pins the audited Ghostty and Restty sources", () => {
       expect(ADAPTED_GHOSTTY_COMMIT).toBe(
-        "f426f6f181ba95f45d33f683fb754b6359d9e04f",
+        "7ec9e26a29399b30ef78f06985fc75045b3cecb6",
       );
       expect(ADAPTED_RESTTY_COMMIT).toBe(
         "7700b14a7643ba9240818209ef1e0aa90d83ad77",

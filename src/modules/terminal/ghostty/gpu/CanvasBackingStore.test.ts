@@ -93,7 +93,7 @@ describe("CanvasBackingStore", () => {
     expect(intrinsicWrites).toBe(0);
   });
 
-  it("keeps intrinsic and CSS sizes exact while shrinking", () => {
+  it("uses exact dimensions for the first presentation", () => {
     const canvas = fakeCanvas(1_024, 768);
     canvas.style.width = "512px";
     canvas.style.height = "384px";
@@ -106,6 +106,42 @@ describe("CanvasBackingStore", () => {
       height: 500,
       style: { width: "350px", height: "250px" },
     });
+  });
+
+  it("bounds allocation changes during adjacent resizing without stretching pixels", () => {
+    const canvas = fakeCanvas(300, 150);
+    const backing = new CanvasBackingStore(canvas);
+    backing.stage(2000, 1300, 1000, 650);
+    backing.commit();
+    let allocations = 0;
+    for (let index = 0; index < 100; index++) {
+      const width = 1600 + (index % 20) * 10;
+      const height = 900 + (index % 15) * 10;
+      backing.stage(width, height, width / 2, height / 2);
+      if (backing.commit()) allocations++;
+      expect(canvas.width).toBeGreaterThanOrEqual(width);
+      expect(canvas.height).toBeGreaterThanOrEqual(height);
+      expect(canvas.width - width).toBeLessThan(256);
+      expect(canvas.height - height).toBeLessThan(256);
+      expect(Number.parseFloat(canvas.style.width) * 2).toBe(canvas.width);
+      expect(Number.parseFloat(canvas.style.height) * 2).toBe(canvas.height);
+    }
+    expect(allocations).toBeLessThan(10);
+  });
+
+  it("reclaims a substantially oversized viewport and restores exact storage after release", () => {
+    const canvas = fakeCanvas(300, 150);
+    const backing = new CanvasBackingStore(canvas);
+    backing.stage(6000, 4000, 3000, 2000);
+    backing.commit();
+    backing.stage(900, 600, 450, 300);
+    backing.commit();
+    expect(canvas.width).toBeLessThan(1025);
+    expect(canvas.height).toBeLessThan(729);
+    backing.release();
+    backing.stage(900, 600, 450, 300);
+    backing.commit();
+    expect(canvas).toMatchObject({ width: 900, height: 600 });
   });
 });
 

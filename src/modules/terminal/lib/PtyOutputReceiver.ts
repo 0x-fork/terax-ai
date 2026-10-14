@@ -1,11 +1,15 @@
+import { schedulePtyParse } from "@/modules/terminal/lib/ptyParseScheduler";
+
 const ACK_TIMEOUT_MS = 5_000;
 const MAX_ACK_REQUESTS = 2;
 const MAX_PENDING_BYTES = 2 * 1024 * 1024;
 const MAX_PENDING_CHUNKS = 2;
+const MAX_PARSE_SLICE_BYTES = 32 * 1024;
+const PARSE_BUDGET_MS = 4;
 
 export type PtyOutputStatus = "running" | "retrying" | "stalled" | "failed";
 
-type Chunk = { bytes: Uint8Array; end: number };
+type Chunk = { bytes: Uint8Array; end: number; offset: number };
 type Attempt = {
   end: number;
   expired: boolean;
@@ -17,6 +21,9 @@ export class PtyOutputReceiver {
   private readonly attempts = new Set<Attempt>();
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private parserTimer: ReturnType<typeof setTimeout> | null = null;
+  private cancelYield: (() => void) | null = null;
+  private parseSlices = 0;
+  private parseYields = 0;
   private scheduled = false;
   private parsing = false;
   private disposed = false;
@@ -33,6 +40,7 @@ export class PtyOutputReceiver {
     private readonly parse: (bytes: Uint8Array) => void | Promise<void>,
     private readonly acknowledge: (bytes: number) => Promise<void>,
     private readonly onStatus: (status: PtyOutputStatus) => void,
+    private readonly scheduleParse = schedulePtyParse,
   ) {}
 
   start(): void {
@@ -55,7 +63,7 @@ export class PtyOutputReceiver {
       return;
     }
     this.received += bytes.length;
-    this.queue.push({ bytes, end: this.received });
+    this.queue.push({ bytes, end: this.received, offset: 0 });
     this.drain();
   }
 
@@ -75,6 +83,8 @@ export class PtyOutputReceiver {
       pendingChunks: this.queue.length,
       ackRequests: this.attempts.size,
       ackRetries: this.retries,
+      parseSlices: this.parseSlices,
+      parseYields: this.parseYields,
     };
   }
 
@@ -82,19 +92,44 @@ export class PtyOutputReceiver {
     this.disposed = true;
     if (this.retryTimer !== null) clearTimeout(this.retryTimer);
     if (this.parserTimer !== null) clearTimeout(this.parserTimer);
+    this.cancelYield?.();
     for (const attempt of this.attempts) clearTimeout(attempt.timer);
     this.retryTimer = null;
     this.parserTimer = null;
+    this.cancelYield = null;
     this.queue.length = 0;
     this.attempts.clear();
   }
 
-  private drain(): void {
-    if (this.parsing || this.disposed || this.failed) return;
+  private drain(deadline = performance.now() + PARSE_BUDGET_MS): void {
+    if (
+      this.parsing ||
+      this.disposed ||
+      this.failed ||
+      this.cancelYield !== null
+    )
+      return;
     while (this.queue.length > 0) {
+      if (performance.now() >= deadline) {
+        this.parseYields++;
+        try {
+          this.cancelYield = this.scheduleParse(() => {
+            this.cancelYield = null;
+            this.drain();
+          });
+        } catch (error) {
+          this.fail(error);
+        }
+        return;
+      }
       const chunk = this.queue[0];
+      const end = Math.min(
+        chunk.offset + MAX_PARSE_SLICE_BYTES,
+        chunk.bytes.length,
+      );
       try {
-        const parsed = this.parse(chunk.bytes);
+        this.parseSlices++;
+        const parsed = this.parse(chunk.bytes.subarray(chunk.offset, end));
         if (parsed && typeof parsed.then === "function") {
           this.parsing = true;
           this.parserTimer = setTimeout(() => {
@@ -107,14 +142,14 @@ export class PtyOutputReceiver {
               if (this.parserTimer !== null) clearTimeout(this.parserTimer);
               this.parserTimer = null;
               this.parsing = false;
-              this.complete(chunk);
-              this.drain();
+              this.completeSlice(chunk, end);
+              this.drain(deadline);
             },
             (error) => this.fail(error),
           );
           return;
         }
-        this.complete(chunk);
+        this.completeSlice(chunk, end);
       } catch (error) {
         this.fail(error);
         return;
@@ -122,7 +157,9 @@ export class PtyOutputReceiver {
     }
   }
 
-  private complete(chunk: Chunk): void {
+  private completeSlice(chunk: Chunk, offset: number): void {
+    chunk.offset = offset;
+    if (offset < chunk.bytes.length) return;
     this.queue.shift();
     this.processed = chunk.end;
     if (this.scheduled) return;
@@ -203,7 +240,9 @@ export class PtyOutputReceiver {
     if (this.disposed || this.failed) return;
     this.failed = true;
     if (this.parserTimer !== null) clearTimeout(this.parserTimer);
+    this.cancelYield?.();
     this.parserTimer = null;
+    this.cancelYield = null;
     this.setStatus("failed");
     console.error("[terax] PTY output delivery paused:", error);
   }
