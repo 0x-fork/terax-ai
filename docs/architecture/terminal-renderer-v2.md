@@ -249,7 +249,7 @@ the structure-of-arrays format and back without resetting the terminal.
 
 One bind group serves both passes: uniform, `cells` (`array<vec4u>`), `glyph_map`,
 `glyph_table` (four words per glyph: rect x and y, width and height, bearing,
-flags), `search_mask` (a four-byte stand-in when inactive) and the two atlas
+flags: bit 0 colour glyph, bit 1 exact coverage with no contrast), `search_mask` (a four-byte stand-in when inactive) and the two atlas
 textures. The background pass is one fullscreen triangle. A wide character's
 trailing half takes selection and search state from its lead, as before.
 The glyph pass is one instanced draw over `cols * rows`; glyph 0, a pending or
@@ -301,6 +301,56 @@ cannot delay the current screen. Rasterization stops after about 2 ms per frame
 across surfaces (8 ms for a surface's first frame so text appears whole).
 The isolated per-surface atlas and its fallback are gone.
 
+### Procedural glyphs
+
+Fonts draw box-drawing characters with side bearings and rounded metrics, so
+borders show gaps between rows and columns and shades turn into dither. These
+ranges are therefore drawn from the cell instead of the font, as Ghostty, kitty,
+Alacritty and Windows Terminal do: Box Drawing (U+2500..257F), Block Elements
+(U+2580..259F), braille (U+2800..28FF), powerline separators (U+E0B0..E0BF,
+E0D2, E0D4), the corner triangles of Geometric Shapes (U+25E2..25E5, 25F8..25FA,
+25FF), and from Symbols for Legacy Computing the sextants, smooth mosaics,
+one-eighth bars, half shades, diagonal fills, quarter circles (U+1FB00..1FBEF
+minus the unassigned and unsupported) and the octants (U+1CD00..1CDE5). A
+sequence that merely starts with one of them (a combining mark, a variation
+selector) still goes to the font.
+
+`gpu/BuiltinGlyphs.ts` and `gpu/builtin/` are pure: a code point and a
+whole-pixel cell give a coverage mask of exactly `deviceCellWidth` by
+`deviceCellHeight` bytes, with no canvas or DOM. `GlyphRasterizer` returns it as
+a glyph with zero bearing, so the quad covers the cell, and `WebGlGlyphAtlas`
+copies the same bytes into its coverage atlas; both renderers therefore draw the
+same pixels. Bold and italic never change these glyphs, so the atlas keys them
+with style 0 and the four styles share one entry. The table entry carries
+`GLYPH_ENTRY_FLAG_EXACT` (bit 1 of the flags word), and the shader skips the text
+contrast curve for it: that curve is meant for font antialiasing and would
+reshape shades and arcs at ratios below 2.
+
+Geometry is Ghostty's (`src/font/sprite/draw`, MIT), ported rather than
+approximated. The light line is `max(1, ceil(0.05 * font px))` device pixels, the
+bundled font's underline weight (the canvas cannot report a font's own), heavy is
+twice that and a double line is two light lines around a light gap. Strokes are
+whole-pixel rectangles at `floor((cell - weight) / 2)`, so the two halves of a
+line meet exactly across cell boundaries whether the cell is odd or even, and the
+junction rules lengthen or trim the arms where weights differ so a joint has no
+notch. Dashes (2, 3, 4) leave half a gap at each end horizontally and a full gap
+at the bottom vertically, with leftover pixels spread over the dashes. Block
+fractions round from the far edge (`size - round((1 - f) * size)`), so two
+halves of an odd cell share the middle pixel line instead of leaving a seam.
+Shades are coverage 64, 128 and 192. Braille picks dot size, spacing and margins
+from the cell so the eight dots are equal whole squares inside it. Only diagonals,
+arcs (cubic Bezier, control points a quarter radius from the centre), triangles,
+circles and the rounded separators are anti-aliased, by exact polygon area
+coverage; the open ends of an arc are pinned to the same pixels as `─` and `│`.
+The mask code draws on a cell-sized buffer and clips to it, so nothing spills into
+a neighbour.
+
+Against Ghostty's own reference images (its `sprite face render all sprites`
+test data at 18x36, 12x24, 11x21 and 9x17 cells with 4, 3, 2 and 1 pixel lines),
+all 885 glyphs this module draws were compared pixel by pixel: 746 are
+bit-identical at every size and the 139 anti-aliased ones differ by at most 29 of
+255 on edge pixels (its rasterizer quantizes coverage; this one is exact).
+
 ### Text contrast
 
 `DWrite_EnhanceContrast` scaled by foreground lightness, then a blend toward
@@ -334,11 +384,22 @@ source tree and reads the presented canvas back as exact RGBA.
 | Atlas grown 1024 to 2048 to 4096, then flushed | final frame pixel-identical to a fresh run |
 | Live ratio changes 1.25, 1.5, 1.75, 2.25, 1 | font re-measured, grid and canvas re-fit each time, no errors |
 | WebGPU to WebGL to WebGPU on one model | format flips `gpu`, `soa`, `gpu`; content intact |
+| Procedural glyphs (`pattern=sprites`: nested and table borders, input box, progress bars, braille spinners, powerline prompt) at ratios 1, 1.25, 1.5, 1.75, 2 and 3, JetBrains Mono and Menlo, letter spacing and line height, cells from 7x14 to 27x54, WebGPU and WebGL (15 captures, `sprites-checks.json`) | every cell holding a procedural glyph or a space matches the frame the generator predicts: 1,534 cells each, no pixel off by more than 0.5 of 255; of 784 cell boundaries shared by two line characters none is broken |
+| Same pattern drawn from the font (revision before this change) | 208 of 784 boundaries broken at ratio 2, 154 at ratio 1.25; sextants and powerline separators are missing-glyph boxes, shades are dither |
+| WebGPU against WebGL, ratio 2, whole pattern | 3,092,904 pixels, 0 different |
+| Shader flag removed (ratio 1.25, text contrast on) | 13,942 pixels off by up to 20: the contrast curve reshapes arcs and shades, which is why `GLYPH_ENTRY_FLAG_EXACT` exists |
 
 The images are in `terminal-renderer-v2-evidence/`: `ratio2-v1.png` and
 `ratio2-v2.png` (full pattern), `ratio2-diff-x8.png` (their difference, amplified
 eight times), `ratio2-underlines-*` (all underline styles), and
 `ratio1.25-*-crop-x6.png` (the same text at ratio 1.25, six times enlarged).
+`sprites-dpr2.png`, `sprites-dpr1.25.png` and `sprites-webgl-dpr1.25.png` show
+the procedural glyph pattern, `sprites-before-dpr2.png` the same pattern from the
+font, `sprites-*-dpr1.25-crop-x5.png` enlarge a heavy table corner before and
+after, `sprites-*-dpr2-crop-x4.png` the italic copy of the bottom boxes (the font
+slants and breaks them; the procedural glyphs ignore the style), and
+`sprites-checks.json` holds the numbers for every capture, computed by
+`scripts/terminal-visual/spriteCheck.ts` (see its README).
 
 Main-thread time per tick (model write plus `renderFrame` plus submit; 400 ticks
 after warm-up, batched because `performance.now()` is 0.1 ms resolution):
@@ -353,6 +414,13 @@ after warm-up, batched because `performance.now()` is 0.1 ms resolution):
 
 Windows and Linux were not run: DirectWrite-like contrast, the
 `devicePixelContentBoxSize` path against real fractional ratios, WebView2 and
-WebKitGTK behaviour, and whether compositors already snap the canvas. Real
+WebKitGTK behaviour, whether compositors already snap the canvas, and the
+procedural glyphs there (their code is platform independent and covered by unit
+tests, but nothing was looked at). The light line weight assumes the bundled
+font's 5% underline thickness for every font, so a font with a much thinner or
+thicker underline gets lines of the same weight. Not drawn procedurally, and
+left to the font: Ghostty's branch glyphs (U+F5D0..F60D), separated quadrants and
+circle pieces (U+1CC00..1CEBF except the octants), the stylised powerline
+extras, and geometric shapes beyond the corner triangles. Real
 fractional display ratios were checked only through readback of the canvas
 (the page cannot emulate a display ratio), not through a physical display.

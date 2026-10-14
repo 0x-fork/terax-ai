@@ -1,3 +1,4 @@
+import { isBuiltinGlyph } from "./BuiltinGlyphs";
 import { GlyphRasterizer } from "./GlyphRasterizer";
 import { SkylineAtlasAllocator } from "./SkylineAtlasAllocator";
 import type { TerminalFontMetrics } from "./terminalVisuals";
@@ -6,6 +7,8 @@ import type { TerminalFontMetrics } from "./terminalVisuals";
 export const GLYPH_ENTRY_WORDS = 4;
 export const GLYPH_ENTRY_BYTES = GLYPH_ENTRY_WORDS * 4;
 export const GLYPH_ENTRY_FLAG_COLOR = 1;
+/** Coverage is final (cell-exact shapes): the shader applies no contrast. */
+export const GLYPH_ENTRY_FLAG_EXACT = 2;
 /** `resolve()` result when nothing more fits even at the largest atlas. */
 export const ATLAS_FULL = -1;
 
@@ -149,8 +152,10 @@ export class GlyphAtlas {
     this.assertActive();
     const codepoint = text.codePointAt(0) ?? 0;
     const single = text.length === (codepoint > 0xffff ? 2 : 1);
-    const simpleKey = codepoint * 4 + (style & 3);
-    const complexKey = single ? "" : `${style & 3}\u0000${text}`;
+    // Procedural glyphs ignore bold and italic, so all four styles share one.
+    const keyStyle = single && isBuiltinGlyph(codepoint) ? 0 : style & 3;
+    const simpleKey = codepoint * 4 + keyStyle;
+    const complexKey = single ? "" : `${keyStyle}\u0000${text}`;
     const cached = single
       ? this.simple.get(simpleKey)
       : this.complex.get(complexKey);
@@ -190,9 +195,9 @@ export class GlyphAtlas {
     this.tableData[base + 1] = glyph.width | (glyph.height << 16);
     this.tableData[base + 2] =
       (glyph.bearingX & 0xffff) | ((glyph.bearingY & 0xffff) << 16);
-    this.tableData[base + 3] = glyph.intrinsicColor
-      ? GLYPH_ENTRY_FLAG_COLOR
-      : 0;
+    this.tableData[base + 3] =
+      (glyph.intrinsicColor ? GLYPH_ENTRY_FLAG_COLOR : 0) |
+      (glyph.exact ? GLYPH_ENTRY_FLAG_EXACT : 0);
     this.tableDirtyStart = Math.min(this.tableDirtyStart, index);
     this.tableDirtyEnd = Math.max(this.tableDirtyEnd, index);
     this.count += 1;

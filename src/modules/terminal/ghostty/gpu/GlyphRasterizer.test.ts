@@ -111,6 +111,50 @@ describe("GlyphRasterizer", () => {
     expect(s.clears[1][3]).toBeLessThan(40);
   });
 
+  it("draws box and block glyphs at exactly the cell size without the canvas", () => {
+    const s = stub();
+    const rasterizer = new GlyphRasterizer(METRICS);
+    const regular = rasterizer.rasterize("┼", 0);
+    expect(regular.width).toBe(METRICS.deviceCellWidth);
+    expect(regular.height).toBe(METRICS.deviceCellHeight);
+    expect(regular.bearingX).toBe(0);
+    expect(regular.bearingY).toBe(0);
+    expect(regular.intrinsicColor).toBe(false);
+    expect(regular.exact).toBe(true);
+    expect(regular.pixels).toHaveLength(
+      METRICS.deviceCellWidth * METRICS.deviceCellHeight,
+    );
+    // The light line weight is whole pixels: 14px * 1.5 = 21 device pixels.
+    const middle =
+      regular.pixels[Math.floor(METRICS.deviceCellHeight / 2) * regular.width];
+    expect(middle).toBe(255);
+    const regularPixels = regular.pixels.slice();
+    const styled = rasterizer.rasterize(
+      "┼",
+      GLYPH_STYLE_BOLD | GLYPH_STYLE_ITALIC,
+    );
+    expect(styled.pixels).toEqual(regularPixels);
+    expect(
+      rasterizer.rasterize("█", 0).pixels.every((value) => value === 255),
+    ).toBe(true);
+    expect(s.created()).toBe(0);
+    expect(s.texts).toEqual([]);
+    expect(s.fonts).toEqual([]);
+    expect(rasterizer.cpuBytes).toBeGreaterThan(0);
+    rasterizer.dispose();
+    expect(rasterizer.cpuBytes).toBe(0);
+  });
+
+  it("leaves text and sequences that merely start with a box character to the font", () => {
+    const s = stub();
+    const rasterizer = new GlyphRasterizer(METRICS);
+    const sequence = rasterizer.rasterize("┼\u0301", 0);
+    expect(sequence.exact).toBe(false);
+    expect(rasterizer.rasterize("a", 0).exact).toBe(false);
+    expect(rasterizer.rasterize("■", 0).exact).toBe(false);
+    expect(s.texts).toEqual(["┼\u0301", "a", "■"]);
+  });
+
   it("allocates its canvas lazily and releases it on dispose", () => {
     const s = stub();
     const rasterizer = new GlyphRasterizer(METRICS);

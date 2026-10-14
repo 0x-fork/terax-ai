@@ -326,6 +326,8 @@ fn fragment_main(
     return vec4f(sample.rgb, sample.a * color.a);
   }
   let coverage = textureLoad(coverage_texture, texel, 0).r;
+  // Cell-exact shapes (box drawing, shades) keep their coverage as drawn.
+  if ((glyph_flags & 2u) != 0u) { return vec4f(color.rgb, color.a * coverage); }
   return vec4f(color.rgb, color.a * apply_contrast(coverage, color.rgb));
 }
 `;

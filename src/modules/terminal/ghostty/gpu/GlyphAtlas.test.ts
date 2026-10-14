@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ATLAS_FULL,
   GLYPH_ENTRY_FLAG_COLOR,
+  GLYPH_ENTRY_FLAG_EXACT,
   GLYPH_ENTRY_WORDS,
   GlyphAtlas,
 } from "./GlyphAtlas";
@@ -192,6 +193,48 @@ describe("GlyphAtlas", () => {
     expect(destination.origin).toEqual([a[0] & 0xffff, a[0] >>> 16, 0]);
     expect(layout).toEqual({ bytesPerRow: width, rowsPerImage: height });
     expect(size).toEqual([width, height, 1]);
+    atlas.dispose();
+  });
+
+  it("shares one cell-sized exact entry between styles for procedural glyphs", () => {
+    const h = createHarness();
+    const atlas = new GlyphAtlas(h.device, METRICS);
+    const regular = atlas.resolve("┼", 0);
+    expect(atlas.resolve("┼", 1)).toBe(regular);
+    expect(atlas.resolve("┼", 2)).toBe(regular);
+    expect(atlas.resolve("┼", 3)).toBe(regular);
+    expect(atlas.glyphCount).toBe(1);
+    // Neither the canvas nor the colour atlas is involved.
+    expect(h.context.fillText).not.toHaveBeenCalled();
+    expect(liveTextures(h.textures).map((t) => t.format)).toEqual([
+      "r8unorm",
+      "rgba8unorm",
+    ]);
+    atlas.commit();
+    const [, , data, start] = h.writeBuffer.mock.calls[0];
+    const entry = (data as Uint32Array).slice(start, start + GLYPH_ENTRY_WORDS);
+    expect(entry[1]).toBe(
+      METRICS.deviceCellWidth | (METRICS.deviceCellHeight << 16),
+    );
+    // Zero bearing: the quad covers the whole cell.
+    expect(entry[2]).toBe(0);
+    expect(entry[3]).toBe(GLYPH_ENTRY_FLAG_EXACT);
+    const [, pixels, layout, size] = h.writeTexture.mock.calls[0];
+    expect(size).toEqual([
+      METRICS.deviceCellWidth,
+      METRICS.deviceCellHeight,
+      1,
+    ]);
+    expect(layout.bytesPerRow).toBe(METRICS.deviceCellWidth);
+    expect(
+      Array.from(pixels as Uint8Array).some((value) => value === 255),
+    ).toBe(true);
+    // A font glyph in the same atlas is not flagged and keeps its own styles.
+    const bold = atlas.resolve("A", 1);
+    expect(atlas.resolve("A", 0)).not.toBe(bold);
+    atlas.commit();
+    const words = h.writeBuffer.mock.calls[1][2] as Uint32Array;
+    expect(words[bold * GLYPH_ENTRY_WORDS + 3]).toBe(0);
     atlas.dispose();
   });
 

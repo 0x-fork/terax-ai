@@ -29,7 +29,9 @@ node scripts/terminal-visual/compare.mjs crisp /tmp/visual a
 Query parameters: `dpr` (override the display ratio), `w` `h` `left` `top` (host
 box, CSS px), `fs` `ff` `lh` `ls` (font size, family, line height, letter
 spacing), `cursor` (`block`, `bar`, `underline`), `blink`, `select` (`row,col,row,col[,1]`
-for rectangular), `search`, `pattern=empty`, `renderer=webgl`, `maxtex` (cap the
+for rectangular), `search`, `pattern=empty`, `pattern=sprites` (see below),
+`renderer=webgl` (captures work there too: the harness keeps the WebGL drawing
+buffer and reads it with `readPixels`), `maxtex` (cap the
 atlas texture size to force eviction), `stress=1|2` (page through thousands of
 glyphs first; 2 waits for each page), `bench=spinner|rewrite|stream&ticks=N`
 (main-thread time per tick, see below), `raf=native`.
@@ -45,3 +47,28 @@ live).
 and reports milliseconds per tick (model write, frame and submit) in batches
 because `performance.now()` is coarse. Both revisions must share one cell
 geometry (for example `fs=15` at ratio 2) for the comparison to be fair.
+
+## Procedural glyph pattern
+
+`pattern=sprites` draws box-drawing, block, braille, powerline and legacy
+computing characters (nested boxes, a table with every junction, a Claude-Code
+style input box, progress bars with eighth blocks, braille spinner frames, a
+powerline prompt, bold and italic copies of the same borders, a few text labels)
+as colour runs from `spritePattern.ts`. With `capture=name` the page also writes `name.check.json`
+from `spriteCheck.ts`:
+
+- `seams`: for every cell boundary where two line characters point at each other,
+  the last pixel column (row) of one cell is compared with the first of the next.
+  Both must be inked on exactly the same pixels. It needs only the image, so it
+  also measures a revision that draws these characters from the font.
+- `expected`: every cell holding a procedural glyph or a space is compared with
+  the frame the generator predicts (`background + (foreground - background) *
+  coverage`). Present only where `gpu/BuiltinGlyphs.ts` exists.
+
+```sh
+open "http://localhost:5199/?pattern=sprites&w=1000&h=780&fs=15&dpr=1.25&capture=sprites-dpr1.25"
+```
+
+Use `h=780` or more so the pattern is not scrolled. Compare against a revision
+that draws these characters from the font by serving it with
+`TERAX_VISUAL_SOURCE_ROOT` as described above.

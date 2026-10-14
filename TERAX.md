@@ -73,6 +73,11 @@ and a backlog from scrolled-away output keeps only visible glyphs queued.
 Grayscale text gets a DirectWrite-style contrast curve when the ratio is below 2
 or on Windows and Linux (`localStorage["terax:terminal-text-contrast"]` is
 `off`, `on` or a strength); macOS Retina is unchanged.
+Box drawing, block elements, braille, powerline separators and common legacy
+computing shapes are drawn procedurally at exactly the cell size, not from the
+font, with Ghostty's sprite geometry (`gpu/BuiltinGlyphs.ts`, pure, shared by
+the WebGPU and WebGL atlases), so borders and bars join seamlessly at every size
+and ratio. They ignore bold and italic and skip the text contrast curve.
 Native cell, grapheme and hyperlink presentation buffers allocate on first use
 and return to the WASM allocator when presentation is reclaimed. Hidden parsing
 does not rebuild them. Short visibility pauses retain uploaded cell data.

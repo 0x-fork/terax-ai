@@ -1,3 +1,8 @@
+import {
+  BuiltinGlyphRenderer,
+  builtinGlyphSpec,
+  isBuiltinGlyph,
+} from "./BuiltinGlyphs";
 import { hasIntrinsicColor } from "./glyphColor";
 import { fontCss, type TerminalFontMetrics } from "./terminalVisuals";
 
@@ -16,6 +21,12 @@ export type RasterizedGlyph = {
   readonly bearingY: number;
   readonly intrinsicColor: boolean;
   /**
+   * The coverage is final: procedurally drawn cell shapes whose partial values
+   * (shades, anti-aliased edges) are intended, so no text contrast adjustment
+   * may reshape them.
+   */
+  readonly exact: boolean;
+  /**
    * `width * height` coverage bytes, or `width * height * 4` RGBA bytes for an
    * intrinsic-colour glyph. Borrowed scratch memory: valid until the next call.
    */
@@ -27,6 +38,10 @@ export type RasterizedGlyph = {
  * canvas is allocated lazily, sized once, and released on `dispose` so an idle
  * atlas holds no bitmap. Only the area the previous glyph touched is cleared,
  * and `context.font` is assigned only when the style changes.
+ *
+ * Box drawing, blocks, braille and powerline separators skip the font: they are
+ * drawn at exactly the cell size with no bearing (see `BuiltinGlyphs.ts`), so
+ * neighbouring cells join without gaps, and bold or italic never alters them.
  */
 export class GlyphRasterizer {
   private canvas: HTMLCanvasElement | null = null;
@@ -36,6 +51,7 @@ export class GlyphRasterizer {
   private dirtyWidth = RASTER_SIZE;
   private dirtyHeight = RASTER_SIZE;
   private readonly coverage = new Uint8Array(RASTER_SIZE * RASTER_SIZE);
+  private builtin: BuiltinGlyphRenderer | null = null;
 
   constructor(private readonly metrics: TerminalFontMetrics) {
     const font = {
@@ -52,10 +68,15 @@ export class GlyphRasterizer {
   }
 
   get cpuBytes(): number {
-    return this.canvas ? RASTER_SIZE * RASTER_SIZE * 5 : 0;
+    return (
+      (this.canvas ? RASTER_SIZE * RASTER_SIZE * 5 : 0) +
+      (this.builtin?.byteSize ?? 0)
+    );
   }
 
   rasterize(text: string, style: number): RasterizedGlyph {
+    const builtin = this.rasterizeBuiltin(text);
+    if (builtin) return builtin;
     const context = this.ensureContext();
     const fontStyle = style & (GLYPH_STYLE_BOLD | GLYPH_STYLE_ITALIC);
     if (fontStyle !== this.activeStyle) {
@@ -106,6 +127,26 @@ export class GlyphRasterizer {
       bearingX: -left - GLYPH_PADDING,
       bearingY: deviceBaseline - ascent - GLYPH_PADDING,
       intrinsicColor,
+      exact: false,
+      pixels,
+    };
+  }
+
+  /** A procedurally drawn cell-sized glyph, or null when `text` is not one. */
+  private rasterizeBuiltin(text: string): RasterizedGlyph | null {
+    const codepoint = text.codePointAt(0) ?? 0;
+    if (!isBuiltinGlyph(codepoint)) return null;
+    if (text.length !== (codepoint > 0xffff ? 2 : 1)) return null;
+    this.builtin ??= new BuiltinGlyphRenderer(builtinGlyphSpec(this.metrics));
+    const pixels = this.builtin.render(codepoint);
+    if (!pixels) return null;
+    return {
+      width: this.builtin.spec.width,
+      height: this.builtin.spec.height,
+      bearingX: 0,
+      bearingY: 0,
+      intrinsicColor: false,
+      exact: true,
       pixels,
     };
   }
@@ -117,6 +158,7 @@ export class GlyphRasterizer {
     }
     this.canvas = null;
     this.context = null;
+    this.builtin = null;
     this.activeStyle = -1;
   }
 

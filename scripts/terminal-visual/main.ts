@@ -75,6 +75,28 @@ function installReadbackHooks(): void {
 }
 if ("gpu" in navigator) installReadbackHooks();
 
+// The WebGL renderer clears its drawing buffer after presenting; keeping it lets
+// the harness read the last frame back with readPixels.
+let webglContext: WebGL2RenderingContext | null = null;
+{
+  const getContext = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function (
+    this: HTMLCanvasElement,
+    kind: string,
+    options?: unknown,
+  ) {
+    const context = getContext.call(
+      this,
+      kind as "webgl2",
+      kind === "webgl2"
+        ? { ...(options as object), preserveDrawingBuffer: true }
+        : (options as WebGLContextAttributes),
+    );
+    if (kind === "webgl2") webglContext = context as WebGL2RenderingContext;
+    return context;
+  } as typeof getContext;
+}
+
 const [
   { getGhosttyCoreRuntime },
   { WebGpuTerminalSurface },
@@ -172,7 +194,8 @@ async function createSurface(kind: string) {
   }
   return WebGpuTerminalSurface.create(surfaceOptions);
 }
-let surface = await createSurface(params.get("renderer") ?? "webgpu");
+let surfaceKind = params.get("renderer") ?? "webgpu";
+let surface = await createSurface(surfaceKind);
 stage("attach");
 surface.attach(host);
 surface.setVisible(true);
@@ -277,7 +300,11 @@ if (params.get("stress")) {
   }
   write("\x1b[2J\x1b[H");
 }
-if ((params.get("pattern") ?? "full") !== "empty") write(pattern());
+const patternName = params.get("pattern") ?? "full";
+if (patternName === "sprites") {
+  const sprites = await import("./spritePattern");
+  write(sprites.spriteAnsi());
+} else if (patternName !== "empty") write(pattern());
 const selectSpec = params.get("select");
 const searchTerm = params.get("search");
 
@@ -308,6 +335,7 @@ type Capture = { width: number; height: number; rgba: Uint8Array };
 
 // Reads the canvas the surface presented in its most recent frame.
 async function captureFrame(): Promise<Capture> {
+  if (surfaceKind === "webgl") return captureWebGl();
   const wait = new Promise<GPUTexture>((resolve) => {
     readback.pending.push(resolve);
   });
@@ -341,6 +369,25 @@ async function captureFrame(): Promise<Capture> {
   return { width: texture.width, height: texture.height, rgba };
 }
 
+// Reads the WebGL renderer's last frame (top row first).
+function captureWebGl(): Capture {
+  const gl = webglContext;
+  if (!gl) throw new Error("no WebGL context to read back");
+  const width = gl.drawingBufferWidth;
+  const height = gl.drawingBufferHeight;
+  const flipped = new Uint8Array(width * height * 4);
+  gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, flipped);
+  const rgba = new Uint8Array(width * height * 4);
+  for (let y = 0; y < height; y += 1) {
+    rgba.set(
+      flipped.subarray((height - 1 - y) * width * 4, (height - y) * width * 4),
+      y * width * 4,
+    );
+  }
+  for (let alpha = 3; alpha < rgba.length; alpha += 4) rgba[alpha] = 255;
+  return { width, height, rgba };
+}
+
 async function post(name: string, body: BodyInit): Promise<void> {
   const response = await fetch(`/__save/${name}`, { method: "POST", body });
   if (!response.ok) throw new Error(`save ${name} failed`);
@@ -350,6 +397,7 @@ async function swapTo(kind: string): Promise<{ before: string; after: string }> 
   const before = model.renderFormat();
   const previous = surface;
   surface = await createSurface(kind);
+  surfaceKind = kind;
   surface.attach(host);
   surface.setVisible(true);
   surface.setFocused(true);
@@ -384,6 +432,49 @@ const api = {
     return meta;
   },
   diagnostics: () => surface.diagnostics(),
+  /**
+   * `pattern=sprites` only: measures line continuity across cell boundaries and,
+   * when the revision has the procedural glyph generator, compares the frame
+   * with the one it predicts. Saves `<name>.check.json`.
+   */
+  async spriteCheck(name: string) {
+    await settle();
+    const [sprites, check, frame] = await Promise.all([
+      import("./spritePattern"),
+      import("./spriteCheck"),
+      captureFrame(),
+    ]);
+    const geometry = {
+      cellWidth: metrics.deviceCellWidth,
+      cellHeight: metrics.deviceCellHeight,
+    };
+    const rows = sprites.spriteRows();
+    const report: Record<string, unknown> = {
+      name,
+      dpr: window.devicePixelRatio,
+      renderer: surfaceKind,
+      cell: `${geometry.cellWidth}x${geometry.cellHeight}`,
+      seams: check.checkSeams(frame, rows, geometry),
+    };
+    // A glob, because a revision without the generator must still load.
+    const loadBuiltin = Object.values(
+      import.meta.glob("@/modules/terminal/ghostty/gpu/BuiltinGlyphs.ts"),
+    )[0] as undefined | (() => Promise<Record<string, any>>);
+    if (loadBuiltin) {
+      const builtin = await loadBuiltin();
+      const renderer = new builtin.BuiltinGlyphRenderer(
+        builtin.builtinGlyphSpec(metrics),
+      );
+      report.thickness = renderer.spec.thickness;
+      report.expected = check.checkExpected(frame, rows, geometry, (codepoint) =>
+        renderer.render(codepoint),
+      );
+    } else {
+      report.expected = null; // this revision draws these glyphs from the font
+    }
+    await post(`${name}.check.json`, JSON.stringify(report, null, 2));
+    return report;
+  },
   async runtime() {
     const module = await import("@/modules/terminal/ghostty/gpu/WebGpuTerminalRuntime");
     return module.webGpuTerminalRuntimeDiagnostics();
@@ -396,6 +487,10 @@ document.title = "harness ready";
 const autoCapture = params.get("capture");
 if (autoCapture) {
   await api.capture(autoCapture);
+  if (patternName === "sprites") {
+    (window as unknown as { __spriteCheck: unknown }).__spriteCheck =
+      await api.spriteCheck(autoCapture);
+  }
   document.title = `captured ${autoCapture}`;
 }
 
