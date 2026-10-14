@@ -23,6 +23,7 @@ import {
   ghosttyBlocks,
 } from "@/modules/terminal/ghostty/ghosttyBlockSessions";
 export type { WatermarkState } from "@/modules/terminal/ghostty/ghosttyBlockSessions";
+import { forgetLeafPresentation } from "@/modules/terminal/lib/ptyPresentation";
 import type { WatermarkState } from "@/modules/terminal/ghostty/ghosttyBlockSessions";
 
 export async function whenSessionReady(
@@ -167,6 +168,7 @@ export async function leafHasForegroundProcess(
 export function disposeSession(leafId: number): void {
   disposeGhosttySession(leafId);
   disposeGhosttyBlocks(leafId);
+  forgetLeafPresentation(leafId);
 }
 
 function delay(milliseconds: number): Promise<void> {

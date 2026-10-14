@@ -1,7 +1,21 @@
+use super::blocking;
+use super::index::FileIndexState;
 use crate::modules::workspace::{resolve_path, WorkspaceEnv, WorkspaceRegistry};
 use serde::Serialize;
 use std::io;
 use std::path::Path;
+use tauri::{AppHandle, Manager, State};
+
+/// Tells the file-list cache that something under `path` changed. The watcher
+/// only covers expanded directories, so our own mutations report themselves.
+pub(super) fn note_changed(index: &FileIndexState, entry: &Path) {
+    note_dir_changed(index, entry.parent().unwrap_or(entry));
+}
+
+pub(super) fn note_dir_changed(index: &FileIndexState, dir: &Path) {
+    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    index.note_change(&super::to_canon(canonical));
+}
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(
@@ -219,13 +233,27 @@ fn remove_path(path: &Path) -> io::Result<()> {
 
 /// Creates a new empty file. Fails if the file already exists.
 #[tauri::command]
-pub fn fs_create_file(path: String, workspace: Option<WorkspaceEnv>) -> Result<(), String> {
-    let workspace = WorkspaceEnv::from_option(workspace);
-    let p = resolve_path(&path, &workspace);
+pub async fn fs_create_file(
+    index: State<'_, FileIndexState>,
+    path: String,
+    workspace: Option<WorkspaceEnv>,
+) -> Result<(), String> {
+    let index = index.inner().clone();
+    blocking(move || {
+        let workspace = WorkspaceEnv::from_option(workspace);
+        let p = resolve_path(&path, &workspace);
+        create_file(&p)?;
+        note_changed(&index, &p);
+        Ok(())
+    })
+    .await
+}
+
+fn create_file(p: &Path) -> Result<(), String> {
     if p.exists() {
         return Err(format!("already exists: {}", p.display()));
     }
-    std::fs::write(&p, "").map_err(|e| {
+    std::fs::write(p, "").map_err(|e| {
         log::debug!("fs_create_file({}) failed: {e}", p.display());
         e.to_string()
     })
@@ -235,13 +263,27 @@ pub fn fs_create_file(path: String, workspace: Option<WorkspaceEnv>) -> Result<(
 /// Parents are created as needed — matches the common "new folder" UX
 /// where typing "a/b/c" creates the full chain.
 #[tauri::command]
-pub fn fs_create_dir(path: String, workspace: Option<WorkspaceEnv>) -> Result<(), String> {
-    let workspace = WorkspaceEnv::from_option(workspace);
-    let p = resolve_path(&path, &workspace);
+pub async fn fs_create_dir(
+    index: State<'_, FileIndexState>,
+    path: String,
+    workspace: Option<WorkspaceEnv>,
+) -> Result<(), String> {
+    let index = index.inner().clone();
+    blocking(move || {
+        let workspace = WorkspaceEnv::from_option(workspace);
+        let p = resolve_path(&path, &workspace);
+        create_dir(&p)?;
+        note_changed(&index, &p);
+        Ok(())
+    })
+    .await
+}
+
+fn create_dir(p: &Path) -> Result<(), String> {
     if p.exists() {
         return Err(format!("already exists: {}", p.display()));
     }
-    std::fs::create_dir_all(&p).map_err(|e| {
+    std::fs::create_dir_all(p).map_err(|e| {
         log::debug!("fs_create_dir({}) failed: {e}", p.display());
         e.to_string()
     })
@@ -249,17 +291,33 @@ pub fn fs_create_dir(path: String, workspace: Option<WorkspaceEnv>) -> Result<()
 
 /// Renames (or moves) a path. Refuses to overwrite an existing target.
 #[tauri::command]
-pub fn fs_rename(from: String, to: String, workspace: Option<WorkspaceEnv>) -> Result<(), String> {
-    let workspace = WorkspaceEnv::from_option(workspace);
-    let from_p = resolve_path(&from, &workspace);
-    let to_p = resolve_path(&to, &workspace);
+pub async fn fs_rename(
+    index: State<'_, FileIndexState>,
+    from: String,
+    to: String,
+    workspace: Option<WorkspaceEnv>,
+) -> Result<(), String> {
+    let index = index.inner().clone();
+    blocking(move || {
+        let workspace = WorkspaceEnv::from_option(workspace);
+        let from_p = resolve_path(&from, &workspace);
+        let to_p = resolve_path(&to, &workspace);
+        rename(&from_p, &to_p)?;
+        note_changed(&index, &from_p);
+        note_changed(&index, &to_p);
+        Ok(())
+    })
+    .await
+}
+
+fn rename(from_p: &Path, to_p: &Path) -> Result<(), String> {
     if !from_p.exists() {
         return Err(format!("not found: {}", from_p.display()));
     }
     if to_p.exists() {
         return Err(format!("already exists: {}", to_p.display()));
     }
-    std::fs::rename(&from_p, &to_p).map_err(|e| {
+    std::fs::rename(from_p, to_p).map_err(|e| {
         log::debug!(
             "fs_rename({} -> {}) failed: {e}",
             from_p.display(),
@@ -271,17 +329,26 @@ pub fn fs_rename(from: String, to: String, workspace: Option<WorkspaceEnv>) -> R
 
 /// Moves a path without clobbering unless replacement was explicitly approved.
 #[tauri::command]
-pub fn fs_move(
+pub async fn fs_move(
+    app: AppHandle,
     from: String,
     to: String,
     root: String,
     expected_conflict: Option<String>,
     workspace: Option<WorkspaceEnv>,
-    registry: tauri::State<'_, WorkspaceRegistry>,
 ) -> Result<FsMoveResult, String> {
-    let workspace = WorkspaceEnv::from_option(workspace);
-    let root = resolve_authorized_root(&root, &workspace, &registry)?;
-    fs_move_impl(&from, &to, &root, expected_conflict.as_deref(), &workspace)
+    blocking(move || {
+        let workspace = WorkspaceEnv::from_option(workspace);
+        let root = resolve_authorized_root(&root, &workspace, &app.state::<WorkspaceRegistry>())?;
+        let moved = fs_move_impl(&from, &to, &root, expected_conflict.as_deref(), &workspace)?;
+        if moved == FsMoveResult::Moved {
+            let index = app.state::<FileIndexState>();
+            note_changed(&index, &resolve_path(&from, &workspace));
+            note_changed(&index, &resolve_path(&to, &workspace));
+        }
+        Ok(moved)
+    })
+    .await
 }
 
 fn fs_move_impl(
@@ -343,30 +410,59 @@ fn fs_move_impl(
 /// Deletes a file or directory (recursively for dirs). Callers are
 /// responsible for confirming destructive operations with the user.
 #[tauri::command]
-pub fn fs_delete(path: String, workspace: Option<WorkspaceEnv>) -> Result<(), String> {
-    let workspace = WorkspaceEnv::from_option(workspace);
-    let p = resolve_path(&path, &workspace);
-    remove_path(&p).map_err(|e| {
+pub async fn fs_delete(
+    index: State<'_, FileIndexState>,
+    path: String,
+    workspace: Option<WorkspaceEnv>,
+) -> Result<(), String> {
+    let index = index.inner().clone();
+    blocking(move || {
+        let workspace = WorkspaceEnv::from_option(workspace);
+        let p = resolve_path(&path, &workspace);
+        delete_path(&p)?;
+        note_changed(&index, &p);
+        Ok(())
+    })
+    .await
+}
+
+fn delete_path(p: &Path) -> Result<(), String> {
+    remove_path(p).map_err(|e| {
         log::warn!("fs_delete({}) failed: {e}", p.display());
         e.to_string()
     })
 }
 
 #[tauri::command]
-pub fn fs_delete_batch(
+pub async fn fs_delete_batch(
+    app: AppHandle,
     paths: Vec<String>,
     root: String,
     workspace: Option<WorkspaceEnv>,
-    registry: tauri::State<'_, WorkspaceRegistry>,
 ) -> FsDeleteBatchResult {
-    let workspace = WorkspaceEnv::from_option(workspace);
-    let Ok(root) = resolve_authorized_root(&root, &workspace, &registry) else {
-        return FsDeleteBatchResult {
-            deleted: Vec::new(),
-            failed: paths.len(),
+    let count = paths.len();
+    tauri::async_runtime::spawn_blocking(move || {
+        let workspace = WorkspaceEnv::from_option(workspace);
+        let Ok(root) =
+            resolve_authorized_root(&root, &workspace, &app.state::<WorkspaceRegistry>())
+        else {
+            return FsDeleteBatchResult {
+                deleted: Vec::new(),
+                failed: paths.len(),
+            };
         };
-    };
-    fs_delete_batch_impl(paths, &root, &workspace)
+        let result = fs_delete_batch_impl(paths, &root, &workspace);
+        let index = app.state::<FileIndexState>();
+        for deleted in &result.deleted {
+            note_changed(&index, &resolve_path(deleted, &workspace));
+        }
+        result
+    })
+    .await
+    .unwrap_or(FsDeleteBatchResult {
+        deleted: Vec::new(),
+        failed: count,
+    })
 }
 
 fn fs_delete_batch_impl(
@@ -408,14 +504,26 @@ fn copy_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Resu
 /// dirs. Sources are absolute OS paths (from a drag-drop); only the destination
 /// is workspace-resolved. Refuses to overwrite existing entries.
 #[tauri::command]
-pub fn fs_copy(
+pub async fn fs_copy(
+    index: State<'_, FileIndexState>,
     sources: Vec<String>,
     dest_dir: String,
     workspace: Option<WorkspaceEnv>,
 ) -> Result<(), String> {
-    let workspace = WorkspaceEnv::from_option(workspace);
-    let dest = resolve_path(&dest_dir, &workspace);
-    for source in &sources {
+    let index = index.inner().clone();
+    blocking(move || {
+        let workspace = WorkspaceEnv::from_option(workspace);
+        let dest = resolve_path(&dest_dir, &workspace);
+        let result = copy_into(&sources, &dest);
+        // A failed copy can still have written earlier sources.
+        note_dir_changed(&index, &dest);
+        result
+    })
+    .await
+}
+
+fn copy_into(sources: &[String], dest: &Path) -> Result<(), String> {
+    for source in sources {
         let src = std::path::PathBuf::from(source);
         let name = src
             .file_name()
@@ -471,13 +579,13 @@ mod tests {
     fn create_file_makes_empty_and_refuses_to_clobber() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("new.txt");
-        fs_create_file(s(f.clone()), None).expect("create");
+        create_file(&f).expect("create");
         assert!(f.exists());
         assert_eq!(std::fs::read(&f).unwrap(), b"");
 
         // A second create must error, not truncate existing content.
         std::fs::write(&f, b"data").unwrap();
-        let err = fs_create_file(s(f.clone()), None).unwrap_err();
+        let err = create_file(&f).unwrap_err();
         assert!(err.contains("already exists"), "got: {err}");
         assert_eq!(std::fs::read(&f).unwrap(), b"data");
     }
@@ -486,9 +594,9 @@ mod tests {
     fn create_dir_builds_nested_chain_and_refuses_existing() {
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("a/b/c");
-        fs_create_dir(s(nested.clone()), None).expect("create dir");
+        create_dir(&nested).expect("create dir");
         assert!(nested.is_dir());
-        let err = fs_create_dir(s(nested), None).unwrap_err();
+        let err = create_dir(&nested).unwrap_err();
         assert!(err.contains("already exists"), "got: {err}");
     }
 
@@ -499,18 +607,18 @@ mod tests {
         let to = dir.path().join("b.txt");
         std::fs::write(&from, b"payload").unwrap();
 
-        fs_rename(s(from.clone()), s(to.clone()), None).expect("rename");
+        rename(&from, &to).expect("rename");
         assert!(!from.exists());
         assert_eq!(std::fs::read(&to).unwrap(), b"payload");
 
         // Missing source is reported, not silently ignored.
-        let err = fs_rename(s(from), s(dir.path().join("c.txt")), None).unwrap_err();
+        let err = rename(&from, &dir.path().join("c.txt")).unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
 
         // Refusing to overwrite an existing target is the data-loss guard.
         let occupied = dir.path().join("keep.txt");
         std::fs::write(&occupied, b"keep").unwrap();
-        let err = fs_rename(s(to.clone()), s(occupied.clone()), None).unwrap_err();
+        let err = rename(&to, &occupied).unwrap_err();
         assert!(err.contains("already exists"), "got: {err}");
         assert_eq!(std::fs::read(&occupied).unwrap(), b"keep");
         assert!(to.exists());
@@ -644,10 +752,9 @@ mod tests {
         std::fs::create_dir_all(src.path().join("d/inner")).unwrap();
         std::fs::write(src.path().join("d/inner/y.txt"), b"y").unwrap();
 
-        fs_copy(
-            vec![s(src.path().join("a.txt")), s(src.path().join("d"))],
-            s(dest.path().to_path_buf()),
-            None,
+        copy_into(
+            &[s(src.path().join("a.txt")), s(src.path().join("d"))],
+            dest.path(),
         )
         .expect("copy");
 
@@ -662,12 +769,7 @@ mod tests {
         // copy, not move: the source survives.
         assert!(src.path().join("a.txt").exists());
 
-        let err = fs_copy(
-            vec![s(src.path().join("a.txt"))],
-            s(dest.path().to_path_buf()),
-            None,
-        )
-        .unwrap_err();
+        let err = copy_into(&[s(src.path().join("a.txt"))], dest.path()).unwrap_err();
         assert!(err.contains("already exists"), "got: {err}");
     }
 
@@ -676,16 +778,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("x.txt");
         std::fs::write(&f, b"x").unwrap();
-        fs_delete(s(f.clone()), None).expect("delete file");
+        delete_path(&f).expect("delete file");
         assert!(!f.exists());
 
         let sub = dir.path().join("sub");
         std::fs::create_dir_all(sub.join("inner")).unwrap();
         std::fs::write(sub.join("inner/y.txt"), b"y").unwrap();
-        fs_delete(s(sub.clone()), None).expect("delete dir");
+        delete_path(&sub).expect("delete dir");
         assert!(!sub.exists());
 
-        let err = fs_delete(s(dir.path().join("missing")), None).unwrap_err();
+        let err = delete_path(&dir.path().join("missing")).unwrap_err();
         assert!(!err.is_empty());
     }
 
@@ -721,7 +823,7 @@ mod tests {
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        fs_delete(s(link.clone()), None).expect("delete symlink");
+        delete_path(&link).expect("delete symlink");
         assert!(!link.exists(), "symlink itself should be gone");
         assert!(real.is_dir(), "target dir must survive");
         assert_eq!(std::fs::read(real.join("keep.txt")).unwrap(), b"keep");

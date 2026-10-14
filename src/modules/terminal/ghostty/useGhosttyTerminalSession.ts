@@ -10,6 +10,7 @@ import { openExternalUrl } from "@/lib/external-link";
 import { ensureMonoFontsLoaded, resolveFontFamily } from "@/lib/fonts";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import type { TerminalBackendKind } from "@/modules/terminal/backend/contracts";
+import { setLeafPresentation } from "@/modules/terminal/lib/ptyPresentation";
 import { PtyResizeScheduler } from "@/modules/terminal/lib/ptyResizeScheduler";
 import { subscribeTerminalResizeInteraction } from "@/modules/terminal/lib/terminalResizeInteraction";
 import { useTerminalFont } from "@/modules/terminal/lib/useTerminalFont";
@@ -193,6 +194,7 @@ export function useGhosttyTerminalSession({
     const session = ensureSession(leafId, backend, initialCwdRef.current);
     session.visible = visible;
     session.focused = focused;
+    setLeafPresentation(leafId, visible, focused);
     ghosttyBlocks(leafId)?.setVisible(visible);
     const surface = session.surface;
     if (!surface || session.rendererError) return;

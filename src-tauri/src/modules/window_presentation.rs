@@ -11,6 +11,11 @@ pub struct PresentationSnapshot {
 
 #[cfg(any(target_os = "macos", test))]
 impl PresentationSnapshot {
+    /// The window is not being looked at: occluded, or the machine is asleep.
+    fn hidden(&self) -> bool {
+        self.occluded || self.sleeping
+    }
+
     fn update(&mut self, occluded: Option<bool>, sleeping: Option<bool>) -> Option<Self> {
         let occluded = occluded.unwrap_or(self.occluded);
         let sleeping = sleeping.unwrap_or(self.sleeping);
@@ -86,7 +91,13 @@ pub mod macos {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .update(occluded, sleeping);
-        if let (Some(next), Some(window)) = (next, app.get_webview_window("main")) {
+        let Some(next) = next else { return };
+        // Applied natively, with no frontend round trip: hidden terminals
+        // switch to the occluded delivery cadence the moment the OS says so.
+        if let Some(pty) = app.try_state::<crate::modules::pty::PtyState>() {
+            pty.set_window_hidden("main", next.hidden());
+        }
+        if let Some(window) = app.get_webview_window("main") {
             let _ = window.emit("terax:window-presentation", next);
         }
     }
@@ -160,5 +171,18 @@ mod tests {
         assert_eq!(state.update(None, Some(true)).unwrap().revision, 2);
         assert_eq!(state.update(Some(false), Some(false)).unwrap().revision, 3);
         assert!(!state.occluded && !state.sleeping);
+    }
+
+    #[test]
+    fn terminals_slow_down_when_the_window_is_occluded_or_the_machine_sleeps() {
+        let mut state = PresentationSnapshot::default();
+        assert!(!state.hidden());
+        assert!(state.update(Some(true), None).unwrap().hidden());
+        // Waking while still occluded keeps terminals on the slow cadence.
+        assert!(state.update(None, Some(true)).unwrap().hidden());
+        assert!(state.update(None, Some(false)).unwrap().hidden());
+        assert!(state.update(None, Some(false)).is_none());
+        assert!(!state.update(Some(false), None).unwrap().hidden());
+        assert!(state.update(None, Some(true)).unwrap().hidden());
     }
 }

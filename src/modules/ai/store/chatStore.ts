@@ -1,4 +1,5 @@
 import type { Chat, UIMessage } from "@ai-sdk/react";
+import { toast } from "sonner";
 import { create } from "zustand";
 import {
   DEFAULT_MODEL_ID,
@@ -24,6 +25,7 @@ import {
   type SessionMeta,
 } from "../lib/sessions";
 import { pushRecentModel } from "../lib/modelPrefs";
+import { persistDelay } from "../lib/persistSchedule";
 
 export type Live = {
   getCwd: () => string | null;
@@ -182,22 +184,38 @@ export function touchChat(id: string, c: Chat<UIMessage>) {
 // when the matching Chat is constructed.
 export const seedMessages = new Map<string, UIMessage[]>();
 
-// Trailing debounce for per-token message persistence. Streaming fires
-// `persistMessages` on every token; without this we'd JSON-serialize the
-// full message array and round-trip to the store plugin per token, which
-// stalls the UI. Flush on idle (status transition) via `flushPersist`.
-const PERSIST_DEBOUNCE_MS = 300;
+// Per-token message persistence is scheduled, not debounced per token: see
+// `persistSchedule.ts`. Streaming saves are plain atomic replaces; the flush
+// functions below (turn end, switch, eviction, close) are durable.
 const pendingPersist = new Map<
   string,
-  { latest: UIMessage[]; timer: ReturnType<typeof setTimeout> }
+  { latest: UIMessage[]; timer: ReturnType<typeof setTimeout>; firstAt: number }
 >();
+const lastPersistedAt = new Map<string, number>();
 
-function flushPersistEntry(id: string) {
+function commitPersist(id: string, durable: boolean) {
   const entry = pendingPersist.get(id);
   if (!entry) return;
   clearTimeout(entry.timer);
   pendingPersist.delete(id);
-  void saveMessages(id, entry.latest);
+  lastPersistedAt.set(id, Date.now());
+  void saveMessages(id, entry.latest, { durable });
+}
+
+function schedulePersist(id: string, messages: UIMessage[]) {
+  const now = Date.now();
+  const existing = pendingPersist.get(id);
+  if (existing) clearTimeout(existing.timer);
+  const firstAt = existing?.firstAt ?? now;
+  const timer = setTimeout(
+    () => commitPersist(id, false),
+    persistDelay(now, firstAt, lastPersistedAt.get(id) ?? null),
+  );
+  pendingPersist.set(id, { latest: messages, timer, firstAt });
+}
+
+function flushPersistEntry(id: string) {
+  commitPersist(id, true);
 }
 
 export function flushPersist(id?: string): void {
@@ -347,10 +365,19 @@ export const useChatStore = create<StoreState>((set, get) => ({
       flip();
       return;
     }
-    void loadMessages(id).then((m) => {
-      if (m && m.length > 0 && !chats.has(id)) seedMessages.set(id, m);
-      flip();
-    });
+    void loadMessages(id)
+      .then((m) => {
+        if (m && m.length > 0 && !chats.has(id)) seedMessages.set(id, m);
+        flip();
+      })
+      .catch((error) => {
+        // Stay on the current conversation: opening this one empty could later
+        // overwrite a healthy file that was only momentarily unreadable.
+        toast.error("Could not open conversation", {
+          id: `conversation-open:${id}`,
+          description: String(error),
+        });
+      });
   },
 
   deleteSession: (id) => {
@@ -363,6 +390,7 @@ export const useChatStore = create<StoreState>((set, get) => ({
       clearTimeout(pend.timer);
       pendingPersist.delete(id);
     }
+    lastPersistedAt.delete(id);
     void deleteSessionData(id);
     void useTodosStore.getState().clearSession(id);
 
@@ -395,16 +423,8 @@ export const useChatStore = create<StoreState>((set, get) => ({
   },
 
   persistMessages: (id, messages) => {
-    // Debounce the message-blob write so streaming doesn't pound the store.
-    const existing = pendingPersist.get(id);
-    if (existing) clearTimeout(existing.timer);
-    const timer = setTimeout(() => {
-      const entry = pendingPersist.get(id);
-      if (!entry) return;
-      pendingPersist.delete(id);
-      void saveMessages(id, entry.latest);
-    }, PERSIST_DEBOUNCE_MS);
-    pendingPersist.set(id, { latest: messages, timer });
+    // Streaming fires this per token; the write itself is scheduled.
+    schedulePersist(id, messages);
 
     // Update zustand session list only when the derived title actually
     // changes — otherwise we'd rewrite the sessions array (and trigger

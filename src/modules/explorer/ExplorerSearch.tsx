@@ -119,6 +119,7 @@ export const ExplorerSearch = forwardRef<ExplorerSearchHandle, Props>(function E
           query: q,
           limit: 200,
           showHidden,
+          requestKey: "explorer-search",
           workspace: currentWorkspaceEnv(),
         });
         if (alive) {

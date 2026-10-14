@@ -38,6 +38,7 @@ tauri-plugin-clipboard-manager = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 getrandom = "0.3"
+memchr = "2"
 terax-control-protocol = { path = "crates/terax-control-protocol" }
 portable-pty = "0.9"
 dirs = "6"
@@ -54,24 +55,34 @@ tauri-plugin-os = "2"
 tauri-plugin-store = "2"
 tauri-plugin-process = "2"
 tauri-plugin-notification = "2"
-reqwest = { version = "0.12", default-features = false, features = [
-	"rustls-tls",
+# One reqwest for the whole app: tauri-plugin-updater already pulls 0.13 with
+# the platform verifier. `rustls-no-provider` + the explicit ring provider below
+# keep it to a single TLS stack and no aws-lc.
+reqwest = { version = "0.13", default-features = false, features = [
+	"rustls-no-provider",
+	"http2",
 	"stream",
 ] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 bytes = "1"
 futures-util = "0.3"
-tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tempfile = "3"
-notify = "8.2.0"
 which = "8.0.4"
 
 [dev-dependencies]
 proptest = "1"
+tokio = { version = "1", features = ["macros", "rt", "test-util", "time"] }
 tempfile = "3"
 wasmparser = { version = "=0.244.0", default-features = false, features = ["std", "validate", "features", "simd"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# inotify (Linux) and ReadDirectoryChangesW (Windows). macOS drives FSEvents
+# directly (see fs/watch/macos.rs), which keeps notify out of that build.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+notify = "8.2.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6", default-features = false, features = [
@@ -79,15 +90,20 @@ keyring = { version = "3.6", default-features = false, features = [
 ] }
 objc2 = "0.6"
 block2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWindow", "NSWorkspace"] }
-objc2-foundation = { version = "0.3", features = ["NSString", "NSUserDefaults"] }
-window-vibrancy = "0.8"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSColor", "NSWindow", "NSWorkspace"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSUserDefaults", "NSValue"] }
+fsevent-sys = "4.1"
+# Same release tauri uses internally, so the build carries a single copy.
+window-vibrancy = "0.6"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6", default-features = false, features = [
 	"windows-native",
 ] }
-window-vibrancy = "0.8"
+window-vibrancy = "0.6"
+# The OS-level proxy setting (registry) is read by reqwest only with this
+# feature, and the previous reqwest honoured it unconditionally on Windows.
+reqwest = { version = "0.13", default-features = false, features = ["system-proxy"] }
 windows-sys = { version = "0.61", features = [
 	"Wdk_System_SystemServices",
 	"Win32_Foundation",

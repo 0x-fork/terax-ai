@@ -178,6 +178,8 @@ pub fn run() {
         }
     }
 
+    modules::runtime::install();
+
     let launch = parse_launch_target();
     let cli_dir = launch.dir.clone();
     workspace::init_launch_cwd(cli_dir.as_deref());
@@ -211,10 +213,15 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_opener::init())
+        // One async scheme multiplexes every terminal's output; see pty/hub.rs.
+        .register_asynchronous_uri_scheme_protocol("terax-pty", pty::stream_protocol)
         .on_page_load(|webview, payload| {
             if matches!(payload.event(), tauri::webview::PageLoadEvent::Started) {
                 if let Some(state) = webview.try_state::<net::AiStreamState>() {
                     state.cancel_window(webview.window().label());
+                }
+                if let Some(state) = webview.try_state::<pty::PtyState>() {
+                    state.reset_webview(webview.label());
                 }
             }
         })
@@ -248,7 +255,8 @@ pub fn run() {
         .manage(fs::watch::FsWatchState::default())
         .manage(history::HistoryState::default())
         .manage(lsp::LspState::default())
-        .manage(fs::grep::ContentSearchState::default())
+        .manage(fs::supersede::Supersede::default())
+        .manage(fs::index::FileIndexState::default())
         .manage({
             let registry = workspace::WorkspaceRegistry::default();
             workspace::bootstrap_registry(&registry);
@@ -262,7 +270,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             pty::pty_open,
             pty::pty_write,
-            pty::pty_ack_output,
+            pty::pty_stream_open,
+            pty::pty_set_presentation,
             pty::pty_diagnostics,
             pty::pty_resize,
             pty::pty_close,
@@ -326,7 +335,7 @@ pub fn run() {
             shell::shell_bg_list,
             workspace::wsl_list_distros,
             workspace::wsl_default_distro,
-            workspace::wsl_home,
+            workspace::ipc::wsl_home,
             workspace::workspace_authorize,
             workspace::workspace_current_dir,
             control::control_frontend_ready,
@@ -341,13 +350,14 @@ pub fn run() {
             secrets::secrets_delete,
             secrets::secrets_get_all,
             net::lm_ping,
-            net::ai_http_request,
             net::ai_http_stream,
             net::ai_http_cancel,
             net::ai_http_ack,
             modules::ai_sessions::ai_session_load,
             modules::ai_sessions::ai_session_save,
             modules::ai_sessions::ai_session_delete,
+            modules::ai_sessions::ai_session_finish_migration,
+            modules::ai_sessions::ai_session_prune_backup,
             history::history_suggest,
             history::history_commands,
             history::history_record,
@@ -367,6 +377,9 @@ pub fn run() {
                 } => {
                     if let Some(state) = app.try_state::<net::AiStreamState>() {
                         state.cancel_window(&label);
+                    }
+                    if let Some(state) = app.try_state::<pty::PtyState>() {
+                        state.destroy_webview(&label);
                     }
                 }
                 // Servers exit on stdin EOF, but destructors are not guaranteed

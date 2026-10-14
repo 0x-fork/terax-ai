@@ -96,6 +96,55 @@ describe("native AI fetch transport", () => {
     expect((await reader.read()).done).toBe(true);
   });
 
+  it("does not spend an IPC call per small chunk and acknowledges at half the native window", async () => {
+    const pending = proxyFetch("https://example.test");
+    await started();
+    headers();
+    const response = await pending;
+    if (!response.body) throw new Error("Missing response body");
+    const reader = response.body.getReader();
+    const small = new Uint8Array(100).fill(66);
+    for (let i = 0; i < 100; i += 1) {
+      packet(1, small);
+      expect((await reader.read()).value).toEqual(small);
+    }
+    await Promise.resolve();
+    expect(calls("ai_http_ack")).toHaveLength(0);
+
+    const chunk = new Uint8Array(32 * 1024).fill(67);
+    packet(1, chunk);
+    await reader.read();
+    await Promise.resolve();
+    expect(calls("ai_http_ack")).toHaveLength(0);
+    packet(1, chunk);
+    await reader.read();
+    await vi.waitFor(() => expect(calls("ai_http_ack")).toHaveLength(1));
+    expect(calls("ai_http_ack")[0][1].bytes).toBe(100 * 100 + 64 * 1024);
+    packet(2);
+    expect((await reader.read()).done).toBe(true);
+  });
+
+  it("acknowledges a long run of tiny packets before the native packet ledger fills", async () => {
+    const pending = proxyFetch("https://example.test");
+    await started();
+    headers();
+    const response = await pending;
+    if (!response.body) throw new Error("Missing response body");
+    const reader = response.body.getReader();
+    for (let i = 0; i < 127; i += 1) {
+      packet(1, "x");
+      await reader.read();
+    }
+    await Promise.resolve();
+    expect(calls("ai_http_ack")).toHaveLength(0);
+    packet(1, "x");
+    await reader.read();
+    await vi.waitFor(() => expect(calls("ai_http_ack")).toHaveLength(1));
+    expect(calls("ai_http_ack")[0][1].bytes).toBe(128);
+    packet(2);
+    expect((await reader.read()).done).toBe(true);
+  });
+
   it("cancels native work before and after a delayed startup acknowledgment", async () => {
     let finishStart!: () => void;
     bridge.invoke.mockImplementation((command) =>
@@ -144,7 +193,7 @@ describe("native AI fetch transport", () => {
     headers();
     const response = await pending;
     const body = expect(response.text()).rejects.toThrow("connection lost");
-    packet(1, "hello");
+    packet(1, new Uint8Array(64 * 1024).fill(72));
     await body;
     expect(calls("ai_http_cancel")).toHaveLength(1);
   });

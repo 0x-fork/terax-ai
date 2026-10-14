@@ -7,6 +7,7 @@ export default defineConfig({
   resolve: { alias: { "@": path.resolve(root, "../../src") } },
   define: {
     __TERAX_IPC_BASE_URL__: JSON.stringify(process.env.TERAX_IPC_BASE_URL),
+    __TERAX_IPC_TREE__: JSON.stringify(process.env.TERAX_IPC_TREE),
   },
   build: {
     target: "es2022",

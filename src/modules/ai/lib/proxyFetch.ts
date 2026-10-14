@@ -2,6 +2,12 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const STREAM_BUFFER_BYTES = 64 * 1024;
+// Mirrors net/stream.rs: native grants a 128 KiB byte window and 256 packets in
+// flight. Acknowledging at half of either keeps the sender from ever stalling
+// on a healthy consumer while a stream of tiny SSE chunks costs no per-chunk
+// IPC. Unconsumed data stays within the buffer plus one window (192 KiB).
+const ACK_BYTES = 64 * 1024;
+const ACK_PACKETS = 128;
 const decoder = new TextDecoder();
 
 export function createProxyFetch(
@@ -70,6 +76,8 @@ async function proxyFetchImpl(
     let cancelled = false;
     let received = 0;
     let acknowledged = 0;
+    let packets = 0;
+    let acknowledgedPackets = 0;
     let ackInFlight = false;
     let controller: ReadableStreamDefaultController<Uint8Array>;
     const channel = new Channel<ArrayBuffer>();
@@ -94,14 +102,18 @@ async function proxyFetchImpl(
         closed ||
         ackInFlight ||
         received <= acknowledged ||
-        (controller.desiredSize ?? 0) <= 0
+        (controller.desiredSize ?? 0) <= 0 ||
+        (received - acknowledged < ACK_BYTES &&
+          packets - acknowledgedPackets < ACK_PACKETS)
       )
         return;
       const bytes = received;
+      const count = packets;
       ackInFlight = true;
       void invoke("ai_http_ack", { requestId, bytes }).then(
         () => {
           acknowledged = Math.max(acknowledged, bytes);
+          acknowledgedPackets = Math.max(acknowledgedPackets, count);
           ackInFlight = false;
           acknowledge();
         },
@@ -165,6 +177,7 @@ async function proxyFetchImpl(
             )
               throw new Error("Invalid AI stream chunk");
             received += bytes.length;
+            packets += 1;
             if (!Number.isSafeInteger(received))
               throw new Error("AI stream byte offset overflow");
             if (

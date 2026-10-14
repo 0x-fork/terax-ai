@@ -1,104 +1,89 @@
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+//! Live directory change notifications for the explorer and editor tabs.
+//!
+//! The frontend registers the directories it shows (and the files open in
+//! editors) and receives debounced `fs:changed` events carrying the watched
+//! directories that changed plus any registered file whose own stamp moved.
+//! Backends only report directory-level activity, so a package install or a
+//! build never turns into per-file work here.
+
+mod plan;
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(not(target_os = "macos"))]
+mod portable;
+
+use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager};
 
-use crate::modules::fs::to_canon;
+use super::blocking;
+use super::index::FileIndexState;
+use super::to_canon;
 use crate::modules::workspace::{resolve_path, WorkspaceEnv, WorkspaceRegistry};
+use plan::{Batch, DirSet, FileStamp, Pending, WatchSet};
 
 // Quiet-gap before a batch flushes; MAX_WINDOW caps latency under a long stream.
 const DEBOUNCE: Duration = Duration::from_millis(150);
 const MAX_WINDOW: Duration = Duration::from_millis(1000);
 
-// Matched on the final path component. Never watched even when expanded: large
-// or generated trees where live updates cost more than they're worth.
-const SKIP_DIRS: &[&str] = &[
-    // VCS
-    ".git",
-    ".hg",
-    ".svn",
-    ".jj",
-    // JS / web
-    "node_modules",
-    "bower_components",
-    ".pnpm-store",
-    ".yarn",
-    "dist",
-    "build",
-    "out",
-    ".next",
-    ".nuxt",
-    ".svelte-kit",
-    ".astro",
-    ".vite",
-    ".turbo",
-    ".parcel-cache",
-    ".angular",
-    ".vercel",
-    ".netlify",
-    ".output",
-    ".cache",
-    // Rust
-    "target",
-    // Python
-    "__pycache__",
-    ".venv",
-    "venv",
-    ".tox",
-    ".nox",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".ipynb_checkpoints",
-    ".eggs",
-    // JVM / Gradle
-    ".gradle",
-    // .NET
-    "obj",
-    // Go / PHP
-    "vendor",
-    // Elixir
-    "_build",
-    "deps",
-    // Dart / Flutter
-    ".dart_tool",
-    // Haskell
-    "dist-newstyle",
-    ".stack-work",
-    // Swift / Zig
-    ".build",
-    "zig-cache",
-    "zig-out",
-    // CMake (CLion)
-    "cmake-build-debug",
-    "cmake-build-release",
-    // IDE / coverage / infra
-    ".idea",
-    "coverage",
-    ".nyc_output",
-    ".terraform",
-];
+#[cfg(target_os = "macos")]
+type PlatformBackend = macos::FsEvents;
+#[cfg(not(target_os = "macos"))]
+type PlatformBackend = portable::Notify;
 
-fn is_skipped(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| SKIP_DIRS.contains(&n))
+trait Backend: Send {
+    /// Brings the OS watches in line with `set`. Called after every change to
+    /// the set; implementations must be a no-op when nothing relevant moved.
+    fn sync(&mut self, set: &WatchSet);
+}
+
+/// What a backend callback needs: the live set of watched directories to
+/// filter against, a way to report a batch, and the file-list cache.
+#[derive(Clone)]
+struct Sink {
+    tx: mpsc::Sender<Batch>,
+    dirs: Arc<RwLock<Arc<DirSet>>>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    index: FileIndexState,
+}
+
+impl Sink {
+    fn send(&self, batch: Batch) {
+        if !batch.is_empty() {
+            let _ = self.tx.send(batch);
+        }
+    }
+
+    fn dirs(&self) -> Arc<DirSet> {
+        self.dirs.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Any directory-level change, watched or not, can stale a file list.
+    #[cfg(target_os = "macos")]
+    fn note_path(&self, path: &[u8]) {
+        if let Ok(text) = std::str::from_utf8(path) {
+            self.index.note_change(text);
+        }
+    }
+}
+
+struct Shared {
+    set: Mutex<WatchSet>,
+    dirs: Arc<RwLock<Arc<DirSet>>>,
+}
+
+struct Running {
+    shared: Arc<Shared>,
+    backend: Box<dyn Backend>,
 }
 
 #[derive(Default)]
 pub struct FsWatchState {
-    inner: Mutex<Option<WatchInner>>,
-}
-
-struct WatchInner {
-    watcher: RecommendedWatcher,
-    // Explorer (expanded dirs) and editor (dirs of open files) can request the
-    // same dir; unwatch only when the last requester releases it.
-    refcounts: HashMap<PathBuf, usize>,
+    inner: Mutex<Option<Running>>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -106,49 +91,46 @@ struct ChangedPayload {
     paths: Vec<String>,
 }
 
-fn ensure_started(state: &FsWatchState, app: &AppHandle) -> Result<(), String> {
-    let mut guard = state.inner.lock().expect("fs watch state poisoned");
-    if guard.is_some() {
-        return Ok(());
-    }
+fn start(app: &AppHandle) -> Result<Running, String> {
+    let (tx, rx) = mpsc::channel::<Batch>();
+    let shared = Arc::new(Shared {
+        set: Mutex::new(WatchSet::default()),
+        dirs: Arc::new(RwLock::new(Arc::new(DirSet::new()))),
+    });
+    let index = app.state::<FileIndexState>().inner().clone();
+    let sink = Sink {
+        tx,
+        dirs: shared.dirs.clone(),
+        index: index.clone(),
+    };
+    let backend: Box<dyn Backend> = Box::new(PlatformBackend::new(sink)?);
 
-    let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
-    let watcher = RecommendedWatcher::new(
-        move |res| {
-            let _ = tx.send(res);
-        },
-        Config::default(),
-    )
-    .map_err(|e| e.to_string())?;
-
+    let drain_shared = shared.clone();
     let app = app.clone();
     std::thread::Builder::new()
         .name("terax-fs-watch".into())
-        .spawn(move || drain_loop(rx, app))
+        .stack_size(256 * 1024)
+        .spawn(move || drain_loop(rx, drain_shared, app, index))
         .map_err(|e| e.to_string())?;
-
-    *guard = Some(WatchInner {
-        watcher,
-        refcounts: HashMap::new(),
-    });
-    Ok(())
+    Ok(Running { shared, backend })
 }
 
-fn drain_loop(rx: mpsc::Receiver<notify::Result<Event>>, app: AppHandle) {
+fn drain_loop(
+    rx: mpsc::Receiver<Batch>,
+    shared: Arc<Shared>,
+    app: AppHandle,
+    index: FileIndexState,
+) {
     loop {
-        let first = match rx.recv() {
-            Ok(ev) => ev,
-            Err(_) => return,
-        };
-
-        let mut paths: HashSet<String> = HashSet::new();
-        collect(&mut paths, first);
+        let Ok(first) = rx.recv() else { return };
+        let mut pending = Pending::default();
+        pending.merge(first);
 
         let deadline = Instant::now() + MAX_WINDOW;
         loop {
             let timeout = DEBOUNCE.min(deadline.saturating_duration_since(Instant::now()));
             match rx.recv_timeout(timeout) {
-                Ok(ev) => collect(&mut paths, ev),
+                Ok(batch) => pending.merge(batch),
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => return,
             }
@@ -157,58 +139,32 @@ fn drain_loop(rx: mpsc::Receiver<notify::Result<Event>>, app: AppHandle) {
             }
         }
 
+        let paths = resolve_changes(pending, &shared);
         if paths.is_empty() {
             continue;
         }
-        let _ = app.emit(
-            "fs:changed",
-            ChangedPayload {
-                paths: paths.into_iter().collect(),
-            },
-        );
-    }
-}
-
-fn collect(set: &mut HashSet<String>, ev: notify::Result<Event>) {
-    let Ok(ev) = ev else { return };
-    if matches!(ev.kind, EventKind::Access(_)) {
-        return;
-    }
-    for p in ev.paths {
-        set.insert(to_canon(&p));
-    }
-}
-
-fn add_paths(inner: &mut WatchInner, paths: Vec<PathBuf>) {
-    for canonical in paths {
-        let current = inner.refcounts.get(&canonical).copied().unwrap_or(0);
-        if current == 0 {
-            match inner.watcher.watch(&canonical, RecursiveMode::NonRecursive) {
-                Ok(()) => {
-                    inner.refcounts.insert(canonical, 1);
-                }
-                Err(e) => log::debug!("fs_watch add {} failed: {e}", canonical.display()),
-            }
-        } else {
-            inner.refcounts.insert(canonical, current + 1);
+        for path in &paths {
+            index.note_change(path);
         }
+        let _ = app.emit("fs:changed", ChangedPayload { paths });
     }
 }
 
-fn remove_paths(inner: &mut WatchInner, paths: Vec<PathBuf>) {
-    for key in paths {
-        let current = inner.refcounts.get(&key).copied().unwrap_or(0);
-        if current <= 1 {
-            inner.refcounts.remove(&key);
-            let _ = inner.watcher.unwatch(&key);
-        } else {
-            inner.refcounts.insert(key, current - 1);
-        }
+/// Watched directories that changed, plus registered files inside them whose
+/// stamp moved.
+fn resolve_changes(pending: Pending, shared: &Shared) -> Vec<String> {
+    let mut set = shared.set.lock().unwrap_or_else(|e| e.into_inner());
+    let dirs = pending.resolve(set.dir_keys());
+    let stamp_of = |path: &str| FileStamp::of(std::path::Path::new(path));
+    let mut paths = dirs.clone();
+    for dir in &dirs {
+        paths.extend(set.changed_files_in(dir, &stamp_of));
     }
+    paths
 }
 
 // Canonical keys keep add/remove symmetric regardless of how the path was spelled.
-fn prepare_add(
+fn prepare_dirs(
     registry: &WorkspaceRegistry,
     workspace: &WorkspaceEnv,
     paths: Vec<String>,
@@ -218,7 +174,10 @@ fn prepare_add(
         .filter_map(|raw| {
             let resolved = resolve_path(&raw, workspace);
             let canonical = std::fs::canonicalize(&resolved).ok()?;
-            if !canonical.is_dir() || is_skipped(&canonical) || !registry.is_authorized(&canonical) {
+            if !canonical.is_dir()
+                || plan::is_skipped(&canonical)
+                || !registry.is_authorized(&canonical)
+            {
                 return None;
             }
             Some(canonical)
@@ -226,85 +185,126 @@ fn prepare_add(
         .collect()
 }
 
+/// A file is identified by its canonical directory plus its own name, so the
+/// path we report matches what editor tabs store even when the file itself no
+/// longer exists.
+fn canonical_file(workspace: &WorkspaceEnv, raw: &str) -> Option<(String, String, PathBuf)> {
+    let resolved = resolve_path(raw, workspace);
+    let name = resolved.file_name()?.to_owned();
+    let parent = std::fs::canonicalize(resolved.parent()?).ok()?;
+    let file = parent.join(name);
+    Some((to_canon(&parent), to_canon(&file), file))
+}
+
+impl FsWatchState {
+    fn with_running<T>(
+        &self,
+        app: &AppHandle,
+        create: bool,
+        f: impl FnOnce(&mut Running) -> T,
+    ) -> Result<Option<T>, String> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            if !create {
+                return Ok(None);
+            }
+            *guard = Some(start(app)?);
+        }
+        Ok(guard.as_mut().map(f))
+    }
+}
+
+impl Running {
+    /// `change` reports whether the set of watched directories moved; file
+    /// bookkeeping alone never touches the OS watches.
+    fn apply(&mut self, change: impl FnOnce(&mut WatchSet) -> bool) {
+        let mut set = self.shared.set.lock().unwrap_or_else(|e| e.into_inner());
+        if !change(&mut set) {
+            return;
+        }
+        *self.shared.dirs.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(set.snapshot());
+        self.backend.sync(&set);
+    }
+}
+
 #[tauri::command]
-pub fn fs_watch_add(
-    paths: Vec<String>,
-    workspace: Option<WorkspaceEnv>,
+pub async fn fs_watch_add(
     app: AppHandle,
-    state: State<'_, FsWatchState>,
-    registry: State<'_, WorkspaceRegistry>,
+    paths: Vec<String>,
+    files: Option<Vec<String>>,
+    workspace: Option<WorkspaceEnv>,
 ) -> Result<(), String> {
-    let workspace = WorkspaceEnv::from_option(workspace);
-    let prepared = prepare_add(&registry, &workspace, paths);
-    if prepared.is_empty() {
-        return Ok(());
-    }
-    ensure_started(&state, &app)?;
-    let mut guard = state.inner.lock().expect("fs watch state poisoned");
-    if let Some(inner) = guard.as_mut() {
-        add_paths(inner, prepared);
-    }
-    Ok(())
+    blocking(move || {
+        let workspace = WorkspaceEnv::from_option(workspace);
+        let dirs = prepare_dirs(&app.state::<WorkspaceRegistry>(), &workspace, paths);
+        let files: Vec<_> = files
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|raw| canonical_file(&workspace, raw))
+            .map(|(dir, key, path)| {
+                let stamp = FileStamp::of(&path);
+                (dir, key, stamp)
+            })
+            .collect();
+        if dirs.is_empty() && files.is_empty() {
+            return Ok(());
+        }
+        app.state::<FsWatchState>()
+            .with_running(&app, true, |running| {
+                running.apply(|set| {
+                    let mut moved = false;
+                    for dir in dirs {
+                        moved |= set.add_dir(to_canon(&dir), dir);
+                    }
+                    for (dir, key, stamp) in files {
+                        set.add_file(dir, key, stamp);
+                    }
+                    moved
+                });
+            })?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn fs_watch_remove(
+pub async fn fs_watch_remove(
+    app: AppHandle,
     paths: Vec<String>,
+    files: Option<Vec<String>>,
     workspace: Option<WorkspaceEnv>,
-    state: State<'_, FsWatchState>,
 ) -> Result<(), String> {
-    let workspace = WorkspaceEnv::from_option(workspace);
-    // A removed/renamed dir no longer canonicalizes; fall back so the refcount
-    // entry is still released.
-    let prepared: Vec<PathBuf> = paths
-        .into_iter()
-        .map(|raw| {
-            let resolved = resolve_path(&raw, &workspace);
-            std::fs::canonicalize(&resolved).unwrap_or(resolved)
-        })
-        .collect();
-    let mut guard = state.inner.lock().expect("fs watch state poisoned");
-    if let Some(inner) = guard.as_mut() {
-        remove_paths(inner, prepared);
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn skip_filter_matches_basename() {
-        assert!(is_skipped(Path::new("/a/b/node_modules")));
-        assert!(is_skipped(Path::new("/x/target")));
-        assert!(is_skipped(Path::new("/p/obj")));
-        assert!(!is_skipped(Path::new("/a/src")));
-        assert!(!is_skipped(Path::new("/a/node_modules/pkg")));
-    }
-
-    #[test]
-    fn collect_ignores_access_and_dedups() {
-        let mut set = HashSet::new();
-        collect(
-            &mut set,
-            Ok(Event {
-                kind: EventKind::Access(notify::event::AccessKind::Read),
-                paths: vec![PathBuf::from("/a/x")],
-                attrs: Default::default(),
-            }),
-        );
-        assert!(set.is_empty());
-
-        let modify = || {
-            Ok(Event {
-                kind: EventKind::Modify(notify::event::ModifyKind::Any),
-                paths: vec![PathBuf::from("/a/x")],
-                attrs: Default::default(),
+    blocking(move || {
+        let workspace = WorkspaceEnv::from_option(workspace);
+        // A removed/renamed dir no longer canonicalizes; fall back so the
+        // refcount entry is still released.
+        let dirs: Vec<String> = paths
+            .into_iter()
+            .map(|raw| {
+                let resolved = resolve_path(&raw, &workspace);
+                to_canon(std::fs::canonicalize(&resolved).unwrap_or(resolved))
             })
-        };
-        collect(&mut set, modify());
-        collect(&mut set, modify());
-        assert_eq!(set.len(), 1);
-    }
+            .collect();
+        let files: Vec<(String, String)> = files
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|raw| canonical_file(&workspace, raw))
+            .map(|(dir, key, _)| (dir, key))
+            .collect();
+        app.state::<FsWatchState>()
+            .with_running(&app, false, |running| {
+                running.apply(|set| {
+                    let mut moved = false;
+                    for dir in &dirs {
+                        moved |= set.remove_dir(dir);
+                    }
+                    for (dir, key) in &files {
+                        set.remove_file(dir, key);
+                    }
+                    moved
+                });
+            })?;
+        Ok(())
+    })
+    .await
 }

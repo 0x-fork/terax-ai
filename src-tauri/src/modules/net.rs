@@ -1,15 +1,19 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::net::{IpAddr, ToSocketAddrs};
 
-use futures_util::{future::Abortable, StreamExt};
+use bytes::Bytes;
+use futures_util::{future::Abortable, FutureExt, StreamExt};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use tauri::ipc::{InvokeBody, JavaScriptChannelId, Request, Response};
 use tauri::{State, WebviewWindow};
 
+mod clients;
 mod stream;
+use super::ipc_body;
+use clients::{client_for, Profile};
 pub use stream::AiStreamState;
 
 const HEADER_BLOCKLIST: &[&str] = &[
@@ -89,8 +93,8 @@ enum IpKind {
 /// concrete IPs we resolved. Callers can pin reqwest to these IPs to defeat
 /// DNS rebinding (where a second lookup returns a different address).
 async fn resolve_and_classify(host: &str) -> Result<(IpKind, Vec<IpAddr>), String> {
-    // Direct literal? Skip DNS.
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    // Direct literal? Skip DNS. `Url::host_str` keeps the brackets of IPv6.
+    if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
         return Ok((ip_kind(ip), vec![ip]));
     }
     let host_owned = host.to_string();
@@ -118,8 +122,6 @@ async fn resolve_and_classify(host: &str) -> Result<(IpKind, Vec<IpAddr>), Strin
     }
     Ok((worst, lookup))
 }
-
-use std::net::ToSocketAddrs;
 
 fn validate_url(url: &str, allow_private: bool) -> Result<reqwest::Url, String> {
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid url: {e}"))?;
@@ -205,12 +207,7 @@ pub async fn lm_ping(base_url: String) -> Result<u16, String> {
         .to_string();
     let safe_ips = classify_and_collect_safe_ips(&host, true).await?;
 
-    let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::none());
-    let addrs: Vec<SocketAddr> = safe_ips.iter().map(|ip| SocketAddr::new(*ip, 0)).collect();
-    builder = builder.resolve_to_addrs(&host, &addrs);
-    let client = builder.build().map_err(|e| e.to_string())?;
+    let client = client_for(Profile::Ping, &host, &safe_ips, true)?;
     client
         .get(parsed)
         .send()
@@ -218,22 +215,16 @@ pub async fn lm_ping(base_url: String) -> Result<u16, String> {
         .map(|r| r.status().as_u16())
         .map_err(|e| e.to_string())
 }
+
 // AI HTTP proxy — bypasses webview CORS / Mixed-Content / PNA so local-network
 // model servers (LM Studio, Ollama, vLLM) work in the production bundle.
-
-#[derive(Debug, Serialize)]
-pub struct HttpResponse {
-    pub status: u16,
-    pub headers: HashMap<String, String>,
-    pub body: Vec<u8>,
-}
 
 fn build_request(
     client: &reqwest::Client,
     method: &str,
     url: reqwest::Url,
     headers: Option<HashMap<String, String>>,
-    body: Option<Vec<u8>>,
+    body: Option<Bytes>,
 ) -> Result<reqwest::RequestBuilder, String> {
     let method = Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
     let mut req = client.request(method, url);
@@ -243,62 +234,6 @@ fn build_request(
         req = req.body(b);
     }
     Ok(req)
-}
-
-fn build_safe_client(
-    allow_private: bool,
-    pinned: &[(String, Vec<IpAddr>)],
-) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(10));
-    // Pin reqwest's resolver to the IPs we just classified. Without this,
-    // reqwest's own DNS lookup could return a different (private/metadata) IP
-    // for the same hostname between classify and connect — classic DNS
-    // rebinding attack. We pin port 0 because reqwest fills in the actual
-    // port from the URL when wiring up the override map.
-    for (host, ips) in pinned {
-        let addrs: Vec<SocketAddr> = ips.iter().map(|ip| SocketAddr::new(*ip, 0)).collect();
-        if !addrs.is_empty() {
-            builder = builder.resolve_to_addrs(host, &addrs);
-        }
-    }
-    builder
-        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() > 10 {
-                return attempt.error("too many redirects");
-            }
-            let next = attempt.url();
-            match next.scheme() {
-                "http" | "https" => {}
-                _ => return attempt.stop(),
-            }
-            if next.username() != "" || next.password().is_some() {
-                return attempt.stop();
-            }
-            let Some(host) = next.host_str() else {
-                return attempt.stop();
-            };
-            if is_blocked_host_name(host) {
-                return attempt.stop();
-            }
-            if let Ok(ip) = host.parse::<IpAddr>() {
-                let k = ip_kind(ip);
-                if k == IpKind::BlockedMetadata {
-                    return attempt.stop();
-                }
-                if !allow_private && matches!(k, IpKind::Loopback | IpKind::Private) {
-                    return attempt.stop();
-                }
-            } else if !allow_private {
-                if let Some(prev) = attempt.previous().last() {
-                    if prev.host_str() != Some(host) {
-                        return attempt.stop();
-                    }
-                }
-            }
-            attempt.follow()
-        }))
-        .build()
-        .map_err(|e| e.to_string())
 }
 
 fn header_map_to_strings(headers: &HeaderMap) -> HashMap<String, String> {
@@ -311,48 +246,33 @@ fn header_map_to_strings(headers: &HeaderMap) -> HashMap<String, String> {
     out
 }
 
-#[tauri::command]
-pub async fn ai_http_request(
-    url: String,
-    method: String,
-    headers: Option<HashMap<String, String>>,
-    body: Option<Vec<u8>>,
-    allow_private_network: Option<bool>,
-) -> Result<HttpResponse, String> {
-    let allow_private = allow_private_network.unwrap_or(false);
-    let parsed = validate_url(&url, allow_private)?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "missing host".to_string())?
-        .to_string();
-    let safe_ips = classify_and_collect_safe_ips(&host, allow_private).await?;
-
-    let client = build_safe_client(allow_private, &[(host, safe_ips)])?;
-
-    let req = build_request(&client, &method, parsed, headers, body)?;
-    let resp = req.send().await.map_err(|e| e.to_string())?;
-
-    let status = resp.status().as_u16();
-    let headers = header_map_to_strings(resp.headers());
-    let body = resp.bytes().await.map_err(|e| e.to_string())?.to_vec();
-    Ok(HttpResponse {
-        status,
-        headers,
-        body,
-    })
-}
-
 #[derive(Serialize)]
 struct StreamHeaders {
     status: u16,
     headers: HashMap<String, String>,
 }
 
+/// Packet kinds the webview decodes: 0 headers, 1 body, 2 end, 3 error.
 fn stream_packet(kind: u8, bytes: &[u8]) -> Response {
     let mut packet = Vec::with_capacity(bytes.len() + 1);
     packet.push(kind);
     packet.extend_from_slice(bytes);
     Response::new(packet)
+}
+
+const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+
+/// The IPC message owns the request buffer and frees it when the command
+/// returns, while the request task outlives the command, so exactly one copy
+/// is needed to hand the body over. The platform fallback that delivers JSON
+/// instead of raw bytes is handled by `ipc_body`.
+fn request_body(body: &InvokeBody) -> Result<Option<Bytes>, String> {
+    let bytes = ipc_body::bytes_of(body, MAX_REQUEST_BYTES, ipc_body::JSON_FALLBACK_MAX_BYTES)?;
+    Ok(match bytes {
+        _ if bytes.is_empty() => None,
+        Cow::Borrowed(raw) => Some(Bytes::copy_from_slice(raw)),
+        Cow::Owned(vec) => Some(Bytes::from(vec)),
+    })
 }
 
 #[derive(Deserialize)]
@@ -387,17 +307,7 @@ pub async fn ai_http_stream(
         on_event,
     } = serde_json::from_str(metadata).map_err(|e| e.to_string())?;
     let on_event = on_event.channel_on::<_, Response>(window.as_ref().clone());
-    let InvokeBody::Raw(bytes) = request.body() else {
-        return Err("expected binary AI request body".into());
-    };
-    if bytes.len() > 64 * 1024 * 1024 {
-        return Err("AI request body exceeds 64 MiB".into());
-    }
-    let body = if bytes.is_empty() {
-        None
-    } else {
-        Some(bytes.clone())
-    };
+    let body = request_body(request.body())?;
     let (lease, registration) = state.start(window.label(), &request_id)?;
     tauri::async_runtime::spawn(async move {
         let run = async {
@@ -405,7 +315,7 @@ pub async fn ai_http_stream(
             let parsed = validate_url(&url, allow_private)?;
             let host = parsed.host_str().ok_or("missing host")?.to_string();
             let safe_ips = classify_and_collect_safe_ips(&host, allow_private).await?;
-            let client = build_safe_client(allow_private, &[(host, safe_ips)])?;
+            let client = client_for(Profile::Stream, &host, &safe_ips, allow_private)?;
             let request = build_request(&client, &method, parsed, headers, body)?;
             let response = request.send().await.map_err(|e| e.to_string())?;
             let metadata = serde_json::to_vec(&StreamHeaders {
@@ -416,17 +326,12 @@ pub async fn ai_http_stream(
             on_event
                 .send(stream_packet(0, &metadata))
                 .map_err(|e| e.to_string())?;
-            let mut chunks = response.bytes_stream();
-            while let Some(chunk) = chunks.next().await {
-                let chunk = chunk.map_err(|e| e.to_string())?;
-                for bytes in chunk.chunks(stream::CHUNK_BYTES) {
-                    lease.control.reserve(bytes.len()).await?;
-                    on_event
-                        .send(stream_packet(1, bytes))
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-            lease.control.drained().await?;
+            pump(response.bytes_stream(), &lease.control, |packet| {
+                on_event
+                    .send(Response::new(packet))
+                    .map_err(|e| e.to_string())
+            })
+            .await?;
             on_event
                 .send(stream_packet(2, &[]))
                 .map_err(|e| e.to_string())?;
@@ -440,13 +345,96 @@ pub async fn ai_http_stream(
     Ok(())
 }
 
-#[tauri::command]
-pub fn ai_http_cancel(window: WebviewWindow, state: State<'_, AiStreamState>, request_id: String) {
-    state.cancel(window.label(), &request_id);
+/// Moves a response body to the webview under byte-window flow control.
+/// Network chunks that are already available are coalesced into one packet, and
+/// while the window is full the next packet keeps filling from the network, so
+/// a slow consumer sees fewer, larger messages rather than a backlog of tiny
+/// ones.
+async fn pump<S, E>(
+    mut chunks: S,
+    control: &stream::StreamControl,
+    mut send: impl FnMut(Vec<u8>) -> Result<(), String>,
+) -> Result<(), String>
+where
+    S: futures_util::Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    use stream::{fill_packet, new_packet, payload_len, CHUNK_BYTES};
+
+    let mut packet = new_packet(1, 0);
+    let mut carry = Bytes::new();
+    // A network failure still delivers whatever arrived before it.
+    let mut ended = false;
+    let mut failure: Option<String> = None;
+    loop {
+        fill_packet(&mut packet, &mut carry);
+        while payload_len(&packet) < CHUNK_BYTES && carry.is_empty() && !ended {
+            match chunks.next().now_or_never() {
+                Some(Some(Ok(next))) => {
+                    carry = next;
+                    fill_packet(&mut packet, &mut carry);
+                }
+                Some(Some(Err(e))) => {
+                    failure = Some(e.to_string());
+                    ended = true;
+                }
+                Some(None) => ended = true,
+                None => break,
+            }
+        }
+        if payload_len(&packet) == 0 {
+            if ended {
+                return failure.map_or(Ok(()), Err);
+            }
+            match chunks.next().await {
+                Some(Ok(next)) => carry = next,
+                Some(Err(e)) => return Err(e.to_string()),
+                None => return Ok(()),
+            }
+            continue;
+        }
+        while !control.try_reserve(payload_len(&packet))? {
+            let can_absorb = payload_len(&packet) < CHUNK_BYTES && carry.is_empty() && !ended;
+            if can_absorb {
+                tokio::select! {
+                    changed = control.credit_changed() => changed?,
+                    next = chunks.next() => match next {
+                        Some(Ok(next)) => {
+                            carry = next;
+                            fill_packet(&mut packet, &mut carry);
+                        }
+                        Some(Err(e)) => {
+                            failure = Some(e.to_string());
+                            ended = true;
+                        }
+                        None => ended = true,
+                    },
+                }
+            } else {
+                control.credit_changed().await?;
+            }
+        }
+        send(std::mem::replace(&mut packet, new_packet(1, 0)))?;
+        if ended && carry.is_empty() {
+            return failure.map_or(Ok(()), Err);
+        }
+    }
 }
 
 #[tauri::command]
-pub fn ai_http_ack(
+pub async fn ai_http_cancel(
+    window: WebviewWindow,
+    state: State<'_, AiStreamState>,
+    request_id: String,
+) -> Result<(), String> {
+    state.cancel(window.label(), &request_id);
+    Ok(())
+}
+
+/// Async so the acknowledgment never rides the main thread, which is where
+/// Tauri runs a plain command.
+#[tauri::command]
+pub async fn ai_http_ack(
     window: WebviewWindow,
     state: State<'_, AiStreamState>,
     request_id: String,
@@ -626,5 +614,179 @@ mod tests {
     fn validate_url_requires_a_host() {
         // A URL that parses but carries no host must not slip through.
         assert!(validate_url("http://", true).is_err());
+    }
+
+    #[test]
+    fn request_bodies_become_shared_bytes_and_empty_means_no_body() {
+        let out = request_body(&InvokeBody::Raw(b"{\"a\":1}".to_vec()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(&out[..], b"{\"a\":1}");
+        assert_eq!(request_body(&InvokeBody::Raw(vec![])), Ok(None));
+        let fallback = request_body(&InvokeBody::Json(serde_json::json!([104, 105]))).unwrap();
+        assert_eq!(fallback.as_deref(), Some(&b"hi"[..]));
+        assert_eq!(
+            request_body(&InvokeBody::Json(serde_json::json!(null))),
+            Ok(None)
+        );
+        assert!(request_body(&InvokeBody::Json(serde_json::json!("nope"))).is_err());
+    }
+
+    #[test]
+    fn ipv6_literal_hosts_resolve_without_dns() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (kind, ips) = rt.block_on(resolve_and_classify("[::1]")).unwrap();
+        assert_eq!(kind, IpKind::Loopback);
+        assert_eq!(ips, vec!["::1".parse::<IpAddr>().unwrap()]);
+        let (kind, _) = rt
+            .block_on(resolve_and_classify("[2606:4700::1111]"))
+            .unwrap();
+        assert_eq!(kind, IpKind::Public);
+    }
+
+    mod flow {
+        use super::*;
+        use crate::modules::net::stream::{AiStreamState, CHUNK_BYTES};
+        use std::sync::mpsc;
+
+        type Chunks = std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, String>>>>;
+
+        fn ready(parts: Vec<Result<Bytes, String>>) -> Chunks {
+            Box::pin(futures_util::stream::iter(parts))
+        }
+
+        fn run_pump(
+            chunks: Chunks,
+        ) -> (
+            tokio::task::JoinHandle<Result<(), String>>,
+            mpsc::Receiver<Vec<u8>>,
+            AiStreamState,
+        ) {
+            let state = AiStreamState::default();
+            let (lease, _) = state.start("w", "r").unwrap();
+            let (tx, rx) = mpsc::channel();
+            let task = tokio::task::spawn_local(async move {
+                let result = pump(chunks, &lease.control.clone(), move |packet| {
+                    tx.send(packet).map_err(|e| e.to_string())
+                })
+                .await;
+                drop(lease);
+                result
+            });
+            (task, rx, state)
+        }
+
+        async fn local<F: std::future::Future>(future: F) -> F::Output {
+            tokio::task::LocalSet::new().run_until(future).await
+        }
+
+        #[tokio::test]
+        async fn many_small_ready_chunks_become_one_packet() {
+            local(async {
+                let parts = (0..50)
+                    .map(|_| Ok(Bytes::from(vec![b'x'; 100])))
+                    .collect::<Vec<_>>();
+                let (task, rx, _state) = run_pump(ready(parts));
+                task.await.unwrap().unwrap();
+                let packets: Vec<_> = rx.try_iter().collect();
+                assert_eq!(packets.len(), 1);
+                assert_eq!(packets[0][0], 1);
+                assert_eq!(packets[0].len(), 1 + 5000);
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn bodies_larger_than_the_window_flow_as_acknowledgments_arrive() {
+            local(async {
+                let total = 300 * 1024;
+                let (task, rx, state) = run_pump(ready(vec![Ok(Bytes::from(vec![9u8; total]))]));
+                let mut received = 0usize;
+                let mut largest = 0usize;
+                while received < total {
+                    tokio::task::yield_now().await;
+                    while let Ok(packet) = rx.try_recv() {
+                        largest = largest.max(packet.len() - 1);
+                        received += packet.len() - 1;
+                        state.acknowledge("w", "r", received as u64).unwrap();
+                    }
+                }
+                task.await.unwrap().unwrap();
+                assert_eq!(received, total);
+                assert_eq!(largest, CHUNK_BYTES);
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn a_full_window_stalls_the_pump_until_the_consumer_acknowledges() {
+            local(async {
+                let (task, rx, state) =
+                    run_pump(ready(vec![Ok(Bytes::from(vec![1u8; 192 * 1024]))]));
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                let first: Vec<_> = rx.try_iter().collect();
+                assert_eq!(first.len(), 2, "only two 64 KiB packets fit in the window");
+                assert!(!task.is_finished());
+                state.acknowledge("w", "r", (64 * 1024) as u64).unwrap();
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(rx.try_iter().count(), 1);
+                task.await.unwrap().unwrap();
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn network_data_arriving_while_blocked_is_coalesced_into_the_next_packet() {
+            local(async {
+                let (net_tx, net_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+                let chunks: Chunks =
+                    Box::pin(futures_util::stream::unfold(net_rx, |mut rx| async move {
+                        rx.recv().await.map(|b| (Ok::<_, String>(b), rx))
+                    }));
+                let (task, rx, state) = run_pump(chunks);
+                net_tx.send(Bytes::from(vec![0u8; 128 * 1024])).unwrap();
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(rx.try_iter().count(), 2);
+                for _ in 0..40 {
+                    net_tx.send(Bytes::from_static(b"tiny")).unwrap();
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(rx.try_iter().count(), 0, "window still full");
+                state.acknowledge("w", "r", (64 * 1024) as u64).unwrap();
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                let next: Vec<_> = rx.try_iter().collect();
+                assert_eq!(next.len(), 1);
+                assert_eq!(next[0].len(), 1 + 160, "forty tiny chunks, one packet");
+                drop(net_tx);
+                state.acknowledge("w", "r", (128 * 1024) as u64).unwrap();
+                task.await.unwrap().unwrap();
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn a_network_error_still_delivers_what_arrived_before_it() {
+            local(async {
+                let (task, rx, _state) = run_pump(ready(vec![
+                    Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+                    Err("connection reset".into()),
+                ]));
+                assert_eq!(task.await.unwrap(), Err("connection reset".to_string()));
+                let packets: Vec<_> = rx.try_iter().collect();
+                assert_eq!(packets.len(), 1);
+                assert_eq!(&packets[0][1..], b"data: [DONE]\n\n");
+            })
+            .await;
+        }
     }
 }

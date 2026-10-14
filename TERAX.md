@@ -113,21 +113,46 @@ the webview supports. Scalar validation explicitly disables SIMD instructions
 and types. This avoids changing OS minimums solely for the WASM SIMD requirement;
 actual older WKWebView and WebKitGTK compatibility still needs platform tests.
 
-PTY parsing uses at most 32 KiB slices with a four-millisecond work budget and
-a shared FIFO MessageChannel task queue, which closes its ports when idle.
-Only fully parsed original chunks earn credit. PTY output retains a 2 MiB pending plus in-flight byte limit and two-message
-window. Acknowledgments are cumulative parsed-byte offsets validated against
-native chunk boundaries, so duplicates and retries cannot grant extra credit.
-Parser failures stop delivery visibly without acknowledging unconsumed bytes.
-Exit waits for the reader drain and final parsing acknowledgments. Unix readers
-sleep on PTY readiness plus an explicit shutdown signal without a polling timer.
-After shell exit they consume ready output, bounded to 2 MiB / 30 seconds, rather
-than wait indefinitely for an inherited slave descriptor to close. Exceeding this
-drain bound reports a reader failure and exit status -1. After shell exit,
-30 seconds without acknowledgment progress closes a stalled queue with a logged
-delivery failure and exit status -1. The deadline is armed before ConPTY close
-and thread joins; it does not run during live-shell backpressure. Close wakes blocked
-queue workers and the Unix reader; Windows keeps draining the pipe while ConPTY closes.
+PTY output is one multiplexed pull stream per window (`docs/architecture/pty-transport-v2.md`),
+not a channel per terminal. The async `terax-pty` URI scheme (`pty/protocol.rs`) has two POST
+endpoints: `poll`, kept outstanding exactly once per webview, and `ack`. One process-wide hub
+thread (`pty/hub.rs`, scheduler in plain data driven by explicit time) holds the poll's responder
+and answers with framed binary data (`pty/wire.rs`: `[u32 id][u8 kind][u32 len]`, kinds data, exit,
+failed, sync; data frames carry their stream offset; responses are capped at 1 MiB) for every
+terminal whose coalescing deadline is due. A terminal's presentation class picks its deadline:
+focused 4 ms (16 ms sustained), visible 16 ms, hidden 100 ms, window occluded or asleep 250 ms;
+256 KiB pending is always due, and terminals due within 4 ms ride in the same response (one
+terminal contributes at most 512 KiB per response, so floods pipeline and share). The
+frontend reports classes only on change (`pty_set_presentation`, from `lib/ptyPresentation.ts`);
+macOS occlusion and sleep reach the hub natively from `window_presentation.rs`. The stream token
+from `pty_stream_open` is the credential: any frame can reach the scheme but only the page can
+invoke. A terminal's output is held until its receiver announces itself, and reload or window
+destruction drops the held responder, kills the token and detaches that window's terminals.
+Frontend `PtyOutputHub` owns the loop: it re-polls on a response before parsing and demultiplexes
+to the `PtyOutputReceiver`s, whose cumulative parsed offsets ride on the next poll. An ack-only
+request goes out only for new receivers, for more than 512 KiB of unsent progress, or when native
+sends `sync` because it waits on that terminal (credit blocked or exiting).
+
+Receivers parse in at most 32 KiB slices with a four-millisecond work budget on a shared FIFO
+MessageChannel task queue, which closes its ports when idle. Only fully parsed original chunks
+earn credit. Credit is bytes: at most 1 MiB in flight (128 chunks) and 2 MiB pending plus in
+flight per terminal. Acknowledgments are cumulative offsets validated against delivered chunk
+boundaries, so duplicates and retries cannot grant credit; a bad boundary or stream gap fails only
+that terminal visibly. Parser failures stop delivery without acknowledging unconsumed bytes.
+Transport failures retry with capped backoff and surface as one stalled/failed toast per
+terminal. Exit waits for the reader drain and the final acknowledgments; the `exit` frame always
+follows that terminal's last data frame. Unix readers sleep on PTY readiness plus an explicit
+shutdown signal without a polling timer. After shell exit they consume ready output, bounded to
+2 MiB / 30 seconds, rather than wait indefinitely for an inherited slave descriptor to close.
+Exceeding this drain bound reports a reader failure and exit status -1. After shell exit,
+30 seconds without acknowledgment progress closes a stalled queue with a logged delivery failure
+and exit status -1. The deadline is armed before ConPTY close and thread joins; it does not run
+during live-shell backpressure. Close wakes blocked queue workers and the Unix reader; Windows
+keeps draining the pipe while ConPTY closes. Per-read costs stay low: the agent and DA filters
+scan with `memchr` and copy runs, the reader checks an atomic `closed` flag and reuses its
+buffers, input goes through one bounded queue to a per-session writer thread, worker threads use
+128-256 KiB stacks, and `pty_has_foreground_process` lists children with `proc_listchildpids` or
+`/proc/<pid>/task/*/children` instead of forking `pgrep`.
 
 Enable release diagnostics with `localStorage.setItem("terax:terminal-diagnostics", "1")`
 and reload. `window.__teraxTerm()` reads frontend counters;
@@ -174,15 +199,15 @@ establish production readiness, platform parity, or multi-day resource stability
 
 **Rust (`src-tauri/`)** owns all OS access. The webview never touches the FS, processes, or shells directly - everything goes through `invoke()` calls to commands registered in `src-tauri/src/lib.rs`:
 
-- `pty::pty_*` - long-lived interactive PTY sessions (portable-pty ↔ Ghostty), managed by `PtyState` (`RwLock<HashMap<id, Session>>`). Output streams via a Tauri `Channel<PtyEvent>`.
+- `pty::pty_*` - long-lived interactive PTY sessions (portable-pty ↔ Ghostty), managed by `PtyState` (`RwLock<HashMap<id, Session>>`). Output streams over the `terax-pty` multiplexed pull stream (hub thread, `pty_stream_open`, `pty_set_presentation`); input goes through a per-session writer thread.
 - `fs::tree::*` (`fs_read_dir`, `list_subdirs`), `fs::file::*` (`fs_read_file`, `fs_write_file`, `fs_stat`, `fs_canonicalize`), `fs::mutate::*` (`fs_create_file`, `fs_create_dir`, `fs_rename`, `fs_move`, `fs_delete`, `fs_delete_batch`): file explorer + editor IO.
-- `fs::search::*` (`fs_search`, `fs_list_files`), `fs::grep::*` (`fs_grep`, `fs_glob`): fuzzy file finder + content search (powered by `ignore` + `grep-*` crates).
-- `git::commands::*`: full source-control surface (`git_status`, `git_diff`, `git_diff_content`, `git_stage`, `git_unstage`, `git_discard`, `git_commit`, `git_fetch`, `git_pull_ff_only`, `git_push`, `git_log`, `git_show_commit`, `git_commit_files`, `git_commit_file_diff`, `git_panel_snapshot`, `git_resolve_repo`, `git_remote_url`). All gated through the workspace authorization registry.
-- `shell::shell_run_command`: one-shot subshell exec used by AI tools. Distinct from PTY sessions; not the user's interactive terminal. On Windows via PowerShell (`-NoProfile -Command`), on Unix via `$SHELL -lc`. Shared helper `build_oneshot_command`.
+- `fs::search::*` (`fs_search`, `fs_list_files`), `fs::grep::*` (`fs_grep`, `fs_grep_interactive`, `fs_glob`): fuzzy file finder + content search (powered by `ignore` + `grep-*` crates). File lists are cached per root in `fs::index` (packed buffer, at most two roots, 45 s TTL) and dropped by watcher events and our own mutations, so a keystroke ranks the cached list instead of re-walking the tree. Interactive searches bump a `fs::supersede` generation when the command is dispatched, so the walk of an older query stops while a newer one starts. Every command that touches the disk is `async` and runs on the blocking pool (`fs::blocking`): Tauri runs a plain command on the main thread, and the async runtime has two workers (`modules/runtime.rs`), so nothing blocking may run inline in an `async fn` either.
+- `git::commands::*`: full source-control surface (`git_status`, `git_diff`, `git_diff_content`, `git_stage`, `git_unstage`, `git_discard`, `git_commit`, `git_fetch`, `git_pull_ff_only`, `git_push`, `git_log`, `git_show_commit`, `git_commit_files`, `git_commit_file_diff`, `git_panel_snapshot`, `git_resolve_repo`, `git_remote_url`). All gated through the workspace authorization registry. `git_status` asks git for `--untracked-files=normal` (one `dir/` entry per untracked directory) and expands small untracked directories back into files with a bounded `git ls-files --others` (500 files and 16 directories per refresh, listing abandoned at a 256 KiB cap); a directory over budget stays collapsed as `dir/`, which stage and discard handle natively.
+- `shell::shell_run_command`: one-shot subshell exec used by AI tools (bounded `proc::capture`: two short reader threads, no wait on pipes a backgrounded grandchild keeps open). Distinct from PTY sessions; not the user's interactive terminal. On Windows via PowerShell (`-NoProfile -Command`), on Unix via `$SHELL -lc`. Shared helper `build_oneshot_command`.
 - `shell::shell_session_*`: persistent agent shell with state across calls. `shell::shell_bg_*` (`spawn`, `logs`, `kill`, `list`): long-running background processes (dev servers etc.) with bounded ring-buffer log capture.
 - `workspace::*`: `workspace_authorize` / `workspace_current_dir` (the spawn/git/AI cwd authorization registry) plus the WSL bridge (`wsl_list_distros`, `wsl_default_distro`, `wsl_home`).
 - `lsp::*` (`lsp_detect`, `lsp_host_pid`, `lsp_resolve_root`, `lsp_spawn`, `lsp_send`, `lsp_kill`): language server process host. Dumb JSON-RPC pipe: Content-Length framing + process lifecycle in Rust (`lsp/framing.rs`, pure + tested), protocol intelligence on the frontend. Spawn cwd gated through the workspace registry; binaries resolve via the captured login-shell env (`lsp/env.rs`, GUI apps get a bare PATH on macOS); root detection walks up to markers but never to or above `$HOME`. Servers run in their own process group on Unix and are group-killed (cargo check / proc-macro children die with the server); Windows children get a `proc::job::ProcessJob` (kill-on-close, shared with pty). All sessions killed on `RunEvent::Exit`.
-- `net::*` (`ai_http_request`, `ai_http_stream`, `lm_ping`): AI HTTP proxy with SSRF guard; keeps provider calls and local-model pings off the webview.
+- `net::*` (`ai_http_stream`, `ai_http_cancel`, `ai_http_ack`, `lm_ping`): AI HTTP proxy with SSRF guard; keeps provider calls and local-model pings off the webview. Clients are cached per `(profile, host, pinned IPs, allow_private)` with a 90 s idle TTL and at most eight entries, so connections and HTTP/2 sessions are reused while DNS-rebinding protection stays per request.
 - `secrets::secrets_*`: OS keychain via the `keyring` crate. Service constant `terax-ai`. Linux uses a file-based fallback gated behind `#[cfg(target_os = "linux")]`.
 - `open_settings_window`: separate webview window for Settings (optional `tab` arg deep-links a section).
 - `vibrancy::window_*`: native window backdrop (`window_backdrop_kind`, `window_set_backdrop`). macOS gets `NSVisualEffectMaterial::UnderWindowBackground`, Windows 11 gets Mica (gated on build >= 22000 via `RtlGetVersion`, since `apply_mica` fails on Windows 10), Linux reports `none` because blur there belongs to the compositor. The `window-vibrancy` crate is a macOS/Windows-only dependency so Linux builds never pull it.
@@ -242,9 +267,9 @@ BYOK. Cloud providers via `@ai-sdk/*`: **OpenAI, Anthropic, Google, xAI, Cerebra
 - **Key storage**: OS keychain via `keyring` (Rust). Frontend reads/writes through `secrets_*` commands. Service `KEYRING_SERVICE = "terax-ai"`. Never persist keys to disk, settings store, or `localStorage`.
 - **Agent** (`lib/agent.ts`): `Experimental_Agent` with `stopWhen: stepCountIs(MAX_AGENT_STEPS)` and the system prompt from `config.ts`. Provider branching happens here - keep the `Agent` / `DirectChatTransport` shape; the rest of the system depends on AI SDK v6 chat semantics.
 - **Sub-agents** (`agents/registry.ts`, `agents/runSubagent.ts`): named sub-agents with their own system prompts and tool subsets, invoked by the main agent via `run_subagent` tool.
-- **Sessions** (`lib/sessions.ts` + `store/chatStore.ts`): conversations are organized into named sessions. `terax-ai-sessions.json` retains only metadata and `activeId`; message arrays live in atomically replaced `conversations/session-<id>.json` files owned by Rust. Legacy migration preserves `terax-ai-sessions.before-message-files.json`, removes a legacy key only after its message file is safe, and never overwrites a newer file on retry. Per-session queues and a native I/O gate serialize storage operations across page reloads; failed latest writes remain retryable, and window close flushes pending storage. `chatStore.ts` keeps a module-scoped `Map<sessionId, Chat<UIMessage>>`; `getOrCreateChat(sessionId)` lazily constructs a `Chat`, seeded with messages from a hydration map populated by `hydrateSessions()` (called once from `App.tsx`). `AgentRunBridge` mirrors active-session messages to disk on every change and auto-derives titles from the first user message. Switching the API key wipes the chat map; sessions persist.
+- **Sessions** (`lib/sessions.ts` + `store/chatStore.ts`): conversations are organized into named sessions. `terax-ai-sessions.json` retains only metadata and `activeId`; message arrays live in atomically replaced `conversations/session-<id>.json` files owned by Rust. Messages cross IPC as raw JSON bytes (validated by a streaming pass, never rebuilt as a document tree); mid-stream saves are plain atomic replaces scheduled at most every 2 s and at least every 4 s, while turn end, session switch and window close save durably (file sync, plus a directory sync for a new file). A queued write for a session is replaced by a newer one, and a damaged file is set aside as `session-<id>.json.corrupt` and reads as empty, so one bad conversation never breaks the rest. Legacy migration is per session: it removes a legacy key only after its message file is safe, never overwrites a newer file on retry, skips and reports a failing key, and deletes `terax-ai-sessions.before-message-files.json` once every migrated file reads back (a leftover copy older than seven days with nothing to migrate is pruned at startup, and deleting a session scrubs it from the copy). Window close flushes with a timeout and never traps: a failed flush shows a "Close anyway" error once. Per-session queues and a native I/O gate serialize storage operations across page reloads; failed latest writes remain retryable, and window close flushes pending storage. `chatStore.ts` keeps a module-scoped `Map<sessionId, Chat<UIMessage>>`; `getOrCreateChat(sessionId)` lazily constructs a `Chat`, seeded with messages from a hydration map populated by `hydrateSessions()` (called once from `App.tsx`). `AgentRunBridge` mirrors active-session messages to disk on every change and auto-derives titles from the first user message. Switching the API key wipes the chat map; sessions persist.
 - **Composer** (`lib/composer.tsx`): React context providing shared input state (text, attachments, voice) for both the docked `AiInputBar` and any other surface. Attachments include image, text-file, and `selection` kinds - selections come from `useChatStore.attachSelection(text, source)` (drained into chips, not pasted into the textarea) and are wrapped as `<selection source="terminal|editor">…</selection>` blocks at submit. Composer derives `isBusy` from `agentMeta.status` so it can mount safely before sessions hydrate.
-- **AI HTTP transport**: binary request bodies and response packets avoid JSON byte arrays. Native requests are owned by their calling window, explicitly cancelled on abort, page reload, or window destruction, and bounded to 16 concurrent requests. A two-message credit window carries at most 64 KiB per chunk; acknowledgments are validated cumulative byte boundaries. The frontend consumer queue is capped at 192 KiB, request bodies at 64 MiB, and request metadata at 64 KiB. Consumer cancellation during startup is repeated after native registration completes. SSRF validation and DNS pinning remain in Rust.
+- **AI HTTP transport**: binary request bodies and response packets avoid JSON byte arrays. Native requests are owned by their calling window, explicitly cancelled on abort, page reload, or window destruction, and bounded to 16 concurrent requests. A 128 KiB byte window (at most 256 packets) carries at most 64 KiB per packet and coalesces ready network chunks; the webview acknowledges validated cumulative byte boundaries once half a window has arrived, so small SSE chunks cost no per-chunk IPC, and a consumer that grants no credit for two minutes is abandoned and its request cancelled. The frontend consumer queue is capped at 192 KiB, request bodies at 64 MiB, and request metadata at 64 KiB. Consumer cancellation during startup is repeated after native registration completes. SSRF validation and DNS pinning remain in Rust.
 - **Voice input**: streamed transcription pipeline. Toggled from the composer.
 - **Live context bridge**: `App.tsx` calls `setLive({ getCwd, getTerminalContext, … })` so tools can read the *currently active* terminal's cwd + last 300 lines of buffer. Lazy by design - don't pre-snapshot.
 - **Tools** (`tools/tools.ts`): `read_file`, `list_directory`, `fs_search`, `fs_grep` auto-execute. `write_file`, `create_directory`, `rename`, `delete`, `run_command`, `shell_session_run`, `shell_bg_spawn` set `needsApproval: true` and the AI SDK pauses for an in-UI confirmation card. Auto-send after approval uses `lastAssistantMessageIsCompleteWithApprovalResponses`. `lib/security.ts` is a deny-list refusing obvious secret paths (`.env*`, `.ssh/`, credentials, keychain dirs) - apply on **both** read and write paths and don't bypass it.
@@ -268,8 +293,8 @@ BYOK. Cloud providers via `@ai-sdk/*`: **OpenAI, Anthropic, Google, xAI, Cerebra
 
 ### Window styling
 
-- macOS: `titleBarStyle: Overlay` + `hiddenTitle: true` in `tauri.conf.json` (native traffic lights via overlay). `transparent: true` + `macOSPrivateApi: true` in `tauri.conf.json` are what `NSVisualEffectView` requires; that also means the macOS build uses a private API and is not App Store eligible.
-- Linux: `decorations: false` + `transparent: true` from `tauri.linux.conf.json`; re-asserted post-realize for GNOME/Mutter CSD.
+- macOS: `titleBarStyle: Overlay` + `hiddenTitle: true` in `tauri.conf.json` (native traffic lights via overlay). The main window is created opaque, because a non-opaque `NSWindow` makes WindowServer blend every terminal frame. `window_set_backdrop` makes the window and its `WKWebView` (`drawsBackground`) see-through only while vibrancy is on, and paints the opaque window with the theme's frame colour otherwise. `macOSPrivateApi: true` stays for that `WKWebView` key and the private `NSVisualEffectView` hosting, so the macOS build uses a private API and is not App Store eligible.
+- Linux: `decorations: false` + `transparent: true` from `tauri.linux.conf.json`; re-asserted post-realize for GNOME/Mutter CSD. Windows and Linux stay transparent from creation because the borderless chrome paints its own rounded corners.
 - Windows: same as Linux via `tauri.windows.conf.json`. React renders custom `WindowControls`.
 
 ### Tauri capabilities
@@ -307,6 +332,7 @@ Long-form contributor guides live under `docs/`. These guides elaborate on `TERA
 - `docs/README.md` - index of contributor guides
 - `docs/architecture/two-process-model.md` - IPC boundary and command reference
 - `docs/architecture/pty-shell-integration.md` - PTY, shell init scripts, OSC, ConPTY, Job Object
+- `docs/architecture/pty-transport-v2.md` - multiplexed PTY output stream: hub, wire format, presentation classes, credit; `scripts/pty-smoke/` drives it in a real debug app (`python3 scripts/pty-smoke/run.py`)
 - `docs/architecture/security-model.md` - consolidated security model and boundaries
 - `docs/architecture/ai-subsystem.md` - AI stack, sessions, tools, adding a provider
 - `docs/architecture/terminal-renderer-pool.md` - model ownership and presentation pool invariants
