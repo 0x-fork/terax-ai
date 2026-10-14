@@ -162,8 +162,39 @@ export type TeraxGhosttySelection = {
   readonly rectangular: boolean;
 };
 
+export type TeraxGhosttyInstantiate = (
+  module: WebAssembly.Module,
+  imports: WebAssembly.Imports,
+) => WebAssembly.Instance;
+
 export type TeraxGhosttyLoadOptions = {
   readonly log?: (message: string) => void;
+  /**
+   * Creates one instance of the compiled module. The default is a synchronous
+   * `new WebAssembly.Instance`, which takes about a millisecond or less once
+   * the module is compiled. Overridable so tests can observe instantiation.
+   */
+  readonly instantiate?: TeraxGhosttyInstantiate;
+  /**
+   * Called once per burst of disposed instances with the linear-memory bytes
+   * they released. A dropped memory is only freed when the engine collects it,
+   * which on an idle page may not happen for a long time; the default hint
+   * allocates a throwaway one-page `WebAssembly.Memory`, which makes WebKit and
+   * V8 collect. `null` disables the hint.
+   */
+  readonly reclaim?: ((bytes: number) => void) | null;
+  /** Quiet period before `reclaim` runs (default 250 ms). */
+  readonly reclaimDelayMs?: number;
+};
+
+/** Linear-memory accounting across every live instance of one compiled module. */
+export type TeraxGhosttyMemoryStats = {
+  readonly instanceCount: number;
+  /** Sum of `memory.buffer.byteLength` over live instances. */
+  readonly totalBytes: number;
+  readonly instanceBytes: readonly number[];
+  /** Instances created since the module was loaded, live or not. */
+  readonly instancesCreated: number;
 };
 
 export type TeraxGhosttyWasmExports = WebAssembly.Exports & {
@@ -175,6 +206,12 @@ export type TeraxGhosttyWasmExports = WebAssembly.Exports & {
     maxScrollbackLines: number,
   ) => number;
   readonly restty_destroy: (handle: number) => void;
+  readonly restty_scrollback_page_bytes: (handle: number) => number;
+  readonly restty_set_scrollback_limits: (
+    handle: number,
+    maxBytes: number,
+    maxLines: number,
+  ) => number;
   readonly restty_write: (handle: number, ptr: number, len: number) => number;
   readonly restty_resize: (handle: number, cols: number, rows: number) => number;
   readonly restty_set_pixel_size: (

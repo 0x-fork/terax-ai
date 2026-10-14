@@ -437,3 +437,24 @@ The [recorded block run](ghostty-resource-soak-2026-09-05-blocks.json) uses five
 scalar in 15.29 seconds. Both plateaued at 71,434,240 bytes (68.125 MiB) of WASM
 memory with zero growth in the final 16 epochs. The marker rings stayed bounded
 at 2,048 pins per model. This does not measure full application RSS or battery use.
+
+## Instance per terminal (October 15)
+
+The shared-instance statements above describe the earlier design. Each model now
+owns a WebAssembly instance created from one cached module, so closing a model
+drops its linear memory instead of leaving a high-water mark. Blank instances
+shrink from 1,310,720 to 327,680 bytes (96 KiB shadow stack), a blank 120x40
+terminal costs 1,114,112 bytes (it was about 0.5 MiB when pages were shared), and
+the five-model block soak plateaus at 75.9 MiB (it was 68.2 MiB) with zero growth.
+
+Opening 20 heavy terminals and closing 15 returns 137 of 186 MB of Node external
+memory (the shared design returned 0.6 MB), and 174 of 247 MB of WebContent
+footprint in WKWebView. WebKit does not collect a dropped memory while a page is
+idle, so the loader allocates a one-page `WebAssembly.Memory` after a burst of
+disposals. Scrollback summed over models is capped at 192 MiB without pruning held
+history. `pnpm profile:ghostty` records the lifecycle comparison and instantiation
+latency, and `node scripts/ghostty-webkit-memory.mjs` repeats it in WKWebView; `pnpm soak:ghostty` records the deepest WebAssembly stack use against
+adversarial input. Details and limits are in
+`packages/ghostty-core/adapted/UPSTREAM.md`. These remain core measurements: they
+do not include renderer memory, and JavaScriptCore moves instances past the
+eighth to bounds-checked memory.

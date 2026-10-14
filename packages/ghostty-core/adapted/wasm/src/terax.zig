@@ -2309,6 +2309,35 @@ pub export fn restty_resize(handle: ?*Restty, cols: u16, rows: u16) u32 {
     return @intFromEnum(ErrorCode.ok);
 }
 
+/// Changes the primary-screen scrollback limits at runtime. Lowering a limit
+/// prunes complete historical pages immediately; zero is rejected because it
+/// would erase history instead of bounding it.
+pub export fn restty_set_scrollback_limits(
+    handle: ?*Restty,
+    max_bytes: u32,
+    max_lines: u32,
+) u32 {
+    const h = handle orelse return @intFromEnum(ErrorCode.invalid_handle);
+    if (max_bytes == 0 or max_lines == 0) return @intFromEnum(ErrorCode.invalid_arg);
+    h.term.setScrollbackMaxBytes(max_bytes);
+    h.term.setScrollbackMaxLines(max_lines);
+    clearSelectionText(h);
+    reconcileSelectionAfterMutation(h.term.screens.active);
+    if (h.search.isActive()) {
+        h.search.viewport_dirty = true;
+        h.search.active_dirty = true;
+    }
+    return @intFromEnum(ErrorCode.ok);
+}
+
+/// Bytes of page memory the primary screen currently holds (scrollback plus
+/// the active area): the quantity the byte limit is compared against.
+pub export fn restty_scrollback_page_bytes(handle: ?*Restty) u32 {
+    const h = handle orelse return 0;
+    const screen = h.term.screens.get(.primary) orelse return 0;
+    return @intCast(@min(screen.pages.page_size, std.math.maxInt(u32)));
+}
+
 pub export fn restty_set_pixel_size(handle: ?*Restty, width_px: u32, height_px: u32) u32 {
     const h = handle orelse return @intFromEnum(ErrorCode.invalid_handle);
     if (width_px == 0 or height_px == 0) return @intFromEnum(ErrorCode.invalid_arg);

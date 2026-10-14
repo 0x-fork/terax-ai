@@ -11,10 +11,10 @@ per-terminal frame loop, or per-pane GPU lifecycle.
 - Restty commit: `7700b14a7643ba9240818209ef1e0aa90d83ad77`
 - Zig: `0.16.0`
 - Optimization: `ReleaseFast`, WebAssembly SIMD and scalar variants
-- SIMD artifact size: `754648` bytes
-- Scalar artifact size: `752584` bytes
-- SIMD SHA-256: `fe59b66192ed1e2ecaf4e96b23f3d46be9af58a2798d21a90c1f62d7f1c4bc2a`
-- Scalar SHA-256: `af3261061f3b3bb3481d132a9a523d28f73e512eee3f473631fb136100b48ec2`
+- SIMD artifact size: `755388` bytes
+- Scalar artifact size: `753322` bytes
+- SIMD SHA-256: `302b7952e0f84d1701b64a4348f597bbe5ab2bc1f2b58c12d6cf775251a895f7`
+- Scalar SHA-256: `c9cffe386b771bd1a76b493bf064b30abb30fd5ef3d36d700226b318309c1cad`
 
 Terax-specific changes include:
 
@@ -37,9 +37,16 @@ Terax-specific changes include:
 - native mode, size, color, visibility, and version query replies;
 - generated upstream Ghostty XTGETTCAP responses and native DECRQSS replies;
 - synchronized-output state for damage suppression with bounded recovery;
-- one shared WASM instance with one terminal handle per Terax model;
-- Ghostty's module-global exact-page WASM pool, avoiding per-terminal geometric
-  page-pool growth while reusing released pages across tabs;
+- one WebAssembly instance (one linear memory) per Terax model, all created
+  from a single compiled module; disposing the model drops the instance, which
+  is the only way WebAssembly memory is ever returned to the operating system;
+- Ghostty's module-global exact-page WASM pool, avoiding geometric page-pool
+  growth; it is per terminal now because the pool lives in the instance;
+- a 96 KiB shadow stack placed below the data (`-Dwasm-stack-kib`, default 96),
+  so a blank instance is 5 pages (320 KiB) instead of 20 and an overflow traps
+  instead of corrupting memory;
+- `restty_set_scrollback_limits` and `restty_scrollback_page_bytes`, which let
+  the host divide a global scrollback budget without pruning held history;
 - upstream OSC SIMD scanning plus row-recycling, cursor, hyperlink, C0/C1,
   Kitty clipboard, and page-pointer correctness fixes through the pinned tip;
 - synchronous SIMD capability detection with a scalar Ghostty artifact for
@@ -88,6 +95,45 @@ Terax-specific changes include:
 The bridge deliberately stays below Terax's model/surface boundary. Terax
 retains renderer pooling, hidden-tab renderer release, damage-driven frame
 scheduling, shell integration, semantic routing, and fallback selection.
+
+## October 15 instance-per-terminal memory
+
+A single shared instance can never give memory back: WebAssembly memory only
+grows, so twenty agent tabs left the app at their joint high-water mark until
+every model was gone. Each model now owns an instance of one cached
+`WebAssembly.Module`. Measured with `pnpm profile:ghostty` (Node 24) and in a
+real WKWebView on macOS 26 (footprint of the WebContent process):
+
+- blank instance: 1,310,720 bytes before, 327,680 after (stack 1 MiB to 96 KiB;
+  Ghostty needs at most 35,200 bytes on the adversarial soak below);
+- one 120x40 terminal: 2,097,152 bytes before, 1,114,112 after; 20 blank
+  terminals: 10,944,512 bytes shared, 22,282,240 private (the cost of isolation);
+- synchronous instantiation of the cached module: 0.075 ms median in V8 (0.12 ms
+  with the terminal) and 0.5 to 1.4 ms in JavaScriptCore (1 to 2 ms with the
+  terminal in WKWebView, 1 ms timer resolution);
+- open 20 heavy terminals (about 9 MiB of scrollback each), close 15: Node
+  external memory 186 MB to 49 MB (shared instance: 175 MB to 174 MB); WKWebView
+  footprint 247 MB to 73 MB, and 26 MB after the last close.
+
+An idle WKWebView does not collect a dropped memory for many seconds, so the
+loader creates a one-page `WebAssembly.Memory` 250 ms after a burst of disposals;
+WebKit and V8 both collect when it is allocated (`reclaim` option). With the hint
+the footprint is back within about a second (212 MB after one second without it).
+`node scripts/ghostty-webkit-memory.mjs` repeats the WKWebView run.
+
+Stack safety: `pnpm soak:ghostty` writes about 33 MB of adversarial input per
+artifact and render format (1 MiB OSC strings, 200,000-parameter SGR, nested
+string introducers, DCS/APC/kitty floods, 100,000 combining marks, malformed
+UTF-8, scroll-region extremes, reflow, search, selection, key encoding) with a
+canary in the stack. The deepest use is 35,200 bytes (36%) in every artifact
+and format; the soak and `GhosttyWasmStack.test.ts` fail above 50%. With the
+4 KiB stack that was tried, the first write traps with a memory access error.
+
+Known limits: JavaScriptCore keeps only eight instances on fast signal-checked
+memory; instances past the eighth use explicit bounds checks and parse about
+1.8x slower in a pure-parse microbenchmark (14.7 ms to 27 ms per 200,000 lines).
+Calls from JavaScript into many different instances are polymorphic, which adds
+about 0.4 microseconds to a write plus render-state update.
 
 ## October 14 upstream update
 
@@ -142,7 +188,8 @@ process RSS and GPU allocations are separate release gates.
 
 ## Rebuild
 
-From `packages/ghostty-core/adapted/wasm`:
+From `packages/ghostty-core/adapted/wasm` (add `-Dwasm-stack-kib=N` to change the
+96 KiB shadow stack; `pnpm soak:ghostty` reports the deepest stack use):
 
 ```sh
 zig build -Dtarget=wasm32-freestanding -Doptimize=ReleaseFast

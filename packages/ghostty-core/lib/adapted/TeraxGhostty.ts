@@ -3,6 +3,7 @@ import type {
   TeraxGhosttyLine,
   TeraxGhosttyLoadOptions,
   TeraxGhosttyKeyEvent,
+  TeraxGhosttyMemoryStats,
   TeraxGhosttyRenderBase,
   TeraxGhosttyRenderFormat,
   TeraxGhosttyRenderState,
@@ -26,10 +27,10 @@ export const ADAPTED_GHOSTTY_COMMIT =
 export const ADAPTED_RESTTY_COMMIT =
   "7700b14a7643ba9240818209ef1e0aa90d83ad77";
 export const ADAPTED_GHOSTTY_WASM_SHA256 =
-  "fe59b66192ed1e2ecaf4e96b23f3d46be9af58a2798d21a90c1f62d7f1c4bc2a";
+  "302b7952e0f84d1701b64a4348f597bbe5ab2bc1f2b58c12d6cf775251a895f7";
 
 export const ADAPTED_GHOSTTY_SCALAR_WASM_SHA256 =
-  "af3261061f3b3bb3481d132a9a523d28f73e512eee3f473631fb136100b48ec2";
+  "c9cffe386b771bd1a76b493bf064b30abb30fd5ef3d36d700226b318309c1cad";
 
 let wasmSimdAvailable: boolean | undefined;
 
@@ -62,11 +63,14 @@ const SEARCH_STATUS_BYTES = 16;
 const SEARCH_VIEWPORT_SPAN_BYTES = 8;
 const MAX_EVENT_PAYLOAD_BYTES = 256 * 1024;
 const LINE_CHUNK_LINES = 64;
+const RECLAIM_DELAY_MS = 250;
 
 const requiredExports = [
   "memory",
   "restty_create_with_limits",
   "restty_destroy",
+  "restty_set_scrollback_limits",
+  "restty_scrollback_page_bytes",
   "restty_write",
   "restty_resize",
   "restty_set_pixel_size",
@@ -203,10 +207,22 @@ type RenderViewCache = {
   readonly gpuAllGlyphs: ViewCacheEntry<Uint32Array>;
 };
 
+/**
+ * A compiled Ghostty module. The module is compiled once and every terminal
+ * gets its own instance, hence its own linear memory: WebAssembly memory can
+ * grow but never shrink, so a private memory is the only way a closed terminal
+ * returns its scrollback to the operating system. Instantiating the compiled
+ * module is synchronous and takes about a millisecond or less.
+ */
 export class TeraxGhostty {
+  private readonly live = new Set<TeraxGhosttyInstance>();
+  private created = 0;
+  private reclaimBytes = 0;
+  private reclaimTimer: ReturnType<typeof setTimeout> | null = null;
+
   private constructor(
-    private readonly exports: TeraxGhosttyWasmExports,
-    private readonly memory: WebAssembly.Memory,
+    private readonly module: WebAssembly.Module,
+    private readonly options: TeraxGhosttyLoadOptions,
   ) {}
 
   static async load(
@@ -225,84 +241,212 @@ export class TeraxGhostty {
     }
 
     const fallback = response.clone();
-    const memoryRef: { current: WebAssembly.Memory | null } = {
-      current: null,
-    };
-    const imports = createImports(memoryRef, options);
+    let module: WebAssembly.Module;
     try {
-      const { instance } = await WebAssembly.instantiateStreaming(
-        response,
-        imports,
-      );
-      return TeraxGhostty.fromInstance(instance, memoryRef);
+      module = await WebAssembly.compileStreaming(response);
     } catch {
-      return TeraxGhostty.loadBytes(await fallback.arrayBuffer(), options);
+      module = await compileBytes(await fallback.arrayBuffer());
     }
+    return TeraxGhostty.fromModule(module, options);
   }
 
   static async loadBytes(
     bytes: ArrayBuffer,
     options: TeraxGhosttyLoadOptions = {},
   ): Promise<TeraxGhostty> {
-    if (bytes.byteLength === 0) {
-      throw new Error("Adapted Ghostty WASM is empty");
-    }
-    const memoryRef: { current: WebAssembly.Memory | null } = {
-      current: null,
-    };
-    const module = await WebAssembly.compile(bytes);
-    const instance = await WebAssembly.instantiate(
-      module,
-      createImports(memoryRef, options),
-    );
-    return TeraxGhostty.fromInstance(instance, memoryRef);
+    return TeraxGhostty.fromModule(await compileBytes(bytes), options);
   }
 
+  static fromModule(
+    module: WebAssembly.Module,
+    options: TeraxGhosttyLoadOptions = {},
+  ): TeraxGhostty {
+    const available = new Set(
+      WebAssembly.Module.exports(module).map((entry) => entry.name),
+    );
+    for (const name of requiredExports) {
+      if (!available.has(name)) {
+        throw new Error(`Missing adapted Ghostty WASM export: ${name}`);
+      }
+    }
+    return new TeraxGhostty(module, options);
+  }
+
+  /** The shared compiled module that every instance is created from. */
+  get compiledModule(): WebAssembly.Module {
+    return this.module;
+  }
+
+  /**
+   * A fresh instance with its own linear memory and no terminal. Dispose it to
+   * drop the memory; terminals created on it share that memory.
+   */
+  instantiate(): TeraxGhosttyInstance {
+    const holder: MemoryHolder = { current: null };
+    const instantiate = this.options.instantiate ?? defaultInstantiate;
+    const raw = instantiate(this.module, createImports(holder, this.options));
+    const exports = raw.exports as TeraxGhosttyWasmExports;
+    if (!(exports.memory instanceof WebAssembly.Memory)) {
+      throw new Error("Adapted Ghostty WASM does not export its memory");
+    }
+    holder.current = exports.memory;
+    const instance = new TeraxGhosttyInstance(this, exports, holder);
+    this.live.add(instance);
+    this.created += 1;
+    return instance;
+  }
+
+  /**
+   * A terminal in a private instance. Disposing the terminal disposes the
+   * instance, so nothing of it survives once the caller drops its references.
+   */
   createTerminal(
     cols: number,
     rows: number,
     options: TeraxGhosttyTerminalOptions = {},
   ): TeraxGhosttyTerminal {
-    return new TeraxGhosttyTerminal(
-      this.exports,
-      this.memory,
-      cols,
-      rows,
-      options,
-    );
+    validateDimensions(cols, rows);
+    const instance = this.instantiate();
+    try {
+      return new TeraxGhosttyTerminal(instance, cols, rows, options, true);
+    } catch (error) {
+      instance.dispose();
+      throw error;
+    }
   }
 
+  /** Linear memory of every live instance, in bytes. */
   getMemoryBytes(): number {
-    return this.memory.buffer.byteLength;
+    let total = 0;
+    for (const instance of this.live) total += instance.memoryBytes;
+    return total;
+  }
+
+  memoryStats(): TeraxGhosttyMemoryStats {
+    const instanceBytes: number[] = [];
+    let totalBytes = 0;
+    for (const instance of this.live) {
+      const bytes = instance.memoryBytes;
+      instanceBytes.push(bytes);
+      totalBytes += bytes;
+    }
+    return {
+      instanceCount: instanceBytes.length,
+      totalBytes,
+      instanceBytes,
+      instancesCreated: this.created,
+    };
+  }
+
+  /** @internal Called by `TeraxGhosttyInstance.dispose`. */
+  releaseInstance(instance: TeraxGhosttyInstance, bytes: number): void {
+    this.live.delete(instance);
+    this.scheduleReclaim(bytes);
+  }
+
+  private scheduleReclaim(bytes: number): void {
+    const reclaim =
+      this.options.reclaim === undefined
+        ? hintGarbageCollection
+        : this.options.reclaim;
+    if (reclaim === null || bytes <= 0) return;
+    this.reclaimBytes += bytes;
+    if (this.reclaimTimer !== null) return;
+    this.reclaimTimer = setTimeout(() => {
+      const pending = this.reclaimBytes;
+      this.reclaimBytes = 0;
+      this.reclaimTimer = null;
+      reclaim(pending);
+    }, this.options.reclaimDelayMs ?? RECLAIM_DELAY_MS);
+    unrefTimer(this.reclaimTimer);
+  }
+}
+
+type MemoryHolder = { current: WebAssembly.Memory | null };
+
+/**
+ * One WebAssembly instance and its linear memory. Dropping every reference to
+ * a disposed instance lets the engine free the memory.
+ */
+export class TeraxGhosttyInstance {
+  private liveExports: TeraxGhosttyWasmExports | null;
+  private owner: TeraxGhostty | null;
+  private holder: MemoryHolder | null;
+  private readonly terminals = new Set<TeraxGhosttyTerminal>();
+
+  constructor(
+    owner: TeraxGhostty,
+    exports: TeraxGhosttyWasmExports,
+    holder: MemoryHolder,
+  ) {
+    this.owner = owner;
+    this.liveExports = exports;
+    this.holder = holder;
+  }
+
+  get disposed(): boolean {
+    return this.liveExports === null;
+  }
+
+  get exports(): TeraxGhosttyWasmExports {
+    if (!this.liveExports) {
+      throw new Error("Adapted Ghostty instance has been disposed");
+    }
+    return this.liveExports;
+  }
+
+  /** `memory.buffer.byteLength`, or 0 once disposed. */
+  get memoryBytes(): number {
+    return this.liveExports ? this.liveExports.memory.buffer.byteLength : 0;
+  }
+
+  /** A terminal that shares this instance's linear memory. */
+  createTerminal(
+    cols: number,
+    rows: number,
+    options: TeraxGhosttyTerminalOptions = {},
+  ): TeraxGhosttyTerminal {
+    return new TeraxGhosttyTerminal(this, cols, rows, options, false);
+  }
+
+  /** @internal */
+  register(terminal: TeraxGhosttyTerminal): void {
+    this.terminals.add(terminal);
+  }
+
+  /** @internal */
+  forget(terminal: TeraxGhosttyTerminal): void {
+    this.terminals.delete(terminal);
   }
 
   /**
-   * The module's linear memory, shared by every terminal of this instance.
-   * `memory.buffer` is replaced (and the old buffer detached) whenever the
-   * module grows; read it again after any call that can allocate.
+   * Invalidates every terminal of the instance and drops its memory. No WASM
+   * code runs: the whole linear memory is released at once. Views that outlive
+   * the instance are detached and read as empty, but V8 keeps a memory alive
+   * while any view of it exists, so callers must not retain them.
    */
-  get wasmMemory(): WebAssembly.Memory {
-    return this.memory;
-  }
-
-  private static fromInstance(
-    instance: WebAssembly.Instance,
-    memoryRef: { current: WebAssembly.Memory | null },
-  ): TeraxGhostty {
-    const exports = instance.exports as TeraxGhosttyWasmExports;
-    for (const name of requiredExports) {
-      if (!(name in exports)) {
-        throw new Error(`Missing adapted Ghostty WASM export: ${name}`);
-      }
-    }
-    memoryRef.current = exports.memory;
-    return new TeraxGhostty(exports, exports.memory);
+  dispose(): void {
+    const exports = this.liveExports;
+    if (!exports) return;
+    const bytes = exports.memory.buffer.byteLength;
+    this.liveExports = null;
+    for (const terminal of [...this.terminals]) terminal.invalidate();
+    this.terminals.clear();
+    if (this.holder) this.holder.current = null;
+    this.holder = null;
+    detachMemoryViews(exports.memory);
+    this.owner?.releaseInstance(this, bytes);
+    this.owner = null;
   }
 }
 
 export class TeraxGhosttyTerminal {
   private readonly cache: RenderViewCache = createRenderViewCache();
   private readonly handle: number;
+  private exports: TeraxGhosttyWasmExports;
+  private memory: WebAssembly.Memory;
+  private instance: TeraxGhosttyInstance;
+  private readonly ownsInstance: boolean;
   private inputPointer = 0;
   private inputCapacity = 0;
   private readonly textEncoder = new TextEncoder();
@@ -310,11 +454,11 @@ export class TeraxGhosttyTerminal {
   private disposed = false;
 
   constructor(
-    private readonly exports: TeraxGhosttyWasmExports,
-    private readonly memory: WebAssembly.Memory,
+    instance: TeraxGhosttyInstance,
     cols: number,
     rows: number,
     options: TeraxGhosttyTerminalOptions,
+    ownsInstance: boolean,
   ) {
     validateDimensions(cols, rows);
     const maxScrollbackBytes = normalizeLimit(
@@ -327,6 +471,10 @@ export class TeraxGhosttyTerminal {
       DEFAULT_SCROLLBACK_LINES,
       MAX_SCROLLBACK_LINES,
     );
+    this.instance = instance;
+    this.ownsInstance = ownsInstance;
+    this.exports = instance.exports;
+    this.memory = this.exports.memory;
     this.handle = this.exports.restty_create_with_limits(
       cols,
       rows,
@@ -336,6 +484,7 @@ export class TeraxGhosttyTerminal {
     if (!this.handle) {
       throw new Error("Failed to create adapted Ghostty terminal");
     }
+    instance.register(this);
   }
 
   get cols(): number {
@@ -401,9 +550,45 @@ export class TeraxGhosttyTerminal {
     );
   }
 
-  /** The linear memory this terminal lives in (see `TeraxGhostty.wasmMemory`). */
+  /**
+   * The linear memory this terminal lives in. `memory.buffer` is replaced (and
+   * the old buffer detached) whenever the memory grows; read it again after any
+   * call that can allocate. Do not retain it past `dispose()`.
+   */
   get wasmMemory(): WebAssembly.Memory {
+    this.assertLive();
     return this.memory;
+  }
+
+  /** Linear memory of the instance this terminal lives in, in bytes. */
+  get instanceMemoryBytes(): number {
+    this.assertLive();
+    return this.memory.buffer.byteLength;
+  }
+
+  /**
+   * Bytes of page memory the primary screen holds (scrollback plus the active
+   * area). A byte limit below this prunes history; at or above it does not.
+   */
+  scrollbackPageBytes(): number {
+    this.assertLive();
+    return this.exports.restty_scrollback_page_bytes(this.handle);
+  }
+
+  /**
+   * Changes the primary-screen scrollback limits. Lowering prunes complete
+   * historical pages immediately; raising only permits growth.
+   */
+  setScrollbackLimits(maxBytes: number, maxLines: number): void {
+    this.assertLive();
+    checkResult(
+      this.exports.restty_set_scrollback_limits(
+        this.handle,
+        clampInteger(maxBytes, 1, MAX_SCROLLBACK_BYTES),
+        clampInteger(maxLines, 1, MAX_SCROLLBACK_LINES),
+      ),
+      "set scrollback limits",
+    );
   }
 
   /** The cell format written by the next update. New terminals use `"soa"`. */
@@ -1017,15 +1202,38 @@ export class TeraxGhosttyTerminal {
     return textDecoder.decode(state.linkBytes.subarray(offset, offset + length));
   }
 
+  /**
+   * Destroys the terminal. A terminal that owns its instance drops the whole
+   * linear memory without running WASM teardown; one on a shared instance frees
+   * its allocations back to that instance's allocator.
+   */
   dispose(): void {
     if (this.disposed) return;
-    this.disposed = true;
-    if (this.inputPointer) {
-      this.exports.restty_free(this.inputPointer, this.inputCapacity);
-      this.inputPointer = 0;
-      this.inputCapacity = 0;
+    const instance = this.instance;
+    try {
+      if (!this.ownsInstance) {
+        if (this.inputPointer) {
+          this.exports.restty_free(this.inputPointer, this.inputCapacity);
+        }
+        this.exports.restty_destroy(this.handle);
+      }
+    } finally {
+      this.invalidate();
+      instance.forget(this);
+      if (this.ownsInstance) instance.dispose();
     }
-    this.exports.restty_destroy(this.handle);
+  }
+
+  /** @internal Drops every reference into the instance without calling WASM. */
+  invalidate(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.inputPointer = 0;
+    this.inputCapacity = 0;
+    clearRenderViewCache(this.cache);
+    this.exports = null as never;
+    this.memory = null as never;
+    this.instance = null as never;
   }
 
   private readRenderState(): TeraxGhosttyRenderState {
@@ -1346,14 +1554,61 @@ export class TeraxGhosttyTerminal {
   }
 }
 
+/**
+ * A page that drops a large WebAssembly memory may not collect it for a long
+ * time: in WKWebView the memory stayed resident for over ten seconds on an
+ * idle page. Creating even a one-page memory makes WebKit and V8 run a
+ * collection, which frees every dropped instance.
+ */
+function hintGarbageCollection(): void {
+  try {
+    new WebAssembly.Memory({ initial: 1 });
+  } catch {
+    // Best effort: the dropped memory is still freed by the next collection.
+  }
+}
+
+function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
+  if (typeof timer === "object" && timer !== null && "unref" in timer) {
+    (timer as { unref(): void }).unref();
+  }
+}
+
+function defaultInstantiate(
+  module: WebAssembly.Module,
+  imports: WebAssembly.Imports,
+): WebAssembly.Instance {
+  return new WebAssembly.Instance(module, imports);
+}
+
+async function compileBytes(bytes: ArrayBuffer): Promise<WebAssembly.Module> {
+  if (bytes.byteLength === 0) {
+    throw new Error("Adapted Ghostty WASM is empty");
+  }
+  return WebAssembly.compile(bytes);
+}
+
+/**
+ * Growing by zero pages detaches the current `ArrayBuffer`, so a view retained
+ * past disposal reads as empty instead of exposing a dead terminal's cells, and
+ * JavaScriptCore no longer lets it pin the memory.
+ */
+function detachMemoryViews(memory: WebAssembly.Memory): void {
+  try {
+    memory.grow(0);
+  } catch {
+    // Best effort: the memory is unreachable once the instance is dropped.
+  }
+}
+
 function createImports(
-  memoryRef: { current: WebAssembly.Memory | null },
+  holder: MemoryHolder,
   options: TeraxGhosttyLoadOptions,
 ): WebAssembly.Imports {
   return {
     env: {
       log: (pointer: number, length: number) => {
-        const memory = memoryRef.current;
+        const memory = holder.current;
         if (!memory || pointer <= 0 || length <= 0) return;
         validateRange(memory.buffer, pointer, length);
         options.log?.(
@@ -1362,6 +1617,15 @@ function createImports(
       },
     },
   };
+}
+
+function clearRenderViewCache(cache: RenderViewCache): void {
+  for (const entry of Object.values(cache) as ViewCacheEntry<TypedArray>[]) {
+    entry.buffer = null;
+    entry.view = null;
+    entry.pointer = 0;
+    entry.length = 0;
+  }
 }
 
 function createRenderViewCache(): RenderViewCache {

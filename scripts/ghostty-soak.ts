@@ -3,8 +3,15 @@ import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { TeraxGhostty } from "@terax/ghostty-core/adapted";
 import { afterAll, expect, it } from "vitest";
+import {
+  fillStackCanary,
+  peakStackBytes,
+  readWasmLayout,
+  runStackWorkloads,
+} from "../src/modules/terminal/ghostty/wasmStackProbe";
 
 const reports: unknown[] = [];
+const stackReports: unknown[] = [];
 const blockTracking = process.env.TERAX_SOAK_BLOCKS === "1";
 // TERAX_SOAK_FORMAT=gpu exercises the GPU cell-record format instead of the
 // structure-of-arrays format (the default).
@@ -75,11 +82,38 @@ for (const artifact of artifacts) {
   });
 }
 
+for (const artifact of artifacts) {
+  it(`${artifact}: adversarial input and deep nesting stay within half of the WebAssembly stack`, async () => {
+    const bytes = await readFile(resolve(process.env.TERAX_SOAK_CORE_DIR ?? "packages/ghostty-core/adapted", artifact));
+    const layout = readWasmLayout(bytes);
+    const core = await TeraxGhostty.loadBytes(Uint8Array.from(bytes).buffer);
+    const instance = core.instantiate();
+    fillStackCanary(instance.exports.memory, layout.stackTop);
+    const terminal = instance.createTerminal(120, 40, {
+      maxScrollbackBytes: 8 * 1024 * 1024,
+      maxScrollbackLines: 10_000,
+    });
+    try {
+      const started = performance.now();
+      const workload = runStackWorkloads(terminal, gpuFormat ? "gpu" : "soa");
+      const peak = peakStackBytes(instance.exports.memory, layout.stackTop);
+      const report = { artifact, renderFormat: gpuFormat ? "gpu" : "soa", stackBytes: layout.stackTop, initialMemoryBytes: layout.initialPages * 65536, peakStackBytes: peak, peakStackFraction: peak / layout.stackTop, ...workload, elapsedMs: performance.now() - started, memoryBytes: instance.memoryBytes };
+      stackReports.push(report);
+      console.info(JSON.stringify(report));
+      expect(peak).toBeGreaterThan(0);
+      expect(peak).toBeLessThanOrEqual(layout.stackTop / 2);
+    } finally {
+      terminal.dispose();
+      instance.dispose();
+    }
+  });
+}
+
 afterAll(async () => {
   const path = process.env.TERAX_SOAK_REPORT;
   if (path) await writeFile(path, `${JSON.stringify({
     scope: "Node WASM core only; excludes Tauri IPC, WebKit, GPU, and application energy",
     recordedAt: new Date().toISOString(), node: process.version, platform: process.platform,
-    arch: process.arch, reports,
+    arch: process.arch, reports, stackReports,
   }, null, 2)}\n`);
 });

@@ -71,6 +71,9 @@ export type GhosttyGpuFrameOptions = {
  * the exact word layout. `cells` and `memory.buffer` are borrowed: use them
  * synchronously (for example `queue.writeBuffer`) before the next call into
  * the model, because any WASM allocation can replace `memory.buffer`.
+ * Never store the frame, `cells` or `memory`: each model owns its WebAssembly
+ * instance, and a retained reference keeps the whole linear memory alive after
+ * `dispose()` (the engine only frees it once nothing references it).
  */
 export type GhosttyGpuFrame = {
   readonly rows: number;

@@ -5,6 +5,7 @@ export {
   supportsWasmSimd,
   ADAPTED_RESTTY_COMMIT,
   TeraxGhostty,
+  TeraxGhosttyInstance,
   TeraxGhosttyTerminal,
 } from "./TeraxGhostty";
 export {
@@ -31,7 +32,9 @@ export type {
   TeraxGhosttyLine,
   TeraxGhosttyRenderBase,
   TeraxGhosttyRenderFormat,
+  TeraxGhosttyInstantiate,
   TeraxGhosttyLoadOptions,
+  TeraxGhosttyMemoryStats,
   TeraxGhosttyKeyEvent,
   TeraxGhosttyRenderState,
   TeraxGhosttySearchStatus,

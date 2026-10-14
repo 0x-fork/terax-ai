@@ -389,20 +389,17 @@ describe.each(["ghostty-vt", "ghostty-vt-scalar"])(
       }
     });
 
-    it("survives WASM memory growth caused by other terminals between update and frame", () => {
+    it("survives WASM memory growth between update and frame", () => {
       const { model, write, reader, frame: consume } = create(40, 6);
-      const other = create(120, 40);
       try {
         write("persistent");
-        consume();
+        const first = consume();
         write("\r\nmore text");
         model.cursor(); // forces the update while views are fresh
-        const before = core.getMemoryBytes();
+        const before = first.memory.buffer.byteLength;
         // Grow linear memory (detaching every earlier ArrayBuffer).
-        other.write(
-          "x".repeat((80 * 1024 * 1024) / 8).replace(/(.{100})/g, "$1\r\n"),
-        );
-        expect(core.getMemoryBytes()).toBeGreaterThan(before);
+        first.memory.grow(1024);
+        expect(first.memory.buffer.byteLength).toBeGreaterThan(before);
         const frame = consume();
         expect(frame.cells.byteLength).toBe(40 * 6 * GPU_CELL_BYTES);
         expect(frame.cells.buffer).toBe(frame.memory.buffer);
@@ -411,7 +408,6 @@ describe.each(["ghostty-vt", "ghostty-vt-scalar"])(
         expect(frame.newGlyphs.map((glyph) => glyph.text).join("")).toBe("mox");
       } finally {
         model.dispose();
-        other.model.dispose();
       }
     });
   },

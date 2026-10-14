@@ -30,6 +30,11 @@ import {
   type TerminalCellReader,
 } from "./core/packedCells";
 import { SynchronizedOutputPresentationGate } from "./core/SynchronizedOutputPresentationGate";
+import {
+  MIN_SCROLLBACK_BYTES,
+  normalizeScrollbackLines,
+  requestedScrollbackBytes,
+} from "./core/scrollbackBudget";
 import { clearTerminalBufferSequence } from "./core/terminalActions";
 import type {
   GhosttyGpuFrame,
@@ -46,9 +51,6 @@ import type {
 
 const MAX_DIMENSION = 4_096;
 const MAX_CELLS = 1_048_576;
-const MIN_SCROLLBACK_BYTES = 1024 * 1024;
-const MAX_SCROLLBACK_BYTES = 64 * 1024 * 1024;
-const APPROXIMATE_BYTES_PER_SCROLLBACK_CELL = 8;
 const NO_DAMAGE: TerminalDamage = { kind: "none" };
 const FULL_DAMAGE: TerminalDamage = { kind: "full" };
 const NO_GLYPHS: readonly GhosttyGpuGlyph[] = Object.freeze([]);
@@ -72,13 +74,24 @@ const DEFAULT_MODES: TerminalModes = Object.freeze({
   synchronizedOutput: false,
 });
 
+type AdaptedGhosttyTerminalModelOptions = GhosttyTerminalModelOptions & {
+  /** Initial scrollback byte limit when the global budget grants less than requested. */
+  readonly scrollbackByteLimit?: number;
+};
+
 /**
  * Terax-owned model adapter for the current Ghostty terminal and render-state
  * implementation. The terminal model is independent from GPU surfaces so it
  * survives RendererPool lease release and keeps parsing hidden-tab output.
+ *
+ * Each model owns a private WebAssembly instance. `dispose()` drops it, so the
+ * linear memory (scrollback included) is returned to the operating system once
+ * the caller also drops its reference to the model.
  */
 export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
   readonly backend: GhosttyTerminalModelOptions["backend"];
+  /** Scrollback bytes the configuration asks for, before the global budget. */
+  readonly requestedScrollbackBytes: number;
 
   private readonly terminal: TeraxGhosttyTerminal;
   private plainLinks: {
@@ -120,9 +133,14 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
   private readonly synchronizedOutputPresentation: SynchronizedOutputPresentationGate;
   private colsValue: number;
   private rowsValue: number;
+  private scrollbackLines: number;
+  private scrollbackBytesLimit: number;
   private disposed = false;
 
-  constructor(ghostty: TeraxGhostty, options: GhosttyTerminalModelOptions) {
+  constructor(
+    ghostty: TeraxGhostty,
+    options: AdaptedGhosttyTerminalModelOptions,
+  ) {
     validateDimensions(options.cols, options.rows);
     this.backend = options.backend;
     this.colsValue = options.cols;
@@ -131,12 +149,21 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
     this.eventSink = options.onEvent ?? null;
     this.onDispose = options.onDispose ?? null;
 
-    const scrollbackLines = normalizeScrollbackLines(
+    this.scrollbackLines = normalizeScrollbackLines(
       options.config?.scrollbackLimit,
     );
+    this.requestedScrollbackBytes = requestedScrollbackBytes(
+      this.scrollbackLines,
+      options.cols,
+    );
+    this.scrollbackBytesLimit = clampInteger(
+      options.scrollbackByteLimit ?? this.requestedScrollbackBytes,
+      MIN_SCROLLBACK_BYTES,
+      this.requestedScrollbackBytes,
+    );
     this.terminal = ghostty.createTerminal(options.cols, options.rows, {
-      maxScrollbackLines: scrollbackLines,
-      maxScrollbackBytes: scrollbackBytes(scrollbackLines, options.cols),
+      maxScrollbackLines: this.scrollbackLines,
+      maxScrollbackBytes: this.scrollbackBytesLimit,
     });
     this.promptPresentation = new PromptPresentationGate(() =>
       this.requestPresentation(),
@@ -153,6 +180,43 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
 
   isDisposed(): boolean {
     return this.disposed;
+  }
+
+  /** The scrollback byte limit currently in force (at most the requested one). */
+  get scrollbackByteLimit(): number {
+    return this.scrollbackBytesLimit;
+  }
+
+  /** Page bytes currently held by the primary screen (history plus active area). */
+  scrollbackPageBytes(): number {
+    this.assertLive();
+    return this.terminal.scrollbackPageBytes();
+  }
+
+  /**
+   * Applies the share of the global scrollback budget granted to this model.
+   * Raising only permits growth; a limit below the bytes already held prunes
+   * the oldest history immediately. The grant never exceeds what the
+   * configuration requested.
+   */
+  setScrollbackByteLimit(bytes: number): void {
+    this.assertLive();
+    const next = clampInteger(
+      bytes,
+      MIN_SCROLLBACK_BYTES,
+      this.requestedScrollbackBytes,
+    );
+    if (next === this.scrollbackBytesLimit) return;
+    const held = this.terminal.scrollbackPageBytes();
+    this.terminal.setScrollbackLimits(next, this.scrollbackLines);
+    this.scrollbackBytesLimit = next;
+    if (this.terminal.scrollbackPageBytes() >= held) return;
+    this.blockMatch = null;
+    this.contentRevision += 1;
+    this.scrollPositionCurrent = false;
+    this.invalidateRenderState();
+    this.pendingDamage = FULL_DAMAGE;
+    this.notifyDamage();
   }
 
   get cols(): number {
@@ -778,10 +842,13 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
     this.packedViewport = new Uint8Array(0);
     this.promptPresentation.dispose();
     this.synchronizedOutputPresentation.dispose();
-    this.terminal.dispose();
     const callback = this.onDispose;
     this.onDispose = null;
-    callback?.();
+    try {
+      this.terminal.dispose();
+    } finally {
+      callback?.();
+    }
   }
 
   private applyConfig(config: GhosttyTerminalConfig | undefined): void {
@@ -1185,19 +1252,6 @@ function scrollPositionFromScrollbar(scrollbar: {
     offset: Math.max(0, history - Math.min(history, scrollbar.offset)),
     history,
   };
-}
-
-function normalizeScrollbackLines(value: number | undefined): number {
-  if (value === undefined || !Number.isFinite(value)) return 10_000;
-  return clampInteger(Math.round(value), 1, 100_000);
-}
-
-function scrollbackBytes(lines: number, cols: number): number {
-  return clampInteger(
-    lines * cols * APPROXIMATE_BYTES_PER_SCROLLBACK_CELL,
-    MIN_SCROLLBACK_BYTES,
-    MAX_SCROLLBACK_BYTES,
-  );
 }
 
 function validateDimensions(cols: number, rows: number): void {

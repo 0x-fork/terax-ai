@@ -32,8 +32,13 @@ A change to a core subsystem (terminal/shell spawn, workspace auth, git, fs, IPC
 ## Terminal migration status
 
 libghostty-vt is the only terminal model. WebGPU is the default renderer and
-Terax WebGL is the compatibility fallback. Each leaf owns one persistent model;
-presentation resources are shared, bounded, and released for hidden leaves.
+Terax WebGL is the compatibility fallback. Each leaf owns one persistent model
+in its own WebAssembly instance (the module is compiled once and shared), so
+closing a leaf drops its linear memory and scrollback instead of leaving a
+high-water mark; nothing may retain a view into a disposed model's memory.
+Scrollback summed over all leaves is capped by a budget (192 MiB, scaled fairly
+between leaves, never pruning history already held). Presentation resources are
+shared, bounded, and released for hidden leaves.
 WebGPU canvases are leased from a shared pool rather than owned by persistent
 models. Up to eight unused targets share a 32 MiB color-storage budget and
 individual two-second deadlines; driver/compositor costs are separate. Reused
