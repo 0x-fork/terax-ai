@@ -1,15 +1,18 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type {
-  WebGpuRuntimeSurface,
-  WebGpuSharedResources,
-} from "./WebGpuTerminalRuntime";
-import {
-  canvasParkDelayMs,
-  WebGpuTerminalRuntime,
-} from "./WebGpuTerminalRuntime";
+import type { WebGpuRuntimeSurface } from "./WebGpuTerminalRuntime";
+import { WebGpuTerminalRuntime } from "./WebGpuTerminalRuntime";
+import type { CssRect } from "./PaneRects";
 
+import {
+  beginTerminalResizeInteraction,
+  endTerminalResizeInteraction,
+} from "@/modules/terminal/lib/terminalResizeInteraction";
+import { resetTerminalResizeGestureForTest } from "@/modules/terminal/lib/terminalResizeGesture";
+
+const GESTURE = {};
 const runtimes: WebGpuTerminalRuntime[] = [];
 async function createRuntime() {
+  sharedArea = null;
   const runtime = await WebGpuTerminalRuntime.create();
   runtimes.push(runtime);
   return runtime;
@@ -17,21 +20,34 @@ async function createRuntime() {
 
 describe("WebGpuTerminalRuntime", () => {
   afterEach(() => {
+    endTerminalResizeInteraction(GESTURE);
+    resetTerminalResizeGestureForTest();
     for (const runtime of runtimes.splice(0)) runtime.dispose();
     vi.useRealTimers();
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   it("creates no encoder when dirty notifications resolve to unchanged pixels", async () => {
     const h = createHarness();
     const runtime = await createRuntime();
     const surface = createSurface();
-    surface.renderFrame.mockReturnValue(false);
-    runtime.register(surface);
+    join(runtime, surface);
+    // The first frame of a window always draws.
     runtime.schedule(surface);
     h.flushFrame();
+    expect(h.submit).toHaveBeenCalledOnce();
+    vi.mocked(h.device.createCommandEncoder).mockClear();
+    h.gpuContext.getCurrentTexture.mockClear();
+
+    surface.prepareFrame.mockReturnValue(false);
+    for (let notification = 0; notification < 20; notification++) {
+      runtime.schedule(surface);
+      h.flushFrame();
+    }
     expect(h.device.createCommandEncoder).not.toHaveBeenCalled();
-    expect(h.submit).not.toHaveBeenCalled();
+    expect(h.gpuContext.getCurrentTexture).not.toHaveBeenCalled();
+    expect(h.submit).toHaveBeenCalledOnce();
   });
 
   it("coalesces all dirty surfaces into one window submission", async () => {
@@ -39,8 +55,8 @@ describe("WebGpuTerminalRuntime", () => {
     const runtime = await createRuntime();
     const first = createSurface();
     const second = createSurface();
-    runtime.register(first);
-    runtime.register(second);
+    join(runtime, first);
+    join(runtime, second);
 
     runtime.schedule(first);
     runtime.schedule(first);
@@ -48,9 +64,14 @@ describe("WebGpuTerminalRuntime", () => {
 
     expect(harness.frames.size).toBe(1);
     harness.flushFrame();
-    expect(first.renderFrame).toHaveBeenCalledOnce();
-    expect(second.renderFrame).toHaveBeenCalledOnce();
+    expect(first.prepareFrame).toHaveBeenCalledOnce();
+    expect(second.prepareFrame).toHaveBeenCalledOnce();
     expect(harness.submit).toHaveBeenCalledOnce();
+    // One canvas texture and one pass drew both panes.
+    expect(harness.gpuContext.getCurrentTexture).toHaveBeenCalledOnce();
+    expect(harness.pass.end).toHaveBeenCalledOnce();
+    expect(first.encode).toHaveBeenCalledOnce();
+    expect(second.encode).toHaveBeenCalledOnce();
     // One frame, one wait; both surfaces rode the same submission.
     expect(harness.onSubmittedWorkDone).toHaveBeenCalledOnce();
     expect(runtime.diagnostics()).toMatchObject({
@@ -67,21 +88,21 @@ describe("WebGpuTerminalRuntime", () => {
     const h = createHarness();
     const runtime = await createRuntime();
     const surface = createSurface();
-    runtime.register(surface);
+    join(runtime, surface);
     for (let frame = 0; frame < 60; frame++) {
       runtime.schedule(surface);
       vi.advanceTimersByTime(frame % 2 ? 17 : 16);
       h.flushFrame((frame * 1_000) / 60);
       await Promise.resolve();
     }
-    expect(surface.renderFrame).toHaveBeenCalledTimes(60);
+    expect(surface.prepareFrame).toHaveBeenCalledTimes(60);
   });
 
   it("retains dirty work while hidden and resumes once visible", async () => {
     const harness = createHarness();
     const runtime = await createRuntime();
     const surface = createSurface();
-    runtime.register(surface);
+    join(runtime, surface);
 
     harness.setVisible(false);
     harness.notifyVisibility();
@@ -94,7 +115,7 @@ describe("WebGpuTerminalRuntime", () => {
     expect(surface.handleVisibilityChange).toHaveBeenCalledWith(true);
     expect(harness.frames.size).toBe(1);
     harness.flushFrame();
-    expect(surface.renderFrame).toHaveBeenCalledOnce();
+    expect(surface.prepareFrame).toHaveBeenCalledOnce();
     runtime.dispose();
   });
 
@@ -102,7 +123,7 @@ describe("WebGpuTerminalRuntime", () => {
     const harness = createHarness();
     const runtime = await createRuntime();
     const surface = createSurface();
-    runtime.register(surface);
+    join(runtime, surface);
     runtime.schedule(surface);
 
     harness.setVisible(false);
@@ -118,7 +139,7 @@ describe("WebGpuTerminalRuntime", () => {
     const harness = createHarness();
     const runtime = await createRuntime();
     const surface = createSurface();
-    runtime.register(surface);
+    join(runtime, surface);
     runtime.schedule(surface);
     runtime.unregister(surface);
 
@@ -140,7 +161,7 @@ describe("WebGpuTerminalRuntime", () => {
     );
     const runtime = await createRuntime();
     const surface = createSurface();
-    runtime.register(surface);
+    join(runtime, surface);
     for (let frame = 0; frame < 2; frame++) {
       runtime.schedule(surface);
       vi.advanceTimersByTime(17);
@@ -178,7 +199,7 @@ describe("WebGpuTerminalRuntime", () => {
     const harness = createHarness();
     const runtime = await createRuntime();
     const surface = createSurface();
-    runtime.register(surface);
+    join(runtime, surface);
     harness.setVisible(false);
     harness.notifyVisibility();
     harness.loseDevice();
@@ -281,7 +302,7 @@ describe("WebGpuTerminalRuntime", () => {
     expect(vi.getTimerCount()).toBe(0);
     retired.mockReturnValue(false);
     const surface = createSurface();
-    runtime.register(surface);
+    join(runtime, surface);
     runtime.schedule(surface);
     h.flushFrame();
     await vi.advanceTimersByTimeAsync(1);
@@ -293,14 +314,14 @@ describe("WebGpuTerminalRuntime", () => {
     const harness = createHarness();
     const runtime = await createRuntime();
     const surface = createSurface();
-    runtime.register(surface);
-    const canvas = runtime.acquireCanvas();
-    canvas.backingStore.stage(2000, 1300, 2);
-    canvas.backingStore.commit();
-    canvas.present();
+    join(runtime, surface);
+    runtime.schedule(surface);
+    harness.flushFrame();
     const atlas = runtime.acquireGlyphAtlas(METRICS, surface);
     const atlasBytes = runtime.diagnostics().atlasBytes;
     expect(atlasBytes).toBeGreaterThan(1_048_576);
+    const canvases = runtime.diagnostics().canvases;
+    expect(canvases).toMatchObject({ active: 1, colorBytes: 800 * 600 * 4 });
 
     harness.setVisible(false);
     harness.notifyVisibility();
@@ -312,35 +333,39 @@ describe("WebGpuTerminalRuntime", () => {
     expect(surface.handleDeviceLoss).not.toHaveBeenCalled();
     expect(harness.frames.size).toBe(0);
     expect(harness.destroyDevice).not.toHaveBeenCalled();
+    expect(harness.gpuContext.unconfigure).not.toHaveBeenCalled();
     expect(runtime.diagnostics()).toMatchObject({
       atlasCount: 1,
       atlasBytes,
-      canvases: { active: 1, idle: 0, destroyed: 0, colorBytes: 10_400_000 },
+      canvases: {
+        active: 1,
+        idle: 0,
+        destroyed: 0,
+        colorBytes: 800 * 600 * 4,
+        backingStoreResizes: 1,
+      },
     });
-    expect(canvas.canvas.width).toBe(2000);
 
     harness.setVisible(true);
     harness.notifyVisibility();
     expect(surface.handleVisibilityChange).toHaveBeenLastCalledWith(true);
-    expect(runtime.diagnostics().canvases).toMatchObject({ destroyed: 0 });
     expect(harness.frames.size).toBe(1);
+    // Resuming redraws the retained canvas without reallocating it.
+    harness.flushFrame();
+    expect(harness.submit).toHaveBeenCalledTimes(2);
+    expect(runtime.diagnostics().canvases.backingStoreResizes).toBe(1);
     atlas.release();
-    canvas.release();
     runtime.dispose();
   });
 
-  it("keeps canvases through device recovery and points them at the new device", async () => {
+  it("keeps the window canvas through device recovery and points it at the new device", async () => {
     const harness = createHarness();
     const runtime = await createRuntime();
     const surface = createSurface();
-    runtime.register(surface);
-    const leased = runtime.acquireCanvas();
-    leased.backingStore.stage(1600, 900, 2);
-    leased.backingStore.commit();
-    leased.present();
-    const parked = runtime.acquireCanvas();
-    parked.release();
-    expect(leased.generation).toBe(1);
+    join(runtime, surface);
+    runtime.schedule(surface);
+    harness.flushFrame();
+    expect(harness.gpuContext.configure).toHaveBeenCalledTimes(1);
 
     harness.loseDevice();
     await vi.waitFor(() =>
@@ -349,357 +374,332 @@ describe("WebGpuTerminalRuntime", () => {
     expect(surface.handleDeviceLoss).toHaveBeenCalledOnce();
     expect(runtime.diagnostics().canvases).toMatchObject({
       active: 1,
+      created: 1,
+      reconfigured: 1,
+      destroyed: 0,
+    });
+    // Same element configured again for the new device, never unconfigured.
+    expect(harness.gpuContext.configure).toHaveBeenCalledTimes(2);
+    expect(harness.gpuContext.unconfigure).not.toHaveBeenCalled();
+    expect(harness.canvasesCreated).toBe(1);
+    // It redraws on the replacement device without reallocating.
+    expect(harness.frames.size).toBe(1);
+    harness.flushFrame();
+    expect(runtime.diagnostics().canvases.backingStoreResizes).toBe(1);
+  });
+
+  it("tears its window canvases down only when the runtime is disposed", async () => {
+    const harness = createHarness();
+    const runtime = await createRuntime();
+    const surface = createSurface();
+    join(runtime, surface);
+    runtime.schedule(surface);
+    harness.flushFrame();
+    runtime.unregister(surface);
+    expect(harness.gpuContext.unconfigure).not.toHaveBeenCalled();
+    expect(runtime.diagnostics().canvases).toMatchObject({
       idle: 1,
       destroyed: 0,
     });
-    expect(harness.gpuContext.unconfigure).not.toHaveBeenCalled();
+    runtime.dispose();
+    expect(harness.gpuContext.unconfigure).toHaveBeenCalledTimes(1);
+  });
 
-    // The leased one is reconfigured in place; the parked one when it is next handed out.
-    leased.reconfigure(runtime.resources());
-    expect(leased.generation).toBe(runtime.resources().generation);
-    expect(leased.canvas.width).toBe(1600);
-    const next = runtime.acquireCanvas();
-    expect(next.canvas).toBe(parked.canvas);
-    expect(next.generation).toBe(runtime.resources().generation);
+  it("draws every visible pane into its device rectangle with a scissor, in one pass", async () => {
+    const h = createHarness();
+    const runtime = await createRuntime();
+    const area = createArea({ left: 10, top: 20, width: 800, height: 600 });
+    const left = createSurface();
+    const right = createSurface();
+    join(runtime, left, { left: 10, top: 20, width: 399, height: 600 }, area);
+    join(runtime, right, { left: 410, top: 20, width: 400, height: 600 }, area);
+    runtime.schedule(left);
+    runtime.schedule(right);
+    h.flushFrame();
+
+    expect(h.pass.setViewport.mock.calls).toEqual([
+      [0, 0, 399, 600, 0, 1],
+      [400, 0, 400, 600, 0, 1],
+    ]);
+    expect(h.pass.setScissorRect.mock.calls).toEqual([
+      [0, 0, 399, 600],
+      [400, 0, 400, 600],
+    ]);
+    // Viewport and scissor are set before each pane encodes.
+    expect(left.encode.mock.invocationCallOrder[0]).toBeGreaterThan(
+      h.pass.setViewport.mock.invocationCallOrder[0],
+    );
+    expect(right.encode.mock.invocationCallOrder[0]).toBeGreaterThan(
+      h.pass.setScissorRect.mock.invocationCallOrder[1],
+    );
+  });
+
+  it("redraws panes that did not change when a neighbour did, because canvas textures are not preserved", async () => {
+    vi.useFakeTimers();
+    const h = createHarness();
+    const runtime = await createRuntime();
+    const quiet = createSurface();
+    const busy = createSurface();
+    join(runtime, quiet, { ...FULL, width: 400 });
+    join(runtime, busy, { ...FULL, left: 400, width: 400 });
+    runtime.schedule(quiet);
+    runtime.schedule(busy);
+    h.flushFrame(performance.now());
+    await vi.advanceTimersByTimeAsync(40);
+    quiet.encode.mockClear();
+    busy.encode.mockClear();
+
+    quiet.prepareFrame.mockReturnValue(false);
+    runtime.schedule(busy);
+    runtime.schedule(quiet);
+    await vi.advanceTimersByTimeAsync(40);
+    h.flushFrame(performance.now());
+    expect(h.submit).toHaveBeenCalledTimes(2);
+    expect(quiet.encode).toHaveBeenCalledOnce();
+    expect(busy.encode).toHaveBeenCalledOnce();
+  });
+
+  it("never reallocates, reconfigures or recreates the canvas on tab switches between different pane geometries", async () => {
+    vi.useFakeTimers();
+    const h = createHarness();
+    const runtime = await createRuntime();
+    const single = createSurface();
+    const pair = [createSurface(), createSurface()];
+    const fullBinding = join(runtime, single).binding;
+    runtime.schedule(single);
+    h.flushFrame();
+    expect(runtime.diagnostics().canvases.backingStoreResizes).toBe(1);
+
+    // Tab B: two panes of different geometry replace the single pane.
+    const present = async () => {
+      await vi.advanceTimersByTimeAsync(40);
+      h.flushFrame();
+    };
+    for (let cycle = 0; cycle < 40; cycle++) {
+      runtime.unregister(single);
+      join(runtime, pair[0], { ...FULL, width: 399 });
+      join(runtime, pair[1], { ...FULL, left: 401, width: 399 });
+      runtime.schedule(pair[0]);
+      runtime.schedule(pair[1]);
+      await present();
+      runtime.unregister(pair[0]);
+      runtime.unregister(pair[1]);
+      join(runtime, single);
+      runtime.schedule(single);
+      await present();
+    }
+    void fullBinding;
+
+    expect(h.canvasesCreated).toBe(1);
     expect(runtime.diagnostics().canvases).toMatchObject({
-      created: 2,
-      reconfigured: 2,
+      created: 1,
+      destroyed: 0,
+      backingStoreResizes: 1,
+      reconfigured: 0,
+    });
+    expect(h.gpuContext.configure).toHaveBeenCalledTimes(1);
+    expect(h.gpuContext.unconfigure).not.toHaveBeenCalled();
+  });
+
+  it("follows a divider drag with viewports only, and prepares the panes that moved at once whatever their pace", async () => {
+    vi.useFakeTimers();
+    const h = createHarness();
+    const runtime = await createRuntime();
+    const focused = createSurface();
+    const background = createSurface();
+    background.isFocused.mockReturnValue(false);
+    const left = join(runtime, focused, { ...FULL, width: 400 });
+    const right = join(runtime, background, { ...FULL, left: 400, width: 400 });
+    runtime.schedule(focused);
+    runtime.schedule(background);
+    h.flushFrame(0);
+    await vi.advanceTimersByTimeAsync(1);
+    background.prepareFrame.mockClear();
+    beginTerminalResizeInteraction(GESTURE);
+
+    for (let step = 1; step <= 60; step++) {
+      const divider = 400 + step * 4;
+      left.binding?.setBounds({ ...FULL, width: divider });
+      right.binding?.setBounds({
+        ...FULL,
+        left: divider,
+        width: 800 - divider,
+      });
+      runtime.schedule(focused);
+      vi.advanceTimersByTime(17);
+      h.flushFrame(step * 17);
+      await Promise.resolve();
+    }
+    endTerminalResizeInteraction(GESTURE);
+
+    expect(runtime.diagnostics().canvases).toMatchObject({
+      backingStoreResizes: 1,
+      created: 1,
+    });
+    // The background pane would only present at its tick, but its rectangle moved every step.
+    expect(background.prepareFrame.mock.calls.length).toBeGreaterThanOrEqual(
+      60,
+    );
+    expect(h.pass.setViewport).toHaveBeenLastCalledWith(640, 0, 160, 600, 0, 1);
+  });
+
+  it("reallocates at most twice for a window drag, then compacts, and never destroys the canvas", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("screen", { availWidth: 1600, availHeight: 1000 });
+    const h = createHarness();
+    const runtime = await createRuntime();
+    const area = createArea({ left: 0, top: 0, width: 800, height: 600 });
+    const surface = createSurface();
+    const { binding } = join(runtime, surface, FULL, area);
+    runtime.schedule(surface);
+    h.flushFrame(0);
+    const resizes = () => runtime.diagnostics().canvases.backingStoreResizes;
+    expect(resizes()).toBe(1);
+    Object.assign(window, { innerWidth: 800, innerHeight: 600 });
+    beginTerminalResizeInteraction(GESTURE);
+
+    const step = async (width: number, height: number) => {
+      Object.assign(window, { innerWidth: width, innerHeight: height });
+      binding?.setBounds({ left: 0, top: 0, width, height });
+      h.resizeArea(area, width, height);
+      runtime.schedule(surface);
+      await vi.advanceTimersByTimeAsync(17);
+      h.flushFrame(performance.now());
+    };
+    // Shrink to a third, grow back: no reallocation at all.
+    for (let width = 800; width >= 270; width -= 10)
+      await step(width, Math.round(width * 0.75));
+    for (let width = 270; width <= 800; width += 10)
+      await step(width, Math.round(width * 0.75));
+    expect(resizes()).toBe(1);
+    // Past the original size: one allocation, to the room the screen leaves.
+    for (let width = 800; width <= 1200; width += 10)
+      await step(width, Math.round(width * 0.75));
+    expect(resizes()).toBe(2);
+    expect(h.canvasesCreated).toBe(1);
+    expect(runtime.diagnostics().canvases.windows[0]).toMatchObject({
+      width: 1600,
+      height: 1000,
+    });
+
+    // The gesture ends: the canvas compacts to the area once.
+    endTerminalResizeInteraction(GESTURE);
+    await vi.advanceTimersByTimeAsync(300);
+    h.flushFrame(performance.now());
+    expect(resizes()).toBe(3);
+    expect(runtime.diagnostics().canvases.windows[0].width).toBeLessThan(1400);
+    expect(h.gpuContext.unconfigure).not.toHaveBeenCalled();
+  });
+
+  it("hides the canvas, keeping its size, when the last pane leaves", async () => {
+    vi.useFakeTimers();
+    const h = createHarness();
+    const runtime = await createRuntime();
+    const surface = createSurface();
+    join(runtime, surface);
+    runtime.schedule(surface);
+    h.flushFrame();
+    const canvas = vi
+      .mocked(document.createElement)
+      .mock.results.find(
+        (r) => (r.value as { getContext?: unknown }).getContext,
+      )?.value as {
+      style: { visibility: string };
+      width: number;
+      height: number;
+    };
+    expect(canvas.style.visibility).toBe("visible");
+    runtime.unregister(surface);
+    await vi.advanceTimersByTimeAsync(300);
+    expect(canvas.style.visibility).toBe("hidden");
+    expect(canvas.width).toBe(800);
+    expect(canvas.height).toBe(600);
+    expect(runtime.diagnostics().canvases).toMatchObject({
+      idle: 1,
+      active: 0,
+    });
+    expect(h.frames.size).toBe(0);
+  });
+
+  it("gives a remounted terminal area the canvas the old one left, instead of a new one", async () => {
+    const h = createHarness();
+    const runtime = await createRuntime();
+    const first = createSurface();
+    const oldArea = createArea();
+    join(runtime, first, FULL, oldArea);
+    runtime.schedule(first);
+    h.flushFrame();
+    runtime.unregister(first);
+    oldArea.isConnected = false;
+
+    const newArea = createArea();
+    const second = createSurface();
+    join(runtime, second, FULL, newArea);
+    runtime.schedule(second);
+    h.flushFrame();
+    expect(h.canvasesCreated).toBe(1);
+    expect(runtime.diagnostics().canvases).toMatchObject({
+      created: 1,
+      reused: 1,
       destroyed: 0,
     });
-    expect(harness.gpuContext.unconfigure).not.toHaveBeenCalled();
-    leased.release();
-    next.release();
+    expect(newArea.insertBefore).toHaveBeenCalledOnce();
   });
 
-  it("tears its canvases down only when the runtime is disposed", async () => {
-    const harness = createHarness();
+  it("draws two terminal areas in one submission", async () => {
+    const h = createHarness();
     const runtime = await createRuntime();
-    const lease = runtime.acquireCanvas();
-    lease.present();
-    const parked = runtime.acquireCanvas();
-    parked.release();
-    expect(harness.gpuContext.unconfigure).not.toHaveBeenCalled();
-    runtime.dispose();
-    expect(harness.gpuContext.unconfigure).toHaveBeenCalledTimes(2);
+    const a = createSurface();
+    const b = createSurface();
+    join(runtime, a, FULL, createArea());
+    join(runtime, b, FULL, createArea());
+    runtime.schedule(a);
+    runtime.schedule(b);
+    h.flushFrame();
+    expect(h.canvasesCreated).toBe(2);
+    expect(h.gpuContext.getCurrentTexture).toHaveBeenCalledTimes(2);
+    expect(h.submit).toHaveBeenCalledOnce();
   });
 
-  it("releases replaced atlas resources after the frame's submission completes, or at once without one", async () => {
+  it("lets a pane lift its DOM background once the GPU finished its first frame", async () => {
     vi.useFakeTimers();
     const h = createHarness();
-    let complete = () => {};
-    h.onSubmittedWorkDone.mockImplementationOnce(
-      () =>
-        new Promise<undefined>((resolve) => {
-          complete = () => resolve(undefined);
-        }),
-    );
     const runtime = await createRuntime();
-    const lease = runtime.acquireGlyphAtlas(METRICS);
-    const release = vi.spyOn(lease.atlas, "releaseRetired");
-    const retired = vi
-      .spyOn(lease.atlas, "hasRetired", "get")
-      .mockReturnValue(true);
     const surface = createSurface();
-    runtime.register(surface);
+    join(runtime, surface);
     runtime.schedule(surface);
-    h.flushFrame();
-    expect(h.submit).toHaveBeenCalledOnce();
-    expect(release).toHaveBeenLastCalledWith(expect.any(Promise));
-    // The wait that frees the atlas resources is the same one that confirms the frame.
-    expect(h.onSubmittedWorkDone).toHaveBeenCalledOnce();
-    expect(runtime.diagnostics().inFlightFrames).toBe(1);
-    complete();
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(runtime.diagnostics().inFlightFrames).toBe(0);
-
-    surface.renderFrame.mockReturnValue(false);
+    h.flushFrame(performance.now());
+    expect(surface.handleCanvasRevealed).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(40);
+    expect(surface.handleCanvasRevealed).toHaveBeenCalledOnce();
+    // Later frames do not reveal again.
     runtime.schedule(surface);
-    vi.advanceTimersByTime(20);
-    h.flushFrame();
-    expect(release).toHaveBeenLastCalledWith(null);
-    retired.mockRestore();
-    lease.release();
-    runtime.dispose();
+    await vi.advanceTimersByTimeAsync(40);
+    h.flushFrame(performance.now());
+    await vi.advanceTimersByTimeAsync(40);
+    expect(h.submit).toHaveBeenCalledTimes(2);
+    expect(surface.handleCanvasRevealed).toHaveBeenCalledOnce();
   });
 
-  it("shares one atlas per font and ratio and keeps ratios apart", async () => {
-    createHarness();
-    const runtime = await createRuntime();
-    const first = runtime.acquireGlyphAtlas(METRICS);
-    const second = runtime.acquireGlyphAtlas(METRICS);
-    const other = runtime.acquireGlyphAtlas({
-      ...METRICS,
-      scale: 2,
-      deviceCellWidth: 16,
-      deviceCellHeight: 32,
-      deviceBaseline: 24,
-    });
-
-    expect(first.atlas).toBe(second.atlas);
-    expect(other.atlas).not.toBe(first.atlas);
-    expect(runtime.diagnostics()).toMatchObject({
-      atlasCount: 2,
-      atlasFlushes: 0,
-      atlasCapacityFailures: 0,
-    });
-
-    first.release();
-    second.release();
-    other.release();
-    runtime.dispose();
-  });
-
-  it("flushes a full atlas between frames, redraws its users and rate limits flushes", async () => {
+  it("mirrors the native cost of every submitted frame to the garbage collector", async () => {
     vi.useFakeTimers();
-    const harness = createHarness();
+    const h = createHarness();
     const runtime = await createRuntime();
-    const first = createSurface();
-    const second = createSurface();
-    runtime.register(first);
-    runtime.register(second);
-    const lease = runtime.acquireGlyphAtlas(METRICS, first);
-    const other = runtime.acquireGlyphAtlas(METRICS, second);
-    const epoch = lease.atlas.epoch;
-    const order: string[] = [];
-    first.renderFrame.mockImplementation((getEncoder) => {
-      order.push(`first epoch ${lease.atlas.epoch}`);
-      getEncoder();
-      return true;
-    });
-
-    lease.requestFlush();
-    expect(runtime.diagnostics().pendingSurfaces).toBe(2);
-    harness.flushFrame();
-    expect(lease.atlas.epoch).toBe(epoch + 1);
-    expect(order).toEqual([`first epoch ${epoch + 1}`]);
-    expect(runtime.diagnostics().atlasFlushes).toBe(1);
-
-    lease.requestFlush();
-    vi.advanceTimersByTime(17);
-    harness.flushFrame();
-    expect(lease.atlas.epoch).toBe(epoch + 1);
-    await vi.advanceTimersByTimeAsync(300);
-    expect(runtime.diagnostics().pendingSurfaces).toBeGreaterThan(0);
-    harness.flushFrame();
-    expect(lease.atlas.epoch).toBe(epoch + 2);
-
-    lease.release();
-    other.release();
-    runtime.dispose();
-  });
-
-  it("gives every surface in a frame one shared rasterization budget", async () => {
-    const harness = createHarness();
-    const runtime = await createRuntime();
-    const budgets = new Set<unknown>();
-    const first = createSurface();
-    const second = createSurface();
-    for (const surface of [first, second]) {
-      surface.renderFrame.mockImplementation(
-        (getEncoder, _resources, budget) => {
-          budgets.add(budget);
-          getEncoder();
-          return true;
-        },
-      );
-      runtime.register(surface);
+    const surface = createSurface();
+    join(runtime, surface);
+    for (let frame = 0; frame < 30; frame++) {
       runtime.schedule(surface);
+      await vi.advanceTimersByTimeAsync(40);
+      h.flushFrame(performance.now());
     }
-    harness.flushFrame();
-    expect(budgets.size).toBe(1);
-    const [budget] = [...budgets] as Array<{ exhausted(ms?: number): boolean }>;
-    expect(budget.exhausted(1_000_000)).toBe(false);
-    expect(budget.exhausted(0)).toBe(true);
-    runtime.dispose();
-  });
-
-  it("keeps one GPU wait outstanding and covers the frames submitted meanwhile with the next", async () => {
-    vi.useFakeTimers();
-    const h = createHarness();
-    const completions: Array<() => void> = [];
-    h.onSubmittedWorkDone.mockImplementation(
-      () =>
-        new Promise<undefined>((resolve) =>
-          completions.push(() => resolve(undefined)),
-        ),
+    const mirror = runtime.diagnostics().gcMirror;
+    expect(mirror.frames).toBe(runtime.diagnostics().submittedFrames);
+    expect(mirror.frames).toBe(30);
+    expect(mirror.allocations).toBeGreaterThan(0);
+    expect(mirror.allocatedBytes).toBeGreaterThan(0);
+    expect(mirror.allocatedBytes).toBeLessThanOrEqual(
+      30 * mirror.bytesPerFrame,
     );
-    const runtime = await createRuntime();
-    const surface = createSurface();
-    runtime.register(surface);
-    // Frames arrive faster than the GPU confirms them, but never two at a time unconfirmed.
-    runtime.schedule(surface);
-    vi.advanceTimersByTime(17);
-    h.flushFrame();
-    runtime.schedule(surface);
-    vi.advanceTimersByTime(17);
-    h.flushFrame();
-    expect(h.submit).toHaveBeenCalledTimes(2);
-    expect(completions).toHaveLength(1);
-    // Confirming frame one starts the wait for frame two at once.
-    completions[0]();
-    await Promise.resolve();
-    expect(completions).toHaveLength(2);
-    completions[1]();
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(runtime.diagnostics()).toMatchObject({
-      submittedFrames: 2,
-      workDoneWaits: 2,
-      peakInFlightFrames: 2,
-      inFlightFrames: 0,
-    });
-    expect(runtime.diagnostics().workDoneLatency.count).toBe(2);
-    // Quiet again: the next frame needs a wait of its own.
-    runtime.schedule(surface);
-    vi.advanceTimersByTime(17);
-    h.flushFrame();
-    expect(completions).toHaveLength(3);
-  });
-
-  it("does not hold the focused pane back while the page sleeps for a background tick", async () => {
-    vi.useFakeTimers();
-    const h = createHarness();
-    const runtime = await createRuntime();
-    const background = createSurface();
-    const focused = createSurface();
-    background.isFocused.mockReturnValue(false);
-    runtime.register(background);
-    runtime.register(focused);
-    runtime.schedule(background);
-    runtime.schedule(focused);
-    h.flushFrame(0);
-    await Promise.resolve();
-    await Promise.resolve();
-
-    vi.advanceTimersByTime(100);
-    runtime.schedule(background);
-    // Asleep until the tick ending at 133 ms.
-    expect(h.frames.size).toBe(0);
-    expect(vi.getTimerCount()).toBeGreaterThan(0);
-    vi.advanceTimersByTime(5);
-    runtime.schedule(focused);
-    // The focused pane is due now: its frame is requested at once, not after the sleep.
-    expect(h.frames.size).toBe(1);
-    h.flushFrame(108);
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(focused.renderFrame).toHaveBeenCalledTimes(2);
-    expect(background.renderFrame).toHaveBeenCalledTimes(1);
-    // The background pane still presents at its tick, in a frame of its own.
-    vi.advanceTimersByTime(30);
-    expect(h.frames.size).toBe(1);
-    h.flushFrame(134);
-    expect(background.renderFrame).toHaveBeenCalledTimes(2);
-  });
-
-  it("records how long panes wait for a frame, separately for the focused one", async () => {
-    vi.useFakeTimers();
-    const h = createHarness();
-    const runtime = await createRuntime();
-    const focused = createSurface();
-    const other = createSurface();
-    other.isFocused.mockReturnValue(false);
-    runtime.register(focused);
-    runtime.register(other);
-    runtime.schedule(focused);
-    runtime.schedule(other);
-    h.flushFrame();
-    await Promise.resolve();
-    vi.advanceTimersByTime(100);
-    runtime.schedule(focused);
-    runtime.schedule(other);
-    // The focused pane draws at the next vsync; the other waits for the end of its tick (133 ms).
-    h.flushFrame(103);
-    expect(focused.renderFrame).toHaveBeenCalledTimes(2);
-    expect(other.renderFrame).toHaveBeenCalledTimes(1);
-    vi.advanceTimersByTime(30);
-    expect(h.frames.size).toBe(1);
-    h.flushFrame(134);
-    expect(other.renderFrame).toHaveBeenCalledTimes(2);
-    const { frameLatency } = runtime.diagnostics();
-    expect(frameLatency.focused).toMatchObject({ count: 2, maxMs: 3 });
-    expect(frameLatency.background.count).toBe(2);
-    expect(frameLatency.background.maxMs).toBeCloseTo(34, 0);
-  });
-
-  it("presents background surfaces that turn dirty within one tick in a single frame", async () => {
-    vi.useFakeTimers();
-    const h = createHarness();
-    const runtime = await createRuntime();
-    const first = createSurface();
-    const second = createSurface();
-    first.isFocused.mockReturnValue(false);
-    second.isFocused.mockReturnValue(false);
-    runtime.register(first);
-    runtime.register(second);
-    runtime.schedule(first);
-    runtime.schedule(second);
-    h.flushFrame();
-    expect(h.submit).toHaveBeenCalledOnce();
-
-    // 100 ms later the first agent redraws; the second does 12 ms after it.
-    vi.advanceTimersByTime(100);
-    runtime.schedule(first);
-    vi.advanceTimersByTime(12);
-    runtime.schedule(second);
-    // Nothing asks for an animation frame until the vsync that can serve the tick ending at 133 ms.
-    expect(h.frames.size).toBe(0);
-    vi.advanceTimersByTime(14);
-    expect(h.frames.size).toBe(1);
-    h.flushFrame((1_000 / 30) * 4);
-    expect(first.renderFrame).toHaveBeenCalledTimes(2);
-    expect(second.renderFrame).toHaveBeenCalledTimes(2);
-    expect(h.submit).toHaveBeenCalledTimes(2);
-    expect(runtime.diagnostics()).toMatchObject({
-      animationFrames: 2,
-      idleAnimationFrames: 0,
-      timerWakeups: 1,
-    });
-  });
-
-  it("reads the canvas parking delay override from local storage and ignores bad values", () => {
-    const read = (value: string | null | Error) => {
-      vi.stubGlobal("window", {
-        localStorage: {
-          getItem: () => {
-            if (value instanceof Error) throw value;
-            return value;
-          },
-        },
-      });
-      return canvasParkDelayMs();
-    };
-    expect(read(null)).toBeUndefined();
-    expect(read("2500")).toBe(2500);
-    expect(read("0")).toBe(0);
-    expect(read("off")).toBe(Number.POSITIVE_INFINITY);
-    expect(read("-5")).toBeUndefined();
-    expect(read("soon")).toBeUndefined();
-    expect(read(new Error("storage blocked"))).toBeUndefined();
-  });
-
-  it("quarantines a device after an asynchronous validation error", async () => {
-    const harness = createHarness();
-    const runtime = await createRuntime();
-    const surface = createSurface();
-    runtime.register(surface);
-
-    harness.reportValidationError("invalid texture upload");
-
-    expect(surface.handleRuntimeError).toHaveBeenCalledOnce();
-    expect(runtime.diagnostics()).toMatchObject({
-      healthy: false,
-      lastError: "WebGPU validation error: invalid texture upload",
-      pendingSurfaces: 0,
-      atlasCount: 0,
-      atlasBytes: 0,
-    });
-    expect(harness.destroyDevice).toHaveBeenCalledOnce();
-    expect(() => runtime.register(createSurface())).toThrow(
-      "WebGPU terminal runtime is disabled",
-    );
-    runtime.dispose();
   });
 });
 
@@ -715,7 +715,17 @@ function createHarness() {
   const submit = vi.fn();
   const onSubmittedWorkDone = vi.fn(async () => undefined);
   const destroyDevice = vi.fn();
-  const gpuContext = { configure: vi.fn(), unconfigure: vi.fn() };
+  const texture = { createView: vi.fn(() => ({})) };
+  const gpuContext = {
+    configure: vi.fn(),
+    unconfigure: vi.fn(),
+    getCurrentTexture: vi.fn(() => texture),
+  };
+  const pass = {
+    setViewport: vi.fn(),
+    setScissorRect: vi.fn(),
+    end: vi.fn(),
+  };
   let loseDevice: (info: GPUDeviceLostInfo) => void = () => {};
   const device = {
     addEventListener: vi.fn(
@@ -747,6 +757,7 @@ function createHarness() {
     createBindGroup: vi.fn(() => ({})),
     createCommandEncoder: vi.fn(() => ({
       finish: vi.fn(() => ({})),
+      beginRenderPass: vi.fn(() => pass),
       copyTextureToTexture: vi.fn(),
     })),
     limits: { maxTextureDimension2D: 8_192 },
@@ -786,9 +797,9 @@ function createHarness() {
       if (name === "visibilitychange") visibilityListener = listener;
     }),
     removeEventListener: vi.fn(),
-    createElement: vi.fn(() => ({
-      width: 0,
-      height: 0,
+    createElement: vi.fn((tag: string) => ({
+      width: tag === "canvas" ? 300 : 0,
+      height: tag === "canvas" ? 150 : 0,
       style: {},
       setAttribute: vi.fn(),
       remove: vi.fn(),
@@ -811,6 +822,32 @@ function createHarness() {
       ),
     })),
   });
+  const windowListeners: Array<[string, () => void]> = [];
+  vi.stubGlobal("window", {
+    devicePixelRatio: 1,
+    innerWidth: 1280,
+    innerHeight: 800,
+    addEventListener: vi.fn((name: string, listener: () => void) =>
+      windowListeners.push([name, listener]),
+    ),
+    removeEventListener: vi.fn(),
+  });
+  const observers: FakeResizeObserver[] = [];
+  vi.stubGlobal(
+    "ResizeObserver",
+    class implements FakeResizeObserver {
+      readonly targets: unknown[] = [];
+      constructor(readonly callback: (entries: unknown[]) => void) {
+        observers.push(this);
+      }
+      observe(target: unknown) {
+        this.targets.push(target);
+      }
+      disconnect() {
+        this.targets.length = 0;
+      }
+    },
+  );
   vi.stubGlobal(
     "requestAnimationFrame",
     (callback: (frameAt?: number) => void) => {
@@ -824,9 +861,12 @@ function createHarness() {
     frames.delete(handle);
   });
 
-  return {
+  const harness = {
     frames,
     cancelledFrames,
+    pass,
+    observers,
+    windowListeners,
     submit,
     onSubmittedWorkDone,
     destroyDevice,
@@ -861,7 +901,91 @@ function createHarness() {
     reportValidationError(message: string): void {
       uncapturedErrorListener?.({ error: { message } });
     },
+    /** The observer of an area reports a new size, as the engine does after layout. */
+    resizeArea(area: FakeElement, width: number, height: number) {
+      area.rect = { left: area.rect.left, top: area.rect.top, width, height };
+      for (const observer of observers) {
+        if (observer.targets.includes(area))
+          observer.callback([
+            {
+              contentRect: { width, height },
+              devicePixelContentBoxSize: [
+                { inlineSize: width, blockSize: height },
+              ],
+            },
+          ]);
+      }
+    },
+    get canvasesCreated() {
+      return vi
+        .mocked(document.createElement)
+        .mock.calls.filter(([tag]) => tag === "canvas").length;
+    },
   };
+  return harness;
+}
+
+type FakeResizeObserver = {
+  readonly targets: unknown[];
+  readonly callback: (entries: unknown[]) => void;
+};
+
+type FakeElement = {
+  rect: CssRect;
+  isConnected: boolean;
+  insertBefore: ReturnType<typeof vi.fn>;
+  getBoundingClientRect(): CssRect;
+  closest(selector: string): FakeElement | null;
+  parentElement: FakeElement | null;
+};
+
+/** A terminal area (what holds the window canvas) as the DOM would give it. */
+function createArea(
+  rect: CssRect = { left: 0, top: 0, width: 800, height: 600 },
+): FakeElement {
+  const area: FakeElement = {
+    rect,
+    isConnected: true,
+    insertBefore: vi.fn(),
+    getBoundingClientRect: () => area.rect,
+    closest: () => area,
+    parentElement: null,
+  };
+  return area;
+}
+
+/** A pane host inside an area. */
+function createHost(area: FakeElement, rect: CssRect): FakeElement {
+  const host: FakeElement = {
+    rect,
+    isConnected: true,
+    insertBefore: vi.fn(),
+    getBoundingClientRect: () => host.rect,
+    closest: (selector) => (selector === "[data-terminal-area]" ? area : null),
+    parentElement: area,
+  };
+  return host;
+}
+
+let sharedArea: FakeElement | null = null;
+const FULL: CssRect = { left: 0, top: 0, width: 800, height: 600 };
+
+/**
+ * Registers a pane the way a surface does (with its host) and reports its layout, which the
+ * real surface does from its resize observer.
+ */
+function join(
+  runtime: WebGpuTerminalRuntime,
+  surface: ReturnType<typeof createSurface>,
+  rect: CssRect = FULL,
+  area: FakeElement | null = null,
+) {
+  sharedArea ??= createArea();
+  const target = area ?? sharedArea;
+  const host = createHost(target, rect);
+  const binding = runtime.register(surface, host as unknown as HTMLElement);
+  binding?.setBounds(rect);
+  return { binding, host, area: target };
 }
 
 const METRICS = {
@@ -883,16 +1007,11 @@ const METRICS = {
 
 function createSurface() {
   return {
-    renderFrame: vi.fn(
-      (
-        getEncoder: () => GPUCommandEncoder,
-        _resources: WebGpuSharedResources,
-        _budget?: unknown,
-      ) => {
-        getEncoder();
-        return true;
-      },
-    ),
+    prepareFrame: vi.fn((_resources?: unknown, _budget?: unknown) => true),
+    drawable: vi.fn(() => true),
+    background: vi.fn(() => [10, 20, 30] as const),
+    encode: vi.fn(),
+    handleCanvasRevealed: vi.fn(),
     handleRuntimeReset: vi.fn(),
     handleRuntimeError: vi.fn(),
     handleVisibilityChange: vi.fn<(visible: boolean) => void>(),

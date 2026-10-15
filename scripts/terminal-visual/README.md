@@ -43,7 +43,7 @@ long runs are slow there. `window.harness` exposes the surface, model,
 `runtime()` (runtime diagnostics) and `window.__setDpr(ratio)` (change the ratio
 live).
 
-`bench` drives `renderFrame` directly, without the scheduler, after a warm-up,
+`bench` drives `prepareFrame` and `encode` (into an offscreen target) directly, without the scheduler, after a warm-up,
 and reports milliseconds per tick (model write, frame and submit) in batches
 because `performance.now()` is coarse. Both revisions must share one cell
 geometry (for example `fs=15` at ratio 2) for the comparison to be fair.
@@ -72,3 +72,31 @@ open "http://localhost:5199/?pattern=sprites&w=1000&h=780&fs=15&dpr=1.25&capture
 Use `h=780` or more so the pattern is not scrolled. Compare against a revision
 that draws these characters from the font by serving it with
 `TERAX_VISUAL_SOURCE_ROOT` as described above.
+
+## Window canvas and split panes
+
+Every WebGPU pane draws into the one canvas of the window's terminal area, so the harness
+page marks `#stage` as `[data-terminal-area]` (`aw`, `ah` set its size in CSS pixels, default
+1600x1000, so a hidden browser pane still lays out) and a capture reads the whole canvas
+texture, then keeps the pane's grid area, which is what its own canvas held before: captures
+of the single-pane page are byte-identical to the per-pane canvas revision (`fresh1000` at
+ratios 2 and 1.25, 0 pixels different).
+
+`grid.html` runs R x C real surfaces in one window with DOM dividers between them, every
+pane showing the same pattern (coloured edge cells with overhanging italic glyphs, text
+inside), and `compare.mjs grid` checks a split capture against a single-pane capture of the
+same pane size:
+
+```sh
+# exact=1 sizes each pane to a whole number of cells (cols x rows), so glyph overhang
+# reaches the scissor edge; without it panes are equal shares of w x h and carry slack
+open "http://localhost:5199/grid.html?grid=1x1&exact=1&cols=40&rows=12&dpr=2&capture=single-d2"
+open "http://localhost:5199/grid.html?grid=2x2&exact=1&cols=40&rows=12&dpr=2&gap=1&capture=split-d2"
+node scripts/terminal-visual/compare.mjs grid /tmp/visual split-d2 single-d2
+```
+
+It requires every pane's grid area to equal the single pane byte for byte (no bleed across
+the scissor edges), every pixel outside the grid areas to be the clear colour, the
+canvas rectangle of each pane to equal its DOM box snapped to device pixels, and the
+dividers to abut the panes on both sides. `left` and `top` shift the grid by fractions of a
+pixel to exercise the origin snapping.

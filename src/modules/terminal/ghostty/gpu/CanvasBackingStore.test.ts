@@ -6,24 +6,6 @@ function fakeCanvas(width: number, height: number) {
 }
 
 describe("CanvasBackingStore", () => {
-  it("releases hidden canvas storage while retaining the exact next presentation size", () => {
-    const canvas = fakeCanvas(300, 150);
-    const backing = new CanvasBackingStore(canvas);
-    backing.stage(3840, 2160, 2);
-    backing.commit();
-    backing.release();
-    expect(canvas).toMatchObject({
-      width: 1,
-      height: 1,
-      style: { width: "1920px", height: "1080px" },
-    });
-    expect(backing.pending).toBe(true);
-    backing.stage(2560, 1440, 2);
-    backing.commit();
-    expect(canvas).toMatchObject({ width: 2560, height: 1440 });
-    expect(backing.pending).toBe(false);
-  });
-
   it("keeps presented pixels intact until the render transaction commits", () => {
     const canvas = fakeCanvas(300, 150);
     const backing = new CanvasBackingStore(canvas);
@@ -130,25 +112,6 @@ describe("CanvasBackingStore", () => {
     }
     const steps = Math.floor(400 / 3) + 1;
     expect(allocations).toBeLessThan(steps / 10);
-  });
-
-  it("reports which sizes it serves without reallocating, and how much it wastes", () => {
-    const canvas = fakeCanvas(300, 150);
-    const backing = new CanvasBackingStore(canvas);
-    // A store that never presented has nothing worth reusing.
-    expect(backing.surplusFor(1000, 600)).toBeNull();
-    backing.stage(1000, 600, 2);
-    backing.commit();
-    expect(backing.surplusFor(1000, 600)).toBe(0);
-    // Slightly smaller sizes reuse the backing; the surplus is the unused pixels.
-    expect(backing.surplusFor(900, 560)).toBe(1000 * 600 - 900 * 560);
-    // Larger or much smaller sizes need a new swapchain.
-    expect(backing.surplusFor(1001, 600)).toBeNull();
-    expect(backing.surplusFor(600, 600)).toBeNull();
-    // Asking changes nothing.
-    expect(backing.pending).toBe(false);
-    expect(backing.size).toEqual({ width: 1000, height: 600 });
-    expect(backing.stage(900, 560, 2)).toBe(false);
   });
 
   describe("during a resize gesture", () => {

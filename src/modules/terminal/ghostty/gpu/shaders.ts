@@ -11,7 +11,8 @@ export const SCREEN_UNIFORM_BYTES = 176;
 
 /** Byte offsets of `Screen` fields; the TypeScript packer mirrors this layout. */
 export const SCREEN_OFFSET = {
-  gridSize: 0,
+  /** Device-pixel size of the pane's viewport in the shared window canvas. */
+  viewportSize: 0,
   cellSize: 8,
   dims: 16,
   flags: 24,
@@ -22,6 +23,8 @@ export const SCREEN_OFFSET = {
   selectionColor: 80,
   selectionLines: 96,
   selectionColumns: 112,
+  /** Device-pixel origin of the pane's viewport; fragment coordinates are window-relative. */
+  origin: 120,
   decoration: 128,
   contrast: 144,
   gamma: 160,
@@ -34,7 +37,7 @@ export const SCREEN_FLAG_SELECTION_RECTANGULAR = 8;
 
 const COMMON = /* wgsl */ `
 struct Screen {
-  grid_size: vec2f,
+  viewport_size: vec2f,
   cell_size: vec2u,
   dims: vec2u,
   flags: u32,
@@ -46,7 +49,7 @@ struct Screen {
   selection_color: vec4f,
   selection_lines: vec4i,
   selection_columns: vec2i,
-  _padding2: vec2u,
+  origin: vec2u,
   decoration: vec4u,
   contrast: vec4f,
   gamma: vec4f,
@@ -180,7 +183,9 @@ fn decoration_color(
 
 @fragment
 fn fragment_main(@builtin(position) position: vec4f) -> @location(0) vec4f {
-  let pixel = vec2u(position.xy);
+  // Fragment coordinates are relative to the window canvas, not to the pane's viewport.
+  let local_position = position.xy - vec2f(screen.origin);
+  let pixel = vec2u(local_position);
   let cell = pixel / screen.cell_size;
   if (cell.x >= screen.dims.x || cell.y >= screen.dims.y) {
     return vec4f(screen.theme_background.rgb, 1.0);
@@ -190,8 +195,8 @@ fn fragment_main(@builtin(position) position: vec4f) -> @location(0) vec4f {
   let background = cell_background(index, cell.y, cell.x);
 
   let cursor_end = screen.cursor_origin + screen.cursor_size;
-  if (position.x >= screen.cursor_origin.x && position.y >= screen.cursor_origin.y &&
-      position.x < cursor_end.x && position.y < cursor_end.y) {
+  if (local_position.x >= screen.cursor_origin.x && local_position.y >= screen.cursor_origin.y &&
+      local_position.x < cursor_end.x && local_position.y < cursor_end.y) {
     return vec4f(screen.cursor_color.rgb, 1.0);
   }
 
@@ -286,8 +291,8 @@ fn vertex_main(
   let pixel = vec2f(origin) + corner * vec2f(drawn);
   var output: VertexOutput;
   output.position = vec4f(
-    pixel.x / screen.grid_size.x * 2.0 - 1.0,
-    1.0 - pixel.y / screen.grid_size.y * 2.0,
+    pixel.x / screen.viewport_size.x * 2.0 - 1.0,
+    1.0 - pixel.y / screen.viewport_size.y * 2.0,
     0.0,
     1.0,
   );
@@ -320,7 +325,7 @@ fn fragment_main(
   @interpolate(flat) @location(2) color: vec4f,
   @interpolate(flat) @location(3) glyph_flags: u32,
 ) -> @location(0) vec4f {
-  let texel = texel_origin + vec2i(floor(position.xy)) - quad_origin;
+  let texel = texel_origin + vec2i(floor(position.xy)) - vec2i(screen.origin) - quad_origin;
   if ((glyph_flags & 1u) != 0u) {
     let sample = textureLoad(color_texture, texel, 0);
     return vec4f(sample.rgb, sample.a * color.a);

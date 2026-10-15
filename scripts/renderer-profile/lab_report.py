@@ -73,12 +73,18 @@ def _pool_metrics(metrics: dict, event: dict) -> None:
         if key in pool:
             metrics[f"pool.{key}"] = pool[key]
     surfaces = event.get("surfaces") or []
-    if surfaces and "backingStoreResizes" in surfaces[0]:
+    if "backingStoreResizes" in pool:
+        # One shared window canvas: the runtime counts the swapchain allocations.
+        metrics["renderer.backing_store_resizes"] = pool["backingStoreResizes"]
+    elif surfaces and "backingStoreResizes" in surfaces[0]:
         metrics["renderer.backing_store_resizes"] = sum(s.get("backingStoreResizes", 0) for s in surfaces)
 
 
 def _surface_total(sample: dict | None, key: str) -> int | None:
-    surfaces = ((sample or {}).get("event") or {}).get("surfaces") or []
+    event = (sample or {}).get("event") or {}
+    if key == "backingStoreResizes" and "backingStoreResizes" in pool_of(event):
+        return pool_of(event)["backingStoreResizes"]
+    surfaces = event.get("surfaces") or []
     if not surfaces or key not in surfaces[0]:
         return None
     return sum(s.get(key, 0) for s in surfaces)

@@ -18,6 +18,7 @@ const STATE: ScreenUniformState = {
   rows: 40,
   cellWidth: 11,
   cellHeight: 21,
+  viewport: { x: 0, y: 0, width: 120 * 11, height: 40 * 21 },
   textBlinkVisible: true,
   searchActive: false,
   cursor: { x: 22, y: 42, width: 11, height: 21 },
@@ -45,6 +46,7 @@ describe("ScreenUniform", () => {
     const uniform = new ScreenUniform();
     uniform.pack({
       ...STATE,
+      viewport: { x: 1005, y: 33, width: 1400, height: 900 },
       searchActive: true,
       selection: {
         active: true,
@@ -59,10 +61,16 @@ describe("ScreenUniform", () => {
     });
     const { f, u, i } = view(uniform);
     const at = (offset: number, word = 0) => offset / 4 + word;
+    // The pane's rectangle in the shared window canvas: the viewport size maps the grid onto
+    // it and the origin turns window-relative fragment coordinates into pane-relative ones.
     expect([
-      f[at(SCREEN_OFFSET.gridSize)],
-      f[at(SCREEN_OFFSET.gridSize, 1)],
-    ]).toEqual([120 * 11, 40 * 21]);
+      f[at(SCREEN_OFFSET.viewportSize)],
+      f[at(SCREEN_OFFSET.viewportSize, 1)],
+    ]).toEqual([1400, 900]);
+    expect([
+      u[at(SCREEN_OFFSET.origin)],
+      u[at(SCREEN_OFFSET.origin, 1)],
+    ]).toEqual([1005, 33]);
     expect([
       u[at(SCREEN_OFFSET.cellSize)],
       u[at(SCREEN_OFFSET.cellSize, 1)],
@@ -108,6 +116,23 @@ describe("ScreenUniform", () => {
       ...f.slice(at(SCREEN_OFFSET.gamma), at(SCREEN_OFFSET.gamma) + 4),
     ]).toEqual(DWRITE_GAMMA_RATIOS.map(Math.fround));
     expect(uniform.data.byteLength).toBe(SCREEN_UNIFORM_BYTES);
+  });
+
+  it("reports a change when only the pane's rectangle in the window canvas moves or resizes", () => {
+    const uniform = new ScreenUniform();
+    uniform.pack(STATE);
+    uniform.markUploaded();
+    for (const viewport of [
+      { ...STATE.viewport, x: 1 },
+      { ...STATE.viewport, y: 1 },
+      { ...STATE.viewport, width: STATE.viewport.width + 1 },
+      { ...STATE.viewport, height: STATE.viewport.height + 1 },
+    ]) {
+      uniform.pack({ ...STATE, viewport });
+      expect(uniform.changed()).toBe(true);
+      uniform.pack(STATE);
+      expect(uniform.changed()).toBe(false);
+    }
   });
 
   it("hides the cursor by zeroing its rectangle", () => {
@@ -183,7 +208,8 @@ describe("shader uniform layout", () => {
       const { offsets, size } = layout(shader);
       expect(size).toBe(SCREEN_UNIFORM_BYTES);
       expect(offsets).toMatchObject({
-        grid_size: SCREEN_OFFSET.gridSize,
+        viewport_size: SCREEN_OFFSET.viewportSize,
+        origin: SCREEN_OFFSET.origin,
         cell_size: SCREEN_OFFSET.cellSize,
         dims: SCREEN_OFFSET.dims,
         flags: SCREEN_OFFSET.flags,
@@ -200,6 +226,16 @@ describe("shader uniform layout", () => {
       });
     },
   );
+
+  it("subtracts the viewport origin from window-relative fragment coordinates in both passes", () => {
+    // Fragment positions are relative to the whole canvas, but a pane's cells, cursor and
+    // glyph quads are relative to its viewport.
+    expect(BACKGROUND_SHADER).toMatch(
+      /let local_position = position\.xy - vec2f\(screen\.origin\);/,
+    );
+    expect(BACKGROUND_SHADER).not.toMatch(/vec2u\(position\.xy\)/);
+    expect(GLYPH_SHADER).toMatch(/vec2i\(screen\.origin\)/);
+  });
 
   it("binds the storage and texture slots the surface fills", () => {
     for (const shader of [BACKGROUND_SHADER, GLYPH_SHADER]) {

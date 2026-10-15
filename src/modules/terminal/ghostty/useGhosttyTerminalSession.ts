@@ -29,6 +29,7 @@ import {
   type TerminalFontSpec,
 } from "./gpu/terminalVisuals";
 import { getWebGpuTerminalRuntime } from "./gpu/WebGpuTerminalRuntime";
+import { webGpuTerminalRuntimeDiagnostics } from "./gpu/WebGpuTerminalRuntime";
 import { WebGpuTerminalSurface } from "./gpu/WebGpuTerminalSurface";
 import { GhosttyInputController } from "./input/GhosttyInputController";
 import { encodeTerminalSubmission } from "./input/terminalInputEncoding";
@@ -491,6 +492,12 @@ export function ghosttySessionResourceTotals() {
     surfaceGpuBufferBytes += renderer.gpuBufferBytes;
     canvasColorBytes += renderer.canvasColorBytes;
   }
+
+  // The WebGPU swapchain belongs to the window canvases, not to the panes drawing into them.
+  const windowCanvasBytes =
+    webGpuTerminalRuntimeDiagnostics()?.canvases.colorBytes ?? 0;
+  canvasColorBytes += windowCanvasBytes;
+  estimatedSwapchainBytes += windowCanvasBytes * 3;
 
   return {
     modelCellCapacity,

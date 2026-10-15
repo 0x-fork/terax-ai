@@ -368,11 +368,12 @@ async function createPane(
     onError: fail,
   });
   const timing = { calls: 0, milliseconds: 0 };
-  const render = surface.renderFrame.bind(surface);
-  surface.renderFrame = (...args) => {
+  // Time the per-pane work of a frame: what the surface uploads (the window canvas draws all panes).
+  const prepare = surface.prepareFrame.bind(surface);
+  surface.prepareFrame = (...args) => {
     const start = performance.now();
     try {
-      return render(...args);
+      return prepare(...args);
     } finally {
       timing.calls++;
       timing.milliseconds += performance.now() - start;

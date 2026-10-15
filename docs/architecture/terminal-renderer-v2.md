@@ -92,10 +92,12 @@ attrs: underline style (3 bits) | strikethrough | overline | blink | wide-lead |
 - The CSS cell size is the device size divided by `dpr` (fractional is fine).
   Hit testing, fit, selection and IME positioning use the CSS cell size;
   rendering uses device pixels only.
-- The backing store is exactly `cols * cellW` by `rows * cellH` device pixels,
-  and the CSS size is backing divided by `dpr`.
+- A pane draws into a rectangle of the shared window canvas whose size is whole
+  device pixels (at least `cols * cellW` by `rows * cellH`; the rest is background);
+  the canvas CSS size is its backing divided by `dpr`.
 - The canvas origin is snapped to the device pixel grid by translating by the
-  negative fractional device offset of the host origin. The offset is
+  negative fractional device offset of the terminal area's origin, and every pane
+  rectangle is rounded edge by edge relative to that origin. The offset is
   recomputed on resize, DPR change and layout moves.
 - `devicePixelContentBoxSize` is used where available; otherwise the size is
   derived from rounding.
@@ -234,12 +236,13 @@ never touch the records.
 
 ### Data path
 
-`WebGpuTerminalSurface.renderFrame` calls `deferPresentation()` and
+`WebGpuTerminalSurface.prepareFrame` calls `deferPresentation()` and
 `consumeGpuFrame({ resync })`, uploads `dirtyRanges` with
 `queue.writeBuffer(cells, offset, frame.cells, offset, length)` and scans the same
 view for evicted glyphs before any other model call, then updates `glyph_map`,
-the search mask and the uniform. It redraws when `frame.damage` is not none or
-any uniform, mask, map or binding changed, and otherwise acquires no texture.
+the search mask and the uniform. It reports a change when `frame.damage` is not none or
+any uniform, mask, map or binding changed; the window canvas then draws every visible
+pane (`encode`), and when no pane and nothing else changed it acquires no texture.
 `resync` is sent for a new or re-leased surface, a replaced cell buffer, and
 after an atlas flush. The surface never calls `renderCells`, `consumeDamage` or
 `viewport`, so the model stays in the GPU format; failover to WebGL flips it to
@@ -277,13 +280,45 @@ window resize, never per frame. Layout moves that neither resize the container
 nor fire a window resize keep the previous offset until the next of those events.
 `devicePixelContentBoxSize` supplies the exact fit when the engine reports it.
 
-`CanvasBackingStore` keeps its nearby-size reuse, now defined so it cannot scale
-text: the CSS size is always `backing / ratio`, drawing uses a viewport of exactly
-`cols * cellW` by `rows * cellH`, and the surplus (up to 255 device pixels per
-axis after a shrink, aligned to 128) is cleared to the background and clipped by the container.
-A test drags a pane across 400 device pixels in 3 pixel steps and requires fewer
-than a tenth as many swapchain reallocations as steps. During a resize gesture the
-store is stricter still; see "Resizing".
+`CanvasBackingStore` (now owned by the window canvas) keeps its nearby-size reuse,
+defined so it cannot scale text: the CSS size is always `backing / ratio`, panes draw
+through exact viewports, and the surplus (up to 255 device pixels per axis after a
+shrink, aligned to 128) is clipped by the area. A test drags an area across 400
+device pixels in 3 pixel steps and requires fewer than a tenth as many swapchain
+reallocations as steps. During a resize gesture the store is stricter still; see
+"Resizing".
+
+### Window canvas
+
+One canvas per terminal area (`WebGpuWindowCanvas`, for the `[data-terminal-area]` layer
+`TerminalStack` renders behind its tab layers, zoom-exempt like the panes) replaces the canvas
+each pane owned. The only other window (settings) has no terminal, and a window is one JS
+context, so multiple windows need nothing.
+
+- **Frame.** `flushFrame` applies each window's layout (commit the backing store, recompute
+  pane rectangles from what the observers measured; no DOM read), lets every due pane (and any
+  pane that moved) `prepareFrame` (uploads, uniform; returns whether its pixels changed), then
+  draws each window for which `windowFrameNeeded` holds (a pane changed, the canvas was
+  reallocated, a pane moved or the window was marked dirty, and something is drawable): one
+  pass clears the canvas (textures are not preserved) and each pane sets `setViewport` and
+  `setScissorRect` to its rectangle and encodes its two draws. An unchanged window acquires no
+  texture and creates no encoder.
+- **Shader.** NDC comes from the uniform's `viewport_size` (the pane rectangle) and the
+  fragment stage subtracts `origin` from window-relative coordinates; the background pass paints
+  the theme background over the whole rectangle, so slack needs no DOM background.
+- **Rectangles** (`PaneRects.ts`): `round(left * ratio) - round(area.left * ratio)` per edge, so
+  neighbours never overlap and the gap is the divider's; clamped to the canvas (WebGPU rejects
+  viewports outside the target) and the canvas to `maxTextureDimension2D`. Surfaces report their
+  host from their resize observer and explicit measurements, the canvas observes the area;
+  nothing is read per frame. A moved pane that fires no observer would misalign the canvas, so
+  while frames are produced the layout is re-read at most once a second.
+- **Pane DOM** is transparent once the canvas showed the pane's first frame (lifted after the
+  GPU finished it); before that, and after a tab switch back, it paints the theme background.
+- **Held presentation** (DEC 2026, prompt redraw): the pane keeps drawing its previous cells;
+  only its uniform follows a moved rectangle.
+- **Failover** stays per pane (WebGL canvases are per pane): an error against one pane falls
+  that pane back; a device error or failed recovery disables the runtime, which falls every pane
+  back and destroys the window canvas.
 
 ### Canvas lifecycle
 
@@ -308,34 +343,54 @@ occlude, tear down, restore):
 | raw WebGL2 canvas: lose context, 1x1, remove, drop (`webgl-destroy`) | +1.0, sawtooth: garbage collection returns it, settles below baseline |
 | raw WebGL2 canvas: hide only (`webgl-keep`) | +0.2 |
 
-So a presented WebGPU canvas is never destroyed (`WebGpuCanvasPool`):
+So a presented WebGPU canvas is never destroyed (`WebGpuWindowCanvas`):
 
-- Occlusion, sleep and a hidden window only pause. Nothing is released: canvases
-  keep their configuration and size, and cell buffers, glyph maps and atlas
-  textures stay resident (together a few MiB; WASM linear memory never shrinks,
-  so returning the native presentation buffers on occlusion gained nothing).
-- A hidden pane returns its canvas to the pool configured and sized. The pool
-  creates a canvas only when none is idle, so it never holds more than the peak
-  number of simultaneously leased canvases. A returning pane passes the backing
-  size it last fitted (`lastBackingSize`) and gets the idle canvas whose backing
-  store already serves it (`CanvasBackingStore.surplusFor`, smallest surplus
-  first), else a parked canvas, else the closest area. A tab switch reallocates
-  nothing.
-- An idle canvas keeps its size for ten seconds (`terax:terminal-canvas-park-ms`,
-  `off` to disable) and is then parked at 1x1, still configured; canvases under
-  2 MiB of color are never parked. The rule exists because tab switches are not
-  ordered: React runs effects in tree order, so switching to a tab earlier in the
-  tree shows its panes before the outgoing tab releases its own, and the pool
-  holds one more canvas than the visible set until they are parked.
-- A lost or replaced GPU device keeps every element: `lease.reconfigure` (leased)
-  or reconfiguration on `acquire` (idle) calls `configure()` on the same canvas
-  with the new device. Surfaces drop their buffers and atlas lease on
-  `handleDeviceLoss`, nothing else.
-- Only `WebGpuTerminalRuntime.dispose()` (HMR, or a fatal error that switches the
-  session to WebGL) destroys canvases; the WebGPU runtime never presents again.
+- Occlusion, sleep and a hidden window only pause. Nothing is released: the canvas
+  keeps its configuration and size, and cell buffers, glyph maps and atlas textures
+  stay resident (together a few MiB; WASM linear memory never shrinks, so returning
+  the native presentation buffers on occlusion gained nothing).
+- A pane that becomes hidden leaves the canvas (its buffers and atlas lease are
+  released as before); the next visible pane joins it. A tab switch, a split, a
+  closed pane and a divider drag change only which viewports are drawn: zero
+  reallocations, zero reconfigurations. When the last pane has been gone for 250 ms the canvas is
+  hidden (a switch must not toggle it) and keeps its size. The runtime counts every swapchain allocation
+  (`canvases.backingStoreResizes`).
+- The previous design (a pool with one canvas per visible pane, closest-size reuse
+  and 1x1 parking after ten seconds) reallocated a presented canvas whenever tabs
+  of different pane geometry alternated (four tabs including a split pair: 246 to
+  726 MiB in 40 switches until a forced collection). It is gone.
+- A lost or replaced GPU device keeps the element: the runtime calls `configure()`
+  on the same canvas with the new device.
+- A terminal area that is gone (a remounted stack) hands its canvas to the next area.
+- Only `WebGpuTerminalRuntime.dispose()` (HMR, or a fatal error that switches every
+  session to WebGL) destroys the canvas; the WebGPU runtime never presents again.
 
-The WebGL fallback is unaffected: its canvases are garbage collected, so its
-two-second occlusion reclaim stays.
+Measured with the app lab (real app, release build, M4, total footprint in MiB; before is `ee836e1`
+for tabs/occlusion and `561d820` for resize, CPU medians of three on `561d820`):
+
+| Scenario | Before | After |
+| --- | --- | --- |
+| `tabs --variant saps` 40 switches, end +30 s (WebContent) | 726 (663) | 218 (160); after forced GC 208 |
+| `tabs` shell + agent, end +30 s | 283 | 200 |
+| backing-store allocations over 40 switches (saps) | 46 | 2 (the first two, at startup) |
+| `agents-steady` 120 s, unfinalized canvas textures / WebKit malloc growth | 2,626 / +36 MiB (no mirroring) | 195 / +2.5 MiB |
+| `agents-steady` CPU (app of one core, instructions/s, WebContent %) | 23.3 %, 0.38 G, 10.3 | 23.4 %, 0.38 G, 10.4 |
+| `idle` CPU (3 runs) | 2.9 % | 3.0 % |
+| `resize` 6 gestures: allocations / peak / settled / +30 s | 10 / 756 / 420 / 407 | 11 (2 at startup) / 796 / 309 / 205 |
+
+Known cost: the renderer lab's `default` workload (100 tab switches 30 ms apart) peaks at 429
+MiB after the switches against 209 on `561d820`, and returns to 214 within seconds (pane DOM
+now overlaps the canvas, so each pane switch builds a layer that waits for a collection);
+real switching (`tabs`, one switch every 3 s) stays flat.
+
+The resize peak is WebKit's page-layer behaviour (see "Resizing"); the extra 40 MiB is the
+window canvas growing once to the gesture bound. Visual: `scripts/terminal-visual` reads the
+window canvas back; a single pane is byte-identical to the per-pane canvas revision at ratios 2
+and 1.25, and 2x2 splits (exact and fractional pane sizes, ratios 2 and 1.25, fractional origin)
+equal a single pane of the same size pixel for pixel, with the divider gaps the clear colour.
+
+The WebGL fallback is unaffected: its canvases (one per pane) are garbage collected,
+so its two-second occlusion reclaim stays.
 
 ### Resizing
 
@@ -358,41 +413,56 @@ hundred instead of for the drag, and a full-screen program gets at most ten rela
 second instead of one per cell of pointer travel (a reflow itself costs about 1 ms). The
 old PTY debounce is gone: a size the PTY has not heard about is never applied to the model
 (`PtyResizeDelivery` only skips repeats and does not record a size when no PTY exists yet).
-Between applications nothing changes: not the model, not the PTY, not the backing store, and
-the canvas keeps its last frame, which the host clips (shrinking) or leaves background
-(growing). Font and ratio changes, the first fit, a pane becoming visible and the end of a
-gesture are not throttled; hidden panes still fit when they are shown.
+Between applications nothing changes: not the model, not the PTY, and the pane keeps drawing
+its last grid inside its already updated rectangle (clipped by the scissor when it shrank,
+background where it grew). Font and ratio changes, the first fit, a pane becoming visible and
+the end of a gesture are not throttled; hidden panes still fit when they are shown.
 `resizePromptRedraw.test.ts` runs this against the real WASM core: a zsh-like prompt is
-cleared by the model resize and restored by the redraw bytes that follow the PTY resize, and
-during a simulated one second drag it is blank for the shell's answer time only.
+cleared by the model resize and restored by the redraw bytes that follow the PTY resize.
+
+**Prompt flash.** Even a few milliseconds of blank prompt every 100 ms is a visible flicker,
+so a resize at a shell prompt also holds presentation (`core/ResizePromptHold.ts`). The model
+tracks the OSC 133 events (`prompt-end` sets "at a prompt"; `prompt-start`, `end-of-input`,
+`end-of-command` and `screen-cleared` clear it). A grid change at a prompt, outside the
+alternate screen, makes `presentationSuppressed()` true, which is what `deferPresentation()`
+already reports for synchronized updates: the surface skips the frame and the pane keeps
+drawing its previous cells (its uniform still follows a moved rectangle). It ends at the
+redraw's `prompt-end`, at the user's input or a command, or after 70 ms
+(`RESIZE_PROMPT_HOLD_MS`) when the shell does not answer, and then presents once. Parsing is
+never delayed. The real-core test replays a one second drag with a frame every 4 ms against a
+shell that answers 8 ms after SIGWINCH: no presented frame is blank, and frames were held.
 
 **Memory.** A resizing canvas allocates a replacement swapchain for every backing-store
 change, and WebKit keeps the retired ones until the live resize ends (three buffers each,
 30 MiB for a 2000x1300 canvas). The lab's window drag (`--workload resize`, 80 drags of
 about 120 steps) made 609 backing-store reallocations (about 8 per drag; 54 over the three
-cycles of one run). A resize gesture is now one of:
+cycles of one run) with a canvas per pane. A resize gesture, as the window canvas sees it, is
+one of the following (everything below applies to the window canvas, the only WebGPU canvas
+that can resize; panes inside it only change rectangles):
 
-- a pane divider drag (`terminalResizeInteraction`),
+- a pane divider drag (`terminalResizeInteraction`): it never changes the terminal area, so
+  the canvas does not move at all; the gesture only keeps the panes' cell buffers from
+  compacting until it ends,
 - the native macOS live resize: `window_presentation.rs` observes
   `NSWindowWillStartLiveResizeNotification`/`NSWindowDidEndLiveResizeNotification` next to
   the occlusion notifications and publishes `liveResize` in the same
   `terax:window-presentation` snapshot; `windowPresentation.ts` forwards it to
   `setNativeLiveResize`,
-- everywhere else (Windows, Linux, animated layouts): the same surface seeing its host change
-  size twice less than 150 ms apart (`lib/terminalResizeGesture.ts`), until 150 ms pass
-  without a change. Several surfaces laying out once each, as on a tab switch, is not a burst.
+- everywhere else (Windows, Linux, animated layouts): the area (or, for the WebGL canvas, a
+  surface's host) changing size twice less than 150 ms apart (`lib/terminalResizeGesture.ts`),
+  until 150 ms pass without a change. Several panes laying out once each, as on a tab
+  switch, is not a burst.
 
-While a gesture runs `CanvasBackingStore.stage` never shrinks. When the pane outgrows the
+While a gesture runs `CanvasBackingStore.stage` never shrinks. When the area outgrows the
 backing it allocates once, on both axes, to `gestureBackingBound`: if the window's inner size
-changed since the gesture began (the window is being dragged), the host plus the screen room
-the window has left; otherwise (a divider, an animated sidebar) the terminal area
-(`[data-terminal-tab]`, else the window), because the window did not grow; capped by
-`maxTextureDimension2D`. The CSS size stays exactly `backing / ratio`
-and the viewport exactly `cols * cellW` by `rows * cellH`, so nothing is scaled; the rest is
-background, clipped by the root. The surface subscribes to the gesture's end, lands the held
-grid immediately and the next `stage` without a gesture compacts the backing to the usual
-nearby size, so a drag costs at most one growth plus one compaction. The WebGL canvas uses
-the same store and throttle.
+changed since the gesture began (the window is being dragged), the area plus the screen room
+the window has left; otherwise (an animated sidebar) the window, because it did not grow;
+capped by `maxTextureDimension2D`. The CSS size stays exactly `backing / ratio` and every
+pane's viewport exactly its rectangle, so nothing is scaled; the rest is background, clipped
+by the area layer. The surfaces land their held grids when the gesture ends and the next
+`stage` without a gesture compacts the backing to the usual nearby size, so a window drag
+costs at most one growth plus one compaction, however many panes the window shows. The WebGL
+canvases (one per pane, rarely used) use the same store and throttle.
 
 Measured with `scripts/renderer-profile` (`--workload resize --cycles 3`: one 1000x650 window,
 one visible pane and one hidden, 3000 lines of scrollback each, output streaming, three
@@ -555,7 +625,8 @@ slants and breaks them; the procedural glyphs ignore the style), and
 `sprites-checks.json` holds the numbers for every capture, computed by
 `scripts/terminal-visual/spriteCheck.ts` (see its README).
 
-Main-thread time per tick (model write plus `renderFrame` plus submit; 400 ticks
+Main-thread time per tick (model write plus the frame plus submit; measured before the
+window canvas existed, when `renderFrame` encoded a pane's own pass; 400 ticks
 after warm-up, batched because `performance.now()` is 0.1 ms resolution):
 
 | Workload | 3,885 cells v1 | v2 | 12,027 cells v1 | v2 |

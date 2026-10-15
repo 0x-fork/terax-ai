@@ -10,8 +10,11 @@ context cannot reset the parser, scrollback, selection, search, or command block
 
 `ghostty/gpu/WebGpuTerminalRuntime.ts` owns the window's device, pipelines, glyph
 atlases (one per font and display ratio, shared by every surface that uses it),
-and damage scheduler. Each frame uses one encoder/submission for eligible
-surfaces. Per-pane deadlines bound focused, background-pane, and unfocused-window
+and damage scheduler, and one `WebGpuWindowCanvas` per terminal area: every visible
+WebGPU pane draws into its device-pixel rectangle of that shared canvas, and a
+presented canvas is never destroyed or resized by a tab switch, split or divider
+drag. Each frame uses one encoder/submission and one render pass for all panes.
+Per-pane deadlines bound focused, background-pane, and unfocused-window
 cadences to 60, 30, and 15 fps. At most two submissions await GPU completion.
 
 `ghostty/webgl/WebGlTerminalRuntime.ts` pools at most five WebGL2 renderer slots.

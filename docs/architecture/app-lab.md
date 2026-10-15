@@ -204,6 +204,17 @@ agent-visible run stays flat (126 MiB, 144 at start) and the split-pair run ends
    canvas-texture wrappers with WebKit; the WebGL renderer does not show the growth.
 3. Until then, a bounded allocation-pressure valve (above) keeps a long session from drifting.
 
+### Result: window canvas and GC mirroring
+
+Both mechanisms are fixed in the product: one shared canvas per window (tab switches, splits and
+dividers never reallocate it) and a per-frame `ArrayBuffer` mirror that makes JavaScriptCore
+collect the frame wrappers steadily (`gpu/GcPressure.ts`). `tabs --variant saps`: 726 -> 218 MiB
+total at the end (40 switches, 46 -> 2 canvas allocations, forced GC 204), `tabs`: 283 -> 200;
+`agents-steady` CPU is unchanged (23.3 % vs 23.4 % of a core, 0.38 G instructions/s). The mirror
+weight was chosen with `--instrument --local-storage terax:terminal-gc-mirror=<bytes>:<batch>`
+(120 s, visible agent): unfinalized canvas textures 2,626 off, 939 at 5x the native cost, 195 at
+10x (the default), 42 at 20x. The experiment patch `tab-switch-toggles.patch` applies to `ee836e1` only.
+
 ### Idle wakeups and the focused terminal input
 
 An idle app with one shell and a focused terminal costs 2.9 % of a core and 256 to 276 wakeups/s

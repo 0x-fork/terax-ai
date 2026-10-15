@@ -4,15 +4,14 @@ import type {
   GhosttyGpuFrame,
   GhosttyTerminalModelApi,
 } from "@/modules/terminal/ghostty/GhosttyTerminalModel";
-import { SCREEN_UNIFORM_BYTES } from "@/modules/terminal/ghostty/gpu/shaders";
+import type { DeviceRect } from "@/modules/terminal/ghostty/gpu/PaneRects";
+import {
+  SCREEN_OFFSET,
+  SCREEN_UNIFORM_BYTES,
+} from "@/modules/terminal/ghostty/gpu/shaders";
 import { WebGpuTerminalSurface } from "@/modules/terminal/ghostty/gpu/WebGpuTerminalSurface";
-import { WebGpuCanvasPool } from "@/modules/terminal/ghostty/gpu/WebGpuCanvasPool";
 import { deriveFontMetrics } from "@/modules/terminal/ghostty/gpu/terminalVisuals";
 import { resetTerminalResizeGestureForTest } from "@/modules/terminal/lib/terminalResizeGesture";
-import {
-  beginTerminalResizeInteraction,
-  endTerminalResizeInteraction,
-} from "@/modules/terminal/lib/terminalResizeInteraction";
 
 const bridge = vi.hoisted(() => ({ runtime: {} as unknown, visible: true }));
 vi.mock(
@@ -32,11 +31,9 @@ vi.mock("@/modules/terminal/ghostty/windowPresentation", () => ({
 }));
 
 const surfaces: WebGpuTerminalSurface[] = [];
-const canvasPools: WebGpuCanvasPool[] = [];
 afterEach(() => {
   resetTerminalResizeGestureForTest();
   for (const surface of surfaces.splice(0)) surface.dispose();
-  for (const pool of canvasPools.splice(0)) pool.dispose();
   vi.unstubAllGlobals();
   vi.useRealTimers();
 });
@@ -93,7 +90,6 @@ describe("WebGPU surface data path", () => {
     expect(h.writeBuffer).not.toHaveBeenCalled();
     expect(h.draw).not.toHaveBeenCalled();
     expect(h.domWork).not.toHaveBeenCalled();
-    expect(h.getCurrentTexture).toHaveBeenCalledOnce();
   });
 
   it("uploads only the uniform for cursor movement and redraws", async () => {
@@ -115,7 +111,6 @@ describe("WebGPU surface data path", () => {
     h.draw.mockClear();
     h.gpu.damage = { kind: "rows", ranges: [{ start: 3, end: 3 }] };
     expect(h.render()).toBe(true);
-    expect(h.draw).toHaveBeenCalled();
     h.writeBuffer.mockClear();
     expect(h.render()).toBe(false);
   });
@@ -150,21 +145,35 @@ describe("WebGPU surface data path", () => {
     expect(h.model.consumeGpuFrame).toHaveBeenLastCalledWith({ resync: true });
   });
 
-  it("draws a viewport-sized pass with one fullscreen triangle and one glyph instance per cell", async () => {
+  it("encodes one fullscreen triangle and one glyph instance per cell into the window pass", async () => {
     const h = await harness();
     h.render();
     const stats = h.surface.diagnostics();
-    expect(h.pass.setViewport).toHaveBeenLastCalledWith(
-      0,
-      0,
-      stats.cols * stats.deviceCellWidth,
-      stats.rows * stats.deviceCellHeight,
-      0,
+    expect(h.surface.drawable()).toBe(true);
+    h.encode();
+    // Viewport and scissor belong to the window canvas; the pane only issues its draws.
+    expect(h.pass.setViewport).not.toHaveBeenCalled();
+    expect(h.pass.setScissorRect).not.toHaveBeenCalled();
+    expect(h.pass.setPipeline).toHaveBeenNthCalledWith(
       1,
+      h.resources.backgroundPipeline,
     );
     expect(h.pass.draw).toHaveBeenNthCalledWith(1, 3);
+    expect(h.pass.setPipeline).toHaveBeenNthCalledWith(
+      2,
+      h.resources.glyphPipeline,
+    );
     expect(h.pass.draw).toHaveBeenNthCalledWith(2, 6, stats.cols * stats.rows);
     expect(h.pass.setBindGroup).toHaveBeenCalledOnce();
+  });
+
+  it("prepares frames without touching the render pass, and cannot be drawn before its first frame", async () => {
+    const h = await harness();
+    expect(h.surface.drawable()).toBe(false);
+    h.render();
+    expect(h.pass.setBindGroup).not.toHaveBeenCalled();
+    expect(h.draw).not.toHaveBeenCalled();
+    expect(h.surface.drawable()).toBe(true);
   });
 });
 
@@ -341,22 +350,11 @@ describe("selection", () => {
 
 describe("pixel-exact geometry", () => {
   it.each([1, 1.25, 1.5, 1.75, 2, 2.25, 3])(
-    "sizes the backing store to whole device cells and its CSS box 1:1 at %s",
+    "fits whole device cells and keeps CSS and device cell sizes 1:1 at %s",
     async (scale) => {
       const h = await harness({ scale });
       h.render();
       const stats = h.surface.diagnostics();
-      const canvas = h.canvas();
-      expect(canvas.width).toBe(stats.cols * stats.deviceCellWidth);
-      expect(canvas.height).toBe(stats.rows * stats.deviceCellHeight);
-      expect(Number.parseFloat(canvas.style.width) * scale).toBeCloseTo(
-        canvas.width,
-        6,
-      );
-      expect(Number.parseFloat(canvas.style.height) * scale).toBeCloseTo(
-        canvas.height,
-        6,
-      );
       expect(h.surface.cellSize().width * scale).toBeCloseTo(
         stats.deviceCellWidth,
         9,
@@ -367,8 +365,12 @@ describe("pixel-exact geometry", () => {
       );
       expect(h.onResize).toHaveBeenCalledWith(stats.cols, stats.rows);
       expect(h.model.setPixelSize).toHaveBeenCalledWith(
-        canvas.width,
-        canvas.height,
+        stats.cols * stats.deviceCellWidth,
+        stats.rows * stats.deviceCellHeight,
+      );
+      // The grid fits the host in whole cells.
+      expect(stats.cols * stats.deviceCellWidth).toBeLessThanOrEqual(
+        Math.round(960 * scale),
       );
     },
   );
@@ -389,22 +391,54 @@ describe("pixel-exact geometry", () => {
     expect(h.surface.diagnostics().cols).toBe(before - 1);
   });
 
-  it("snaps the canvas origin to the device pixel grid and recomputes on layout changes", async () => {
+  it("tells the window canvas where its host is on every layout change, and packs the rectangle it gets back", async () => {
     const h = await harness({ scale: 1.25 });
-    const snapped = (left: number) => {
-      const match = /translate\(([-\d.e]+)px/.exec(h.canvas().style.transform);
-      return (left + Number.parseFloat(match?.[1] ?? "0")) * 1.25;
-    };
-    h.observe({ width: 960, height: 640, left: 100.4, top: 20 });
     h.render();
-    expect(h.canvas().style.transform).toBe("translate(0.4px, 0px)");
-    expect(snapped(100.4)).toBeCloseTo(126, 6);
-    h.observe({ width: 960, height: 640, left: 100.8, top: 20 });
+    expect(h.setBounds).toHaveBeenLastCalledWith({
+      left: 0,
+      top: 0,
+      width: 960,
+      height: 640,
+    });
+    h.observe({ width: 700, height: 500, left: 100.4, top: 20 });
+    expect(h.setBounds).toHaveBeenLastCalledWith({
+      left: 100.4,
+      top: 20,
+      width: 700,
+      height: 500,
+    });
+
+    // The canvas answers with the snapped device rectangle; the uniform carries it.
+    h.paneRect.value = { x: 126, y: 25, width: 875, height: 625 };
+    h.writeBuffer.mockClear();
+    expect(h.render()).toBe(true);
+    const uniform = h.writeBuffer.mock.calls.find(
+      ([buffer]) => buffer === h.lastUniformBuffer(),
+    );
+    if (!uniform) throw new Error("uniform was not uploaded");
+    const words = new Uint32Array((uniform[2] as Float32Array).buffer);
+    const floats = uniform[2] as Float32Array;
+    expect([
+      floats[SCREEN_OFFSET.viewportSize / 4],
+      floats[SCREEN_OFFSET.viewportSize / 4 + 1],
+    ]).toEqual([875, 625]);
+    expect([
+      words[SCREEN_OFFSET.origin / 4],
+      words[SCREEN_OFFSET.origin / 4 + 1],
+    ]).toEqual([126, 25]);
+  });
+
+  it("redraws, without touching the grid, when only the pane's rectangle moved", async () => {
+    const h = await harness();
     h.render();
-    expect(snapped(100.8)).toBeCloseTo(Math.round(100.8 * 1.25), 6);
-    h.observe({ width: 960, height: 640, left: 100, top: 20 });
-    h.render();
-    expect(h.canvas().style.transform).toBe("");
+    h.paneRect.value = { x: 4, y: 0, width: 956, height: 640 };
+    h.writeBuffer.mockClear();
+    h.model.consumeGpuFrame.mockClear();
+    expect(h.render()).toBe(true);
+    expect(h.writeBuffer).toHaveBeenCalledOnce();
+    expect(h.writeBuffer.mock.calls[0][0]).toBe(h.lastUniformBuffer());
+    // A moved rectangle alone leaves the PTY alone.
+    expect(h.onResize).toHaveBeenCalledTimes(1);
   });
 
   it("re-measures the font and rebuilds resources when the display ratio changes", async () => {
@@ -421,21 +455,10 @@ describe("pixel-exact geometry", () => {
       h.surface,
     );
     expect(after.cols).toBeGreaterThan(before.cols * 0);
-    h.render();
-    const canvas = h.canvas();
-    expect(canvas.width).toBeGreaterThanOrEqual(after.cols * 12);
-    expect(Number.parseFloat(canvas.style.width) * 1.5).toBeCloseTo(
-      canvas.width,
-      6,
-    );
-    expect(h.pass.setViewport).toHaveBeenLastCalledWith(
-      0,
-      0,
-      after.cols * 12,
-      after.rows * after.deviceCellHeight,
-      0,
-      1,
-    );
+    expect(h.render()).toBe(true);
+    expect(h.surface.drawable()).toBe(true);
+    h.encode();
+    expect(h.pass.draw).toHaveBeenLastCalledWith(6, after.cols * after.rows);
   });
 });
 
@@ -503,7 +526,7 @@ describe("resizing the host", () => {
     expect(h.surface.diagnostics().cols).toBe(80);
   });
 
-  it("keeps the model, PTY and backing store still between throttled steps", async () => {
+  it("keeps the model and PTY still between throttled steps while the pane's rectangle follows the host", async () => {
     vi.useFakeTimers();
     const h = await harness({ resizeIntervalMs: 100 });
     h.render();
@@ -512,9 +535,6 @@ describe("resizing the host", () => {
     h.render();
     h.onResize.mockClear();
     h.model.setPixelSize.mockClear();
-    const resizes = h.surface.diagnostics().backingStoreResizes;
-    const canvas = h.canvas();
-    const backing = { width: canvas.width, height: canvas.height };
     vi.advanceTimersByTime(10);
 
     h.observe(hostSize(700));
@@ -523,8 +543,10 @@ describe("resizing the host", () => {
     expect(h.onResize).not.toHaveBeenCalled();
     expect(h.model.setPixelSize).not.toHaveBeenCalled();
     expect(h.surface.diagnostics().cols).toBe(112);
-    expect(h.surface.diagnostics().backingStoreResizes).toBe(resizes);
-    expect({ width: canvas.width, height: canvas.height }).toEqual(backing);
+    // The window canvas heard about the new host right away.
+    expect(h.setBounds).toHaveBeenLastCalledWith(
+      expect.objectContaining({ width: 700 }),
+    );
     expect(h.schedule).toHaveBeenCalled();
 
     vi.advanceTimersByTime(90);
@@ -554,136 +576,6 @@ describe("resizing the host", () => {
 
     expect(h.surface.diagnostics().cols).toBe(80);
     expect(h.onResize).toHaveBeenLastCalledWith(80, expect.any(Number));
-  });
-
-  describe("backing store during a gesture", () => {
-    const token = {};
-    afterEach(() => endTerminalResizeInteraction(token));
-
-    it("never reallocates while the window shrinks and grows back, then compacts once", async () => {
-      vi.useFakeTimers();
-      vi.stubGlobal("screen", { availWidth: 1600, availHeight: 1000 });
-      const h = await harness({ scale: 2 });
-      Object.assign(window, { innerWidth: 1000, innerHeight: 700 });
-      h.render();
-      h.observe(hostSize(960, 640));
-      h.render();
-      const start = h.surface.diagnostics();
-      const startBacking = h.canvas().width;
-      beginTerminalResizeInteraction(token);
-
-      // Shrink to a third, then grow back to the original size, a frame per step.
-      for (let width = 960; width >= 320; width -= 8) {
-        h.observe(hostSize(width, Math.round(width * 0.66)));
-        h.render();
-      }
-      for (let width = 320; width <= 960; width += 8) {
-        h.observe(hostSize(width, Math.round(width * 0.66)));
-        h.render();
-      }
-      expect(h.surface.diagnostics().backingStoreResizes).toBe(
-        start.backingStoreResizes,
-      );
-      expect(h.canvas().width).toBe(startBacking);
-      // The canvas is still exactly backing / ratio, drawn through an exact viewport.
-      expect(Number.parseFloat(h.canvas().style.width) * 2).toBe(
-        h.canvas().width,
-      );
-
-      h.observe(hostSize(400, 300));
-      h.render();
-      expect(h.canvas().width).toBe(startBacking);
-      const during = h.surface.diagnostics();
-      expect(h.pass.setViewport).toHaveBeenLastCalledWith(
-        0,
-        0,
-        during.cols * during.deviceCellWidth,
-        during.rows * during.deviceCellHeight,
-        0,
-        1,
-      );
-
-      endTerminalResizeInteraction(token);
-      // The observer's own burst detector lets go 150 ms after the last change.
-      vi.advanceTimersByTime(200);
-      h.render();
-      const after = h.surface.diagnostics();
-      expect(after.backingStoreResizes).toBe(start.backingStoreResizes + 1);
-      expect(h.canvas().width).toBeLessThan(startBacking);
-      expect(h.canvas().width).toBeLessThan(
-        after.cols * after.deviceCellWidth + 256,
-      );
-    });
-
-    it("grows once, to the room the screen leaves, when the window outgrows the backing", async () => {
-      vi.useFakeTimers();
-      vi.stubGlobal("screen", { availWidth: 1600, availHeight: 1000 });
-      const h = await harness({ scale: 2 });
-      h.observe(hostSize(480, 320));
-      h.render();
-      const start = h.surface.diagnostics();
-      beginTerminalResizeInteraction(token);
-
-      // The window grows with its content: 40 x 60 CSS pixels of chrome around the host.
-      for (let width = 480; width <= 1000; width += 8) {
-        const height = Math.round(width * 0.66);
-        Object.assign(window, {
-          innerWidth: width + 40,
-          innerHeight: height + 60,
-        });
-        h.observe(hostSize(width, height));
-        h.render();
-        vi.advanceTimersByTime(16);
-      }
-
-      const during = h.surface.diagnostics();
-      // The first outgrowing step allocates, to the bound; nothing after that does.
-      expect(during.backingStoreResizes - start.backingStoreResizes).toBe(1);
-      // A pane can never be larger than the screen minus the chrome.
-      expect(h.canvas().width).toBe((1600 - 40) * 2);
-      expect(h.canvas().height).toBe((1000 - 60) * 2);
-      expect(Number.parseFloat(h.canvas().style.width) * 2).toBe(
-        h.canvas().width,
-      );
-    });
-
-    it("bounds a layout-only gesture by the window it sits in, not by the screen", async () => {
-      vi.useFakeTimers();
-      vi.stubGlobal("screen", { availWidth: 1600, availHeight: 1000 });
-      const h = await harness({ scale: 2 });
-      // The window keeps its size while the host (a sidebar closing, a divider) grows.
-      Object.assign(window, { innerWidth: 1000, innerHeight: 700 });
-      h.observe(hostSize(480, 320));
-      h.render();
-      beginTerminalResizeInteraction(token);
-
-      for (let width = 480; width <= 960; width += 8) {
-        h.observe(hostSize(width, Math.round(width * 0.66)));
-        h.render();
-        vi.advanceTimersByTime(16);
-      }
-
-      expect(h.canvas().width).toBe(1000 * 2);
-      expect(h.canvas().height).toBe(700 * 2);
-    });
-
-    it("allocates to nearby sizes, step by step, when the host changes slowly", async () => {
-      vi.useFakeTimers();
-      const h = await harness({ scale: 2 });
-      h.render();
-      h.observe(hostSize(480, 320));
-      h.render();
-      const start = h.surface.diagnostics().backingStoreResizes;
-      // A change every 200 ms is no gesture, so nothing is held for later.
-      for (let width = 480; width <= 960; width += 8) {
-        vi.advanceTimersByTime(200);
-        h.observe(hostSize(width, Math.round(width * 0.66)));
-        h.render();
-      }
-      expect(
-        h.surface.diagnostics().backingStoreResizes - start,
-      ).toBeGreaterThan(1);
-    });
   });
 });
 
@@ -844,8 +736,6 @@ describe("WebGPU surface resource lifecycle", () => {
     const h = await harness();
     h.render();
     const allocated = h.createBuffer.mock.calls.length;
-    const canvas = h.canvas();
-    const backing = { width: canvas.width, height: canvas.height };
     const resources = h.surface.diagnostics();
     for (let transition = 0; transition < 1_000; transition++) {
       h.visibility(false);
@@ -856,17 +746,11 @@ describe("WebGPU surface resource lifecycle", () => {
     expect(h.createBuffer).toHaveBeenCalledTimes(allocated);
     expect(h.destroy).not.toHaveBeenCalled();
     expect(h.model.releasePresentationResources).not.toHaveBeenCalled();
-    expect(h.context.unconfigure).not.toHaveBeenCalled();
-    expect(h.acquireCanvas).toHaveBeenCalledOnce();
-    expect(h.canvasPool.diagnostics()).toMatchObject({
-      active: 1,
-      destroyed: 0,
-    });
-    expect(h.canvas().width).toBe(backing.width);
-    expect(h.canvas().height).toBe(backing.height);
+    // The pane stays in the window canvas for the whole pause.
+    expect(h.register).toHaveBeenCalledOnce();
+    expect(h.unregister).not.toHaveBeenCalled();
     expect(h.surface.diagnostics()).toMatchObject({
       gpuBufferBytes: resources.gpuBufferBytes,
-      estimatedSwapchainBytes: resources.estimatedSwapchainBytes,
       documentSuspended: true,
     });
     expect(h.render()).toBe(false);
@@ -878,67 +762,79 @@ describe("WebGPU surface resource lifecycle", () => {
     expect(h.onError).not.toHaveBeenCalled();
   });
 
-  it("keeps its canvas when the GPU device is lost and reconfigures it for the replacement", async () => {
+  it("keeps its place in the window canvas when the GPU device is lost and rebuilds its buffers for the replacement", async () => {
     const h = await harness();
     h.render();
-    const canvas = h.leases[0].canvas;
-    const width = canvas.width;
     h.surface.handleDeviceLoss();
     expect(h.surface.diagnostics()).toMatchObject({
       gpuBufferBytes: 0,
       documentSuspended: true,
     });
     expect(h.destroy).toHaveBeenCalled();
-    expect(h.context.unconfigure).not.toHaveBeenCalled();
-    expect(h.canvasPool.diagnostics()).toMatchObject({
-      active: 1,
-      destroyed: 0,
-    });
+    expect(h.surface.drawable()).toBe(false);
+    expect(h.unregister).not.toHaveBeenCalled();
 
     h.resources.generation = 2;
     h.visibility(true);
-    expect(h.acquireCanvas).toHaveBeenCalledOnce();
-    expect(h.leases[0].generation).toBe(2);
-    expect(h.leases[0].canvas).toBe(canvas);
-    expect(canvas.width).toBe(width);
-    expect(h.canvasPool.diagnostics()).toMatchObject({
-      active: 1,
-      reconfigured: 1,
-      destroyed: 0,
-    });
+    expect(h.register).toHaveBeenCalledOnce();
     expect(h.surface.diagnostics().gpuBufferBytes).toBeGreaterThan(0);
     expect(h.render()).toBe(true);
+    expect(h.surface.drawable()).toBe(true);
     expect(h.onError).not.toHaveBeenCalled();
   });
 
-  it("returns its canvas to the pool configured when hidden and takes back one of the right size", async () => {
+  it("leaves the window canvas when hidden and rejoins it, without a canvas of its own, when shown", async () => {
     const h = await harness();
     h.render();
-    const canvas = h.leases[0].canvas;
-    const { width, height } = canvas;
+    expect(h.register).toHaveBeenCalledOnce();
     h.surface.setVisible(false);
-    expect(h.canvasPool.diagnostics()).toMatchObject({
-      active: 0,
-      idle: 1,
-      destroyed: 0,
-    });
-    expect(h.context.unconfigure).not.toHaveBeenCalled();
-    expect(canvas.width).toBe(width);
+    expect(h.unregister).toHaveBeenCalledOnce();
+    expect(h.surface.drawable()).toBe(false);
     h.surface.setVisible(true);
-    expect(h.acquireCanvas).toHaveBeenCalledTimes(2);
-    // The pane tells the pool which backing size it needs, so the matching canvas comes back.
-    expect(h.acquireCanvas).toHaveBeenLastCalledWith(
-      expect.objectContaining({ width: expect.any(Number) }),
-    );
-    expect(h.leases[1].canvas).toBe(canvas);
-    expect(canvas.width).toBe(width);
-    expect(canvas.height).toBe(height);
+    expect(h.register).toHaveBeenCalledTimes(2);
+    expect(h.register).toHaveBeenLastCalledWith(h.surface, h.host);
+  });
+
+  it("keeps its DOM background until the window canvas has shown its first frame", async () => {
+    const h = await harness();
+    const root = h.elements.find(
+      (e) => e.getAttribute("data-terax-ghostty-surface") === "webgpu",
+    ) as unknown as { style: { backgroundColor: string } };
+    expect(root.style.backgroundColor).toBe("rgb(0 0 0)");
+    h.render();
+    expect(root.style.backgroundColor).toBe("rgb(0 0 0)");
+    h.surface.handleCanvasRevealed();
+    expect(root.style.backgroundColor).toBe("transparent");
+    // Leaving the window covers the canvas again until the next first frame.
+    h.surface.setVisible(false);
+    expect(root.style.backgroundColor).toBe("rgb(0 0 0)");
+    h.surface.setVisible(true);
+    h.render();
+    expect(root.style.backgroundColor).toBe("rgb(0 0 0)");
+  });
+
+  it("shows the previous frame in the pane's moved rectangle while presentation is held", async () => {
+    const h = await harness();
+    h.render();
+    h.model.deferPresentation = () => true;
+    h.paneRect.value = { x: 40, y: 0, width: 920, height: 640 };
+    h.writeBuffer.mockClear();
+    h.model.consumeGpuFrame.mockClear();
+    // The grid and cells of the last frame stay; only the uniform follows the rectangle.
+    expect(h.render()).toBe(true);
+    expect(h.model.consumeGpuFrame).not.toHaveBeenCalled();
+    expect(h.writeBuffer).toHaveBeenCalledOnce();
+    expect(h.writeBuffer.mock.calls[0][0]).toBe(h.lastUniformBuffer());
+    expect(h.surface.drawable()).toBe(true);
+    // Unchanged rectangle while held: nothing to draw.
+    h.writeBuffer.mockClear();
+    expect(h.render()).toBe(false);
+    expect(h.writeBuffer).not.toHaveBeenCalled();
   });
 
   it("defers font changes during occlusion and acquires the current font and DPR on resume", async () => {
     const h = await harness();
     const allocated = h.createBuffer.mock.calls.length;
-    const swapchain = h.surface.diagnostics().estimatedSwapchainBytes;
     h.visibility(false);
     h.surface.setFontMetrics({
       ...METRICS,
@@ -948,9 +844,6 @@ describe("WebGPU surface resource lifecycle", () => {
     });
     expect(h.createBuffer).toHaveBeenCalledTimes(allocated);
     expect(h.surface.diagnostics().gpuBufferBytes).toBe(0);
-    // The paused canvas is left as it is.
-    expect(h.surface.diagnostics().estimatedSwapchainBytes).toBe(swapchain);
-    expect(h.context.unconfigure).not.toHaveBeenCalled();
     h.setScale(2);
     h.visibility(true);
     expect(h.acquireGlyphAtlas).toHaveBeenLastCalledWith(
@@ -1008,11 +901,6 @@ async function harness(
     buffers.push(buffer);
     return buffer;
   });
-  const context = {
-    configure: vi.fn(),
-    unconfigure: vi.fn(),
-    getCurrentTexture: vi.fn(() => ({ createView: () => ({}) })),
-  };
   const domWork = vi.fn();
   const scrollReads = vi.fn();
   const rectReads = vi.fn();
@@ -1047,7 +935,7 @@ async function harness(
       appendChild: vi.fn(),
       remove: vi.fn(),
       contains: () => false,
-      getContext: () => context,
+      getContext: () => null,
       getBoundingClientRect: () => {
         rectReads();
         domWork();
@@ -1078,7 +966,8 @@ async function harness(
       // The pool's canvases and the font measurer share this stub.
       if (tag === "canvas") {
         Object.assign(made, {
-          getContext: (kind: string) => (kind === "2d" ? measuring : context),
+          tagName: "CANVAS",
+          getContext: (kind: string) => (kind === "2d" ? measuring : null),
         });
       }
       return made;
@@ -1163,23 +1052,26 @@ async function harness(
     backgroundPipeline: { name: "background" },
     glyphPipeline: { name: "glyph" },
   };
-  const canvasPool = new WebGpuCanvasPool();
-  canvasPools.push(canvasPool);
-  const leases: Array<ReturnType<WebGpuCanvasPool["acquire"]>> = [];
-  const acquireCanvas = vi.fn(
-    (preferred?: { width: number; height: number } | null) => {
-      const lease = canvasPool.acquire(
-        resources as never,
-        preferred ?? undefined,
-      );
-      leases.push(lease);
-      return lease;
+  // What the window canvas gives a pane: the rectangle it computed, and a way to report layout.
+  const paneRect: { value: DeviceRect | null } = {
+    value: {
+      x: 0,
+      y: 0,
+      width: Math.round(960 * scale),
+      height: Math.round(640 * scale),
     },
-  );
+  };
+  const setBounds = vi.fn();
+  const invalidate = vi.fn();
+  const register = vi.fn((_surface: unknown, _host: unknown) => ({
+    setBounds,
+    rect: () => paneRect.value,
+    invalidate,
+  }));
+  const unregister = vi.fn();
   bridge.runtime = {
-    acquireCanvas: acquireCanvas,
-    register: vi.fn(),
-    unregister: vi.fn(),
+    register,
+    unregister,
     schedule,
     interact,
     acquireGlyphAtlas,
@@ -1255,10 +1147,10 @@ async function harness(
     setPipeline: vi.fn(),
     setBindGroup: vi.fn(),
     setViewport: vi.fn(),
+    setScissorRect: vi.fn(),
     draw: vi.fn(),
     end: vi.fn(),
   };
-  const encoder = { beginRenderPass: vi.fn(() => pass) };
   const onError = vi.fn();
   const onResize = vi.fn();
   const surface = await WebGpuTerminalSurface.create({
@@ -1300,13 +1192,18 @@ async function harness(
     createBindGroup,
     draw: pass.draw,
     pass,
-    getCurrentTexture: context.getCurrentTexture,
     render: (budget?: { exhausted(allowance?: number): boolean }) =>
-      surface.renderFrame(
-        () => encoder as unknown as GPUCommandEncoder,
+      surface.prepareFrame(resources as never, budget),
+    encode: () =>
+      surface.encode(
+        pass as unknown as GPURenderPassEncoder,
         resources as never,
-        budget,
       ),
+    paneRect,
+    setBounds,
+    register,
+    unregister,
+    host: hostElement,
     model,
     gpu,
     atlas,
@@ -1331,12 +1228,6 @@ async function harness(
     set origin(value: number) {
       origin = value;
     },
-    canvas: () =>
-      leases[leases.length - 1].canvas as unknown as {
-        width: number;
-        height: number;
-        style: { width: string; height: string; transform: string };
-      },
     lastCellsBuffer: () => lastBuffer("cell records"),
     lastUniformBuffer: () => lastBuffer("surface uniform"),
     lastGlyphMapBuffer: () => lastBuffer("glyph map"),
@@ -1397,11 +1288,7 @@ async function harness(
       bridge.visible = visible;
       surface.handleVisibilityChange(visible);
     },
-    context,
     resources,
-    canvasPool,
-    acquireCanvas,
-    leases,
   };
 }
 

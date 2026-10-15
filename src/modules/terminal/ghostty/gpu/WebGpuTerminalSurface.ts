@@ -16,19 +16,12 @@ import type {
 } from "../GhosttyTerminalModel";
 import { GhosttySearchController } from "../search/GhosttySearchController";
 import { TerminalSelectionController } from "../selection/TerminalSelectionController";
-import type { WebGpuCanvasLease } from "@/modules/terminal/ghostty/gpu/WebGpuCanvasPool";
-import type { GestureGrowth } from "./CanvasBackingStore";
 import { DevicePixelRatioMonitor } from "./DevicePixelRatioMonitor";
-import {
-  type CssSize,
-  gestureBackingBound,
-  measureGestureBackingEnvironment,
-  windowInnerSize,
-} from "./GestureBacking";
 import { TerminalGlyphMap, type RasterBudget } from "./GlyphMap";
-import { ScreenUniform } from "./ScreenUniform";
+import type { DeviceRect } from "./PaneRects";
+import { ScreenUniform, type ScreenUniformState } from "./ScreenUniform";
 import { SCREEN_UNIFORM_BYTES } from "./shaders";
-import { fitTerminalViewport, snapOffsetCss } from "./TerminalFit";
+import { fitTerminalViewport } from "./TerminalFit";
 import {
   TerminalFitQueue,
   type TerminalFitBounds,
@@ -71,6 +64,7 @@ import {
   type WebGpuSharedResources,
   type WebGpuTerminalRuntime,
 } from "./WebGpuTerminalRuntime";
+import type { PaneBinding } from "./WebGpuWindowCanvas";
 
 const CURSOR_BLINK_MS = 600;
 const TEXT_BLINK_MS = 600;
@@ -94,7 +88,8 @@ export type WebGpuTerminalSurfaceOptions = {
 
 export type WebGpuTerminalSurfaceStats = {
   readonly frames: number;
-  readonly backingStoreResizes: number;
+  /** The pane's rectangle in the shared window canvas, device pixels; null before layout. */
+  readonly viewport: DeviceRect | null;
   /** Grid changes applied (model and PTY resized together) and held back by the throttle. */
   readonly gridResizes: number;
   readonly deferredGridResizes: number;
@@ -124,7 +119,7 @@ export class WebGpuTerminalSurface
 {
   readonly backend = "ghostty-webgpu" as const;
 
-  private target: WebGpuCanvasLease | null = null;
+  private binding: PaneBinding | null = null;
   private readonly input = document.createElement("textarea");
   private readonly root = document.createElement("div");
   private readonly scrollbar = document.createElement("div");
@@ -171,8 +166,6 @@ export class WebGpuTerminalSurface
   private documentSuspended = !terminalWindowPresentation().visible;
   private runtimeRegistered = false;
   private resizeInteractionActive = terminalResizeInteractionActive();
-  /** The window's inner size when the current gesture began; a change means the window is the one moving. */
-  private gestureStartInner: CssSize = windowInnerSize();
   private compactAfterResize = false;
   private nativeCursorVisible = false;
   private windowFocused = terminalWindowFocused();
@@ -185,7 +178,6 @@ export class WebGpuTerminalSurface
   private forceFullRedraw = true;
   private runtimeGeneration = 0;
   private frameCount = 0;
-  private backingStoreResizeCount = 0;
   private cellCompactionCount = 0;
   private uploadCount = 0;
   private uploadedBytes = 0;
@@ -195,10 +187,14 @@ export class WebGpuTerminalSurface
   private mouseDownLink: string | null = null;
   private applyingFit = false;
   private disposed = false;
-  private appliedTransform = "";
-  private snapOrigin: { left: number; top: number } | null = null;
-  /** Last backing size this pane fitted to; lets the pool hand back a canvas that already has it. */
-  private lastBackingSize: { width: number; height: number } | null = null;
+  /** The window canvas has shown this pane's first frame; until then its DOM covers the canvas. */
+  private revealed = false;
+  /** A frame was prepared and its bind group is ready, so the window canvas can draw the pane. */
+  private hasFrame = false;
+  /** Glyph instances of the last prepared frame. */
+  private drawCells = 0;
+  /** What the uniform last held, kept to repack it when only the pane's rectangle moves. */
+  private lastScreenState: ScreenUniformState | null = null;
 
   private constructor(
     private readonly runtime: WebGpuTerminalRuntime,
@@ -290,11 +286,8 @@ export class WebGpuTerminalSurface
     this.unsubscribeResizeInteraction = subscribeTerminalResizeInteraction(
       (active) => {
         this.resizeInteractionActive = active;
-        if (active) {
-          this.gestureStartInner = windowInnerSize();
-          return;
-        }
-        // The gesture is over: land the held grid now and shrink the backing to fit it.
+        if (active) return;
+        // The gesture is over: land the held grid now and compact what the drag grew.
         this.compactAfterResize = true;
         this.fitImmediate = true;
         this.queueFit(this.heldBounds ?? undefined);
@@ -477,8 +470,46 @@ export class WebGpuTerminalSurface
     return this.focused;
   }
 
-  renderFrame(
-    getEncoder: () => GPUCommandEncoder,
+  /** The window canvas can draw this pane: it prepared a frame and its bindings exist. */
+  drawable(): boolean {
+    return (
+      !this.disposed &&
+      this.visible &&
+      this.hasFrame &&
+      // A replaced buffer leaves the old bind group naming a destroyed one until the next
+      // prepared frame rebinds it.
+      !this.bindGroupDirty &&
+      this.bindGroup !== null &&
+      this.binding !== null
+    );
+  }
+
+  background(): Rgb {
+    return this.theme.background;
+  }
+
+  /** Called inside the window pass; viewport and scissor already cover the pane's rectangle. */
+  encode(pass: GPURenderPassEncoder, resources: WebGpuSharedResources): void {
+    if (!this.bindGroup) return;
+    pass.setBindGroup(0, this.bindGroup);
+    pass.setPipeline(resources.backgroundPipeline);
+    pass.draw(3);
+    pass.setPipeline(resources.glyphPipeline);
+    pass.draw(6, this.drawCells);
+  }
+
+  handleCanvasRevealed(): void {
+    if (this.revealed) return;
+    this.revealed = true;
+    this.updateRootBackground();
+  }
+
+  /**
+   * Uploads what changed (cells, glyphs, search mask, uniform) and says whether the pane's pixels
+   * differ from what the window canvas last drew. Draws nothing: the window canvas redraws every
+   * visible pane in one pass when any of them changed.
+   */
+  prepareFrame(
     resources: WebGpuSharedResources,
     budget: RasterBudget = createRasterBudget(RASTER_BUDGET_MS),
   ): boolean {
@@ -486,7 +517,7 @@ export class WebGpuTerminalSurface
       this.disposed ||
       !this.visible ||
       this.documentSuspended ||
-      !this.target ||
+      !this.binding ||
       !this.cellsBuffer ||
       !this.uniformBuffer ||
       !this.atlasLease
@@ -495,12 +526,16 @@ export class WebGpuTerminalSurface
     }
     if (resources.generation !== this.runtimeGeneration) {
       this.handleRuntimeReset(resources);
-      // The replacement canvas has no staged size yet.
+      // The replacement buffers have no fitted size yet.
       this.resizeToHost(undefined, false);
     }
     this.applyQueuedFit();
     const model = this.options.model;
-    if (model.deferPresentation()) return false;
+    if (model.deferPresentation()) {
+      // The previous frame stays on screen (a synchronized update, or a prompt being redrawn
+      // after a resize); only the pane's rectangle may still have moved under it.
+      return this.refreshHeldViewport(resources.device);
+    }
     const revision = model.revision();
     if (revision !== this.contentRevision) {
       this.contentRevision = revision;
@@ -510,14 +545,9 @@ export class WebGpuTerminalSurface
     this.selection.reconcile();
     this.search.refreshOverlay();
     this.updateScrollbar();
-    if (this.target.backingStore.commit()) {
-      this.backingStoreResizeCount += 1;
-      this.forceFullRedraw = true;
-    }
     const lease = this.atlasLease;
     const device = resources.device;
     if (!lease || !this.cellsBuffer) return false;
-
     // The frame's cell view borrows WASM memory: upload it and scan it before
     // any other call into the model.
     const atlasStale = lease.atlas.epoch !== this.glyphMap.atlasEpoch;
@@ -571,35 +601,8 @@ export class WebGpuTerminalSurface
       return false;
     }
 
-    const viewportWidth = Math.min(
-      frame.cols * this.metrics.deviceCellWidth,
-      this.target.canvas.width,
-    );
-    const viewportHeight = Math.min(
-      frame.rows * this.metrics.deviceCellHeight,
-      this.target.canvas.height,
-    );
-    const encoder = getEncoder();
-    const pass = encoder.beginRenderPass({
-      label: "Terax terminal surface pass",
-      colorAttachments: [
-        {
-          view: this.target.context.getCurrentTexture().createView(),
-          clearValue: rgbClear(this.theme.background),
-          loadOp: "clear",
-          storeOp: "store",
-        },
-      ],
-    });
-    pass.setViewport(0, 0, viewportWidth, viewportHeight, 0, 1);
-    pass.setBindGroup(0, this.bindGroup);
-    pass.setPipeline(resources.backgroundPipeline);
-    pass.draw(3);
-    pass.setPipeline(resources.glyphPipeline);
-    pass.draw(6, expectedCells);
-    pass.end();
-    this.target.present();
-
+    this.drawCells = expectedCells;
+    this.hasFrame = true;
     this.forceFullRedraw = false;
     this.forcePresent = false;
     this.frameCount += 1;
@@ -611,6 +614,27 @@ export class WebGpuTerminalSurface
     if (this.frameCount === 1) this.options.onFirstFrame?.();
     this.options.onFrame?.();
     return true;
+  }
+
+  /**
+   * While presentation is held the cells, glyph map and grid of the last frame stay as they
+   * are, but the window canvas may still have moved or resized the pane's rectangle, and the
+   * shader maps the grid onto that rectangle. Repacks the uniform for it.
+   */
+  private refreshHeldViewport(device: GPUDevice): boolean {
+    const state = this.lastScreenState;
+    const rect = this.binding?.rect();
+    if (!state || !rect || !this.uniformBuffer) return false;
+    const held = state.viewport;
+    if (
+      held.x === rect.x &&
+      held.y === rect.y &&
+      held.width === rect.width &&
+      held.height === rect.height
+    )
+      return false;
+    this.packAndUpload({ ...state, viewport: rect }, device);
+    return this.hasFrame;
   }
 
   handleRuntimeReset(resources: WebGpuSharedResources): void {
@@ -626,7 +650,7 @@ export class WebGpuTerminalSurface
 
   /**
    * Window occlusion, sleep and a lost GPU device all stop here. Pausing cancels timers and
-   * rendering and releases nothing: the canvas keeps its configuration and size, because
+   * rendering and releases nothing: the window canvas keeps its configuration and size, because
    * destroying or shrinking a presented WebGPU canvas makes WebKit retain its swapchain.
    */
   handleVisibilityChange(visible: boolean): void {
@@ -653,6 +677,7 @@ export class WebGpuTerminalSurface
       }
     }
     this.forcePresent = true;
+    this.binding?.invalidate();
     if (this.visible) this.search.resume();
     this.armCursorBlink();
     this.syncTextBlink();
@@ -661,7 +686,7 @@ export class WebGpuTerminalSurface
 
   /**
    * The GPU device is gone: buffers and the atlas lease belong to it and are dropped now, the
-   * canvas is kept and pointed at the replacement device when presentation resumes.
+   * window canvas is kept and pointed at the replacement device when presentation resumes.
    */
   handleDeviceLoss(): void {
     this.handleVisibilityChange(false);
@@ -674,12 +699,9 @@ export class WebGpuTerminalSurface
       (this.uniformBuffer?.size ?? 0) +
       (this.glyphMapBuffer?.size ?? 0) +
       (this.searchBuffer?.size ?? 0);
-    const canvasColorBytes = this.target
-      ? this.target.canvas.width * this.target.canvas.height * 4
-      : 0;
     return {
       frames: this.frameCount,
-      backingStoreResizes: this.backingStoreResizeCount,
+      viewport: this.binding?.rect() ?? null,
       gridResizes: this.gridResizeCount,
       deferredGridResizes: this.deferredGridResizeCount,
       cellCompactions: this.cellCompactionCount,
@@ -690,8 +712,9 @@ export class WebGpuTerminalSurface
         this.glyphMap.byteSize +
         this.searchScratch.byteLength,
       gpuBufferBytes: retainedBufferBytes,
-      canvasColorBytes,
-      estimatedSwapchainBytes: canvasColorBytes * 3,
+      // The swapchain belongs to the window canvas; see the runtime's `canvases`.
+      canvasColorBytes: 0,
+      estimatedSwapchainBytes: 0,
       cols: this.options.model.cols,
       rows: this.options.model.rows,
       scale: this.metrics.scale,
@@ -822,15 +845,6 @@ export class WebGpuTerminalSurface
   private initializeGpuResources(resources: WebGpuSharedResources): void {
     if (!this.host) return;
     try {
-      // Same element, new device: reconfiguring it keeps the swapchain WebKit already holds.
-      if (this.target && this.target.generation !== resources.generation)
-        this.target.reconfigure(resources);
-      if (!this.target) {
-        this.target = this.runtime.acquireCanvas(this.lastBackingSize);
-        this.target.canvas.style.transform = "";
-        this.appliedTransform = "";
-        this.root.append(this.target.canvas);
-      }
       this.metrics = metricsForScale(this.metrics, devicePixelScale());
       this.contrast = currentTextContrast(this.metrics.scale);
       this.atlasLease = this.runtime.acquireGlyphAtlas(this.metrics, this);
@@ -856,7 +870,6 @@ export class WebGpuTerminalSurface
       this.runtimeGeneration = resources.generation;
     } catch (error) {
       this.releaseGpuResources();
-      this.releaseCanvas();
       throw error;
     }
   }
@@ -864,34 +877,34 @@ export class WebGpuTerminalSurface
   private activateGpuResources(): void {
     if (!this.host) return;
     if (!this.runtimeRegistered) {
-      this.runtime.register(this);
+      this.binding = this.runtime.register(this, this.host);
       this.runtimeRegistered = true;
     }
     if (this.documentSuspended || this.uniformBuffer) return;
     try {
       this.initializeGpuResources(this.runtime.resources());
     } catch (error) {
-      this.runtime.unregister(this);
-      this.runtimeRegistered = false;
+      this.leaveWindow();
       this.releaseGpuResources();
-      this.releaseCanvas();
       throw error;
     }
   }
 
   private deactivateGpuResources(): void {
+    this.leaveWindow();
+    this.releaseGpuResources();
+  }
+
+  /** Leaves the window canvas; the canvas itself stays configured and sized for the next pane. */
+  private leaveWindow(): void {
     if (this.runtimeRegistered) {
       this.runtime.unregister(this);
       this.runtimeRegistered = false;
     }
-    this.releaseGpuResources();
-    this.releaseCanvas();
-  }
-
-  /** Back to the pool, still configured and sized for the next visible pane. */
-  private releaseCanvas(): void {
-    this.target?.release();
-    this.target = null;
+    this.binding = null;
+    this.revealed = false;
+    this.hasFrame = false;
+    this.updateRootBackground();
   }
 
   private releaseGpuResources(): void {
@@ -910,6 +923,8 @@ export class WebGpuTerminalSurface
     this.atlasLease?.release();
     this.atlasLease = null;
     this.glyphMap = new TerminalGlyphMap();
+    this.hasFrame = false;
+    this.lastScreenState = null;
     this.cellCapacity = 0;
     this.blinkingCells = 0;
     this.forceFullRedraw = true;
@@ -918,8 +933,23 @@ export class WebGpuTerminalSurface
 
   private queueFit(bounds?: TerminalFitBounds): void {
     if (!this.host) return;
-    this.fitQueue.request(bounds);
+    // The pane's rectangle in the window canvas follows the layout at once; the grid follows
+    // at the pace of the resize throttle.
+    const measured = bounds ?? this.measureHost();
+    this.reportBounds(measured);
+    this.fitQueue.request(measured);
     this.runtime.schedule(this);
+  }
+
+  /** Tells the window canvas where the host is; the canvas turns it into device pixels. */
+  private reportBounds(bounds: TerminalFitBounds): void {
+    if (bounds.left === undefined || bounds.top === undefined) return;
+    this.binding?.setBounds({
+      left: bounds.left,
+      top: bounds.top,
+      width: bounds.width,
+      height: bounds.height,
+    });
   }
 
   private boundsFromEntry(entry: ResizeObserverEntry): TerminalFitBounds {
@@ -979,7 +1009,7 @@ export class WebGpuTerminalSurface
   ): void {
     if (
       !this.host ||
-      !this.target ||
+      !this.binding ||
       !this.visible ||
       this.documentSuspended ||
       !this.uniformBuffer
@@ -987,6 +1017,7 @@ export class WebGpuTerminalSurface
       return;
     this.fitQueue.clear();
     const bounds = measuredBounds ?? this.measureHost();
+    this.reportBounds(bounds);
     const scale = devicePixelScale();
     this.scrollbarSync.invalidate();
     this.scrollbarViewportHeight = Math.round(bounds.height);
@@ -1001,7 +1032,7 @@ export class WebGpuTerminalSurface
       this.metrics,
       bounds.device,
     );
-    if (!fit || !this.target) return;
+    if (!fit || !this.binding) return;
     const { cols, rows, pixelWidth, pixelHeight } = fit;
     if (cols * rows > MAX_WEBGPU_SURFACE_CELLS) {
       this.options.onError(
@@ -1014,11 +1045,10 @@ export class WebGpuTerminalSurface
 
     const outcome = this.resizeSync.request(cols, rows, throttled);
     if (outcome === "deferred") {
-      // The grid, the PTY and the backing keep their last size; the canvas keeps showing the
-      // last frame and the host clips or pads it until the next interval.
+      // The grid and the PTY keep their last size; the pane keeps showing its last grid inside
+      // its (already moved) rectangle, background where it is larger, clipped where smaller.
       this.heldBounds = bounds;
       this.deferredGridResizeCount += 1;
-      if (this.applySnap(bounds)) this.forceFullRedraw = true;
       return;
     }
     this.heldBounds = null;
@@ -1027,64 +1057,12 @@ export class WebGpuTerminalSurface
       this.gridResizeCount += 1;
       this.selection.reconcile();
     }
-    this.ensureCellCapacity(cols * rows, this.runtime.resources().device);
-
-    const backingStoreChanged = this.target.backingStore.stage(
-      pixelWidth,
-      pixelHeight,
-      this.metrics.scale,
-      this.gestureGrowth(),
-    );
-    this.lastBackingSize = { width: pixelWidth, height: pixelHeight };
-    const snapped = this.applySnap(bounds);
-    if (changed || backingStoreChanged) {
+    if (changed) {
       this.options.model.setPixelSize(pixelWidth, pixelHeight);
+      this.forceFullRedraw = true;
     }
-    if (changed || backingStoreChanged || snapped) this.forceFullRedraw = true;
     this.updateScrollbar();
-    if (scheduleRender && (changed || backingStoreChanged)) {
-      this.runtime.schedule(this);
-    }
-  }
-
-  /**
-   * During a drag the backing store never shrinks and grows once, to the bound the drag
-   * cannot exceed (see `gestureBackingBound`); `undefined` outside a drag.
-   */
-  private gestureGrowth(): GestureGrowth | undefined {
-    const host = this.host;
-    if (!this.resizeInteractionActive || !host) return undefined;
-    return () =>
-      gestureBackingBound(
-        measureGestureBackingEnvironment(
-          host,
-          this.gestureStartInner,
-          this.metrics.scale,
-          this.runtime.resources().device.limits?.maxTextureDimension2D ?? 8192,
-        ),
-      );
-  }
-
-  /**
-   * Moves the canvas onto the device pixel grid. The origin comes from the
-   * observer callback or a measurement, never from a per-frame read.
-   */
-  private applySnap(bounds: TerminalFitBounds): boolean {
-    if (!this.target) return false;
-    if (bounds.left !== undefined && bounds.top !== undefined) {
-      this.snapOrigin = { left: bounds.left, top: bounds.top };
-    }
-    const origin = this.snapOrigin;
-    if (!origin) return false;
-    const offset = snapOffsetCss(origin.left, origin.top, this.metrics.scale);
-    const transform =
-      offset.x === 0 && offset.y === 0
-        ? ""
-        : `translate(${offset.x}px, ${offset.y}px)`;
-    if (transform === this.appliedTransform) return false;
-    this.target.canvas.style.transform = transform;
-    this.appliedTransform = transform;
-    return true;
+    if (scheduleRender && changed) this.runtime.schedule(this);
   }
 
   private updateScrollbar(): void {
@@ -1315,11 +1293,17 @@ export class WebGpuTerminalSurface
       this.cursorEnabled && this.cursorVisible && this.nativeCursorVisible;
     const bounds = this.selection.normalizedBounds();
     const theme = this.theme;
-    this.screen.pack({
+    const state: ScreenUniformState = {
       cols: frame.cols,
       rows: frame.rows,
       cellWidth: this.metrics.deviceCellWidth,
       cellHeight: this.metrics.deviceCellHeight,
+      viewport: this.binding?.rect() ?? {
+        x: 0,
+        y: 0,
+        width: frame.cols * this.metrics.deviceCellWidth,
+        height: frame.rows * this.metrics.deviceCellHeight,
+      },
       textBlinkVisible: this.textBlinkVisible,
       searchActive: this.searchBuffer !== null,
       cursor: showCursor
@@ -1338,9 +1322,18 @@ export class WebGpuTerminalSurface
         this.metrics.scale,
       ),
       contrast: this.contrast,
-    });
+    };
+    return this.packAndUpload(state, device);
+  }
+
+  /** Packs the uniform and uploads it when it differs from what the GPU holds. */
+  private packAndUpload(state: ScreenUniformState, device: GPUDevice): boolean {
+    const buffer = this.uniformBuffer;
+    if (!buffer) return false;
+    this.lastScreenState = state;
+    this.screen.pack(state);
     if (!this.screen.changed()) return false;
-    device.queue.writeBuffer(this.uniformBuffer, 0, this.screen.data);
+    device.queue.writeBuffer(buffer, 0, this.screen.data);
     this.screen.markUploaded();
     this.uploadCount += 1;
     this.uploadedBytes += SCREEN_UNIFORM_BYTES;
@@ -1403,8 +1396,14 @@ export class WebGpuTerminalSurface
     this.textBlinkTimer = null;
   }
 
+  /**
+   * The window canvas draws the terminal background. Until it has shown this pane's first
+   * frame the pane's own DOM covers whatever the canvas still holds from another tab.
+   */
   private updateRootBackground(): void {
-    this.root.style.backgroundColor = rgbToCss(this.theme.background);
+    this.root.style.backgroundColor = this.revealed
+      ? "transparent"
+      : rgbToCss(this.theme.background);
   }
 
   private assertLive(): void {
@@ -1435,15 +1434,6 @@ function observeHost(observer: ResizeObserver, host: HTMLElement): void {
   } catch {
     observer.observe(host);
   }
-}
-
-function rgbClear(color: Rgb): GPUColor {
-  return {
-    r: color[0] / 255,
-    g: color[1] / 255,
-    b: color[2] / 255,
-    a: 1,
-  };
 }
 
 function toError(error: unknown): Error {

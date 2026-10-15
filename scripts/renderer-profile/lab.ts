@@ -118,8 +118,8 @@ async function run() {
     surfaces.push(surface);
     const timing = { calls: 0, milliseconds: 0 };
     renderTiming.push(timing);
-    const render = surface.renderFrame.bind(surface);
-    surface.renderFrame = (...args) => {
+    const render = surface.prepareFrame.bind(surface);
+    surface.prepareFrame = (...args) => {
       const start = performance.now();
       try {
         return render(...args);

@@ -24,6 +24,7 @@ import type {
 } from "@terax/ghostty-core/protocol";
 import { CellFlags } from "@terax/ghostty-core/protocol";
 import { PromptPresentationGate } from "./core/PromptPresentationGate";
+import { ResizePromptHold } from "./core/ResizePromptHold";
 import {
   CELL_STRIDE,
   type Rgb,
@@ -130,6 +131,7 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
   private scrollPositionValue: ScrollPosition = { offset: 0, history: 0 };
   private scrollPositionCurrent = false;
   private readonly promptPresentation: PromptPresentationGate;
+  private readonly resizePromptHold: ResizePromptHold;
   private readonly synchronizedOutputPresentation: SynchronizedOutputPresentationGate;
   private colsValue: number;
   private rowsValue: number;
@@ -166,6 +168,9 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
       maxScrollbackBytes: this.scrollbackBytesLimit,
     });
     this.promptPresentation = new PromptPresentationGate(() =>
+      this.requestPresentation(),
+    );
+    this.resizePromptHold = new ResizePromptHold(() =>
       this.requestPresentation(),
     );
     this.synchronizedOutputPresentation =
@@ -233,6 +238,7 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
     this.assertLive();
     return (
       this.promptPresentation.suppressed ||
+      this.resizePromptHold.suppressed ||
       this.synchronizedOutputPresentation.suppressed
     );
   }
@@ -323,6 +329,9 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
     this.scrollPositionCurrent = false;
     this.invalidateRenderState();
     this.pendingDamage = FULL_DAMAGE;
+    // Ghostty just cleared a redrawable prompt; keep the previous frame until the shell
+    // prints it again (or the deadline), instead of presenting it blank.
+    this.resizePromptHold.resized(this.modesValue.alternateScreen);
     this.notifyDamage();
   }
 
@@ -841,6 +850,7 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
     this.blockMatch = null;
     this.packedViewport = new Uint8Array(0);
     this.promptPresentation.dispose();
+    this.resizePromptHold.dispose();
     this.synchronizedOutputPresentation.dispose();
     const callback = this.onDispose;
     this.onDispose = null;
@@ -1030,6 +1040,7 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
     const events = this.terminal.drainEvents();
     for (const event of events) {
       this.promptPresentation.observe(event);
+      this.resizePromptHold.observe(event);
       this.eventSink?.(event);
     }
   }
@@ -1042,6 +1053,7 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
   private notifyDamage(): void {
     if (
       this.promptPresentation.suppressed ||
+      this.resizePromptHold.suppressed ||
       this.synchronizedOutputPresentation.suppressed ||
       this.damageNotificationPending ||
       this.damageListeners.size === 0

@@ -12,11 +12,22 @@ import {
 import { GlyphAtlas } from "./GlyphAtlas";
 import type { RasterBudget } from "./GlyphMap";
 import {
-  type PreferredCanvasSize,
-  WebGpuCanvasPool,
-} from "@/modules/terminal/ghostty/gpu/WebGpuCanvasPool";
+  GcPressureMirror,
+  gcPressureOptionsFromStorage,
+  type GcPressureStats,
+} from "./GcPressure";
 import { BACKGROUND_SHADER, GLYPH_SHADER } from "./shaders";
 import type { TerminalFontMetrics } from "./terminalVisuals";
+import {
+  findTerminalArea,
+  type PaneBinding,
+  WebGpuWindowCanvas,
+  type WindowCanvasConfiguration,
+  type WindowCanvasPane,
+  type WindowCanvasStats,
+  type WindowFrameStart,
+  windowFrameNeeded,
+} from "./WebGpuWindowCanvas";
 
 const MAX_ATLAS_COUNT = 8;
 const MAX_WARM_UNUSED_ATLASES = 1;
@@ -39,13 +50,19 @@ export type WebGpuSharedResources = {
   readonly generation: number;
 };
 
-export interface WebGpuRuntimeSurface {
+export interface WebGpuRuntimeSurface extends WindowCanvasPane {
   handleWindowFocus?(focused: boolean): void;
-  renderFrame(
-    getEncoder: () => GPUCommandEncoder,
+  /**
+   * Uploads whatever changed since the last frame (cells, glyphs, uniform). True when the
+   * pane's pixels differ and a window frame must draw them. Encodes nothing: the window
+   * canvas draws every visible pane after all surfaces prepared.
+   */
+  prepareFrame(
     resources: WebGpuSharedResources,
     budget?: RasterBudget,
   ): boolean;
+  /** The pane's first frame reached the screen: its DOM background can step aside. */
+  handleCanvasRevealed?(): void;
   handleRuntimeReset(resources: WebGpuSharedResources): void;
   handleRuntimeError(error: Error): void;
   /** Pause or resume. Pausing stops rendering and timers and releases no GPU resource. */
@@ -76,8 +93,25 @@ export type GlyphAtlasLease = {
   release(): void;
 };
 
+export type WebGpuCanvasStats = {
+  /** Window canvases with at least one pane, and the ones kept for the next area. */
+  readonly active: number;
+  readonly idle: number;
+  readonly parked: number;
+  readonly colorBytes: number;
+  readonly created: number;
+  readonly reused: number;
+  readonly reconfigured: number;
+  readonly destroyed: number;
+  /** Backing-store allocations over all window canvases (a tab switch adds none). */
+  readonly backingStoreResizes: number;
+  readonly windowFrames: number;
+  readonly windows: readonly WindowCanvasStats[];
+};
+
 export type WebGpuRuntimeStats = {
-  readonly canvases: ReturnType<WebGpuCanvasPool["diagnostics"]>;
+  readonly canvases: WebGpuCanvasStats;
+  readonly gcMirror: GcPressureStats;
   readonly generation: number;
   readonly surfaceCount: number;
   readonly atlasCount: number;
@@ -140,12 +174,23 @@ class LatencyTracker {
 }
 
 export class WebGpuTerminalRuntime {
-  private readonly canvasPool = new WebGpuCanvasPool({
-    parkAfterMs: canvasParkDelayMs(),
-  });
+  /** One canvas per terminal area (a window has one); never destroyed while the runtime lives. */
+  private readonly windows = new Map<HTMLElement, WebGpuWindowCanvas>();
+  private readonly paneWindows = new Map<
+    WebGpuRuntimeSurface,
+    WebGpuWindowCanvas
+  >();
+  private windowsCreated = 0;
+  private windowsDestroyed = 0;
+  private windowsReused = 0;
+  private readonly gcMirror = new GcPressureMirror(
+    gcPressureOptionsFromStorage(),
+  );
   private readonly surfaces = new Set<WebGpuRuntimeSurface>();
   private dirtySurfaces = new Set<WebGpuRuntimeSurface>();
   private renderSurfaces = new Set<WebGpuRuntimeSurface>();
+  /** Panes whose rectangle changed this frame; they prepare whatever their pace. */
+  private readonly movedSurfaces = new Set<WebGpuRuntimeSurface>();
   private readonly atlases = new Map<string, AtlasEntry>();
   private device: GPUDevice | null = null;
   private format: GPUTextureFormat = "bgra8unorm";
@@ -204,26 +249,86 @@ export class WebGpuTerminalRuntime {
     }
   }
 
-  register(surface: WebGpuRuntimeSurface): void {
+  /**
+   * Registers a surface for frames. With a `host` the surface also joins the window canvas of
+   * the terminal area the host lives in and gets the binding through which it reports its
+   * layout and reads its rectangle.
+   */
+  register(
+    surface: WebGpuRuntimeSurface,
+    host?: HTMLElement,
+  ): PaneBinding | null {
     this.assertLive();
     this.assertHealthy();
+    let binding: PaneBinding | null = null;
+    if (host) binding = this.joinWindow(surface, host);
     this.surfaces.add(surface);
     surface.handleWindowFocus?.(this.windowFocused);
     const state = terminalWindowPresentation();
     surface.handleVisibilityChange(
       state.visible && !this.pendingRecoveryReason && !this.recovering,
     );
+    return binding;
   }
 
   unregister(surface: WebGpuRuntimeSurface): void {
     this.surfaces.delete(surface);
     this.dirtySurfaces.delete(surface);
     this.renderSurfaces.delete(surface);
+    const target = this.paneWindows.get(surface);
+    if (target) {
+      this.paneWindows.delete(surface);
+      target.removePane(surface);
+      // The panes left in the window must clear what the departed one drew.
+      this.scheduleWindow(target);
+    }
     if (this.dirtySurfaces.size === 0) this.cancelScheduledFrame();
   }
 
-  acquireCanvas(preferred?: PreferredCanvasSize | null) {
-    return this.canvasPool.acquire(this.resources(), preferred ?? undefined);
+  private joinWindow(
+    surface: WebGpuRuntimeSurface,
+    host: HTMLElement,
+  ): PaneBinding {
+    const area = findTerminalArea(host);
+    let target = this.windows.get(area);
+    if (!target) {
+      // An area that is gone (a remounted stack) hands its canvas over: the element is never
+      // destroyed, because WebKit would keep its swapchain.
+      for (const [oldArea, candidate] of this.windows) {
+        if (candidate.paneCount > 0 || oldArea.isConnected) continue;
+        this.windows.delete(oldArea);
+        target = candidate;
+        this.windowsReused += 1;
+        break;
+      }
+      if (!target) {
+        const created: WebGpuWindowCanvas = new WebGpuWindowCanvas(
+          this.canvasConfiguration(),
+          { requestFrame: () => this.scheduleWindow(created) },
+        );
+        this.windowsCreated += 1;
+        target = created;
+      }
+      this.windows.set(area, target);
+    }
+    target.reconfigure(this.canvasConfiguration());
+    target.mount(area);
+    this.paneWindows.set(surface, target);
+    return target.addPane(surface, host);
+  }
+
+  private scheduleWindow(target: WebGpuWindowCanvas): void {
+    const pane = target.firstPane() as WebGpuRuntimeSurface | undefined;
+    if (pane) this.schedule(pane);
+  }
+
+  private canvasConfiguration(): WindowCanvasConfiguration {
+    const resources = this.resources();
+    return {
+      device: resources.device,
+      format: resources.format,
+      generation: resources.generation,
+    };
   }
 
   interact(surface: WebGpuRuntimeSurface): void {
@@ -350,7 +455,8 @@ export class WebGpuTerminalRuntime {
       if (entry.references === 0) unusedAtlasCount += 1;
     }
     return {
-      canvases: this.canvasPool.diagnostics(),
+      canvases: this.canvasStats(),
+      gcMirror: this.gcMirror.diagnostics(),
       generation: this.generation,
       surfaceCount: this.surfaces.size,
       atlasCount: this.atlases.size,
@@ -392,6 +498,37 @@ export class WebGpuTerminalRuntime {
     };
   }
 
+  private canvasStats(): WebGpuCanvasStats {
+    const windows = [...this.windows.values()].map((target) =>
+      target.diagnostics(),
+    );
+    let colorBytes = 0;
+    let backingStoreResizes = 0;
+    let windowFrames = 0;
+    let reconfigured = 0;
+    let active = 0;
+    for (const stats of windows) {
+      colorBytes += stats.colorBytes;
+      backingStoreResizes += stats.reallocations;
+      windowFrames += stats.frames;
+      reconfigured += stats.reconfigured;
+      if (stats.panes > 0) active += 1;
+    }
+    return {
+      active,
+      idle: windows.length - active,
+      parked: 0,
+      colorBytes,
+      created: this.windowsCreated,
+      reused: this.windowsReused,
+      reconfigured,
+      destroyed: this.windowsDestroyed,
+      backingStoreResizes,
+      windowFrames,
+      windows,
+    };
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
@@ -405,13 +542,23 @@ export class WebGpuTerminalRuntime {
     this.surfaces.clear();
     for (const entry of this.atlases.values()) entry.atlas.dispose();
     this.atlases.clear();
-    this.canvasPool.dispose();
+    this.disposeWindows();
     this.releaseDevice();
+  }
+
+  /** Final teardown of the canvases: the runtime never presents again. */
+  private disposeWindows(): void {
+    for (const target of this.windows.values()) {
+      target.dispose();
+      this.windowsDestroyed += 1;
+    }
+    this.windows.clear();
+    this.paneWindows.clear();
   }
 
   /**
    * Occlusion and sleep pause: no frame is scheduled and surfaces cancel their timers, but every
-   * canvas, buffer and atlas texture stays exactly as it is (see WebGpuCanvasPool for why).
+   * canvas, buffer and atlas texture stays exactly as it is (see WebGpuWindowCanvas for why).
    */
   private readonly handleVisibility = ({
     visible,
@@ -427,6 +574,7 @@ export class WebGpuTerminalRuntime {
     }
     if (visible) {
       this.pacer.reset();
+      for (const target of this.windows.values()) target.markDirty();
       this.requestFrame();
     }
   };
@@ -508,21 +656,35 @@ export class WebGpuTerminalRuntime {
     this.renderSurfaces = batch;
     try {
       const resources = this.resources();
-      const frame: { encoder: GPUCommandEncoder | null } = { encoder: null };
-      const getEncoder = () =>
-        (frame.encoder ??= resources.device.createCommandEncoder({
-          label: "Terax terminal window frame",
-        }));
-      let rendered = false;
+      // Layout first: backing stores are committed and every pane's rectangle recomputed, so a
+      // pane that moved can prepare against its new rectangle in this very frame whatever its
+      // pace. Reads no DOM, except the occasional geometry check.
+      const starts = new Map<WebGpuWindowCanvas, WindowFrameStart>();
+      for (const target of this.windows.values()) {
+        if (target.paneCount === 0) continue;
+        target.verifyGeometry(frameAt);
+        const start = target.beginFrame();
+        starts.set(target, start);
+        for (const pane of start.moved) {
+          const surface = pane as WebGpuRuntimeSurface;
+          if (!this.surfaces.has(surface)) continue;
+          batch.add(surface);
+          this.movedSurfaces.add(surface);
+        }
+      }
+      const changed = new Set<WebGpuWindowCanvas>();
       let due = 0;
-      // Flushes happen before any surface encodes, so no draw in this frame
+      // Flushes happen before any surface prepares, so no upload in this frame
       // can read indices that a later flush would invalidate.
       this.applyAtlasFlushes();
       const budget = createRasterBudget(RASTER_BUDGET_MS);
 
       for (const surface of batch) {
         if (!this.surfaces.has(surface)) continue;
-        if (!this.pacer.due(surface, this.windowFocused, frameAt)) {
+        if (
+          !this.movedSurfaces.has(surface) &&
+          !this.pacer.due(surface, this.windowFocused, frameAt)
+        ) {
           this.dirtySurfaces.add(surface);
           continue;
         }
@@ -533,25 +695,53 @@ export class WebGpuTerminalRuntime {
             ? this.focusedLatency
             : this.backgroundLatency
           ).record(waited);
-        // Before drawing: a change the draw itself schedules (a glyph backlog) is a new wait.
+        // Before preparing: a change the upload itself schedules (a glyph backlog) is a new wait.
         this.pacer.settled(surface);
         try {
-          if (surface.renderFrame(getEncoder, resources, budget)) {
+          if (surface.prepareFrame(resources, budget)) {
             this.pacer.presented(surface, frameAt);
-            rendered = true;
+            const target = this.paneWindows.get(surface);
+            if (target) changed.add(target);
           }
         } catch (error) {
           surface.handleRuntimeError(toError(error));
         }
       }
+      this.movedSurfaces.clear();
 
       if (due === 0) this.idleAnimationFrames += 1;
+      // One command buffer for every window; a window with nothing new draws nothing and
+      // acquires no texture.
+      let encoder: GPUCommandEncoder | null = null;
+      let rendered = false;
+      const revealed: WebGpuRuntimeSurface[] = [];
+      for (const [target, start] of starts) {
+        if (
+          !windowFrameNeeded({
+            paneChanged: changed.has(target),
+            dirty: target.isDirty,
+            reallocated: start.reallocated,
+            moved: start.moved.length,
+            drawable: target.drawableCount(),
+          })
+        )
+          continue;
+        target.consumeDirty();
+        encoder ??= resources.device.createCommandEncoder({
+          label: "Terax terminal window frame",
+        });
+        const result = target.encode(encoder, resources);
+        if (result.drawn > 0) rendered = true;
+        for (const pane of result.revealed)
+          revealed.push(pane as WebGpuRuntimeSurface);
+      }
       let submitted = false;
-      if (frame.encoder && rendered) {
-        resources.device.queue.submit([frame.encoder.finish()]);
+      if (encoder && rendered) {
+        resources.device.queue.submit([encoder.finish()]);
         this.submittedFrames += 1;
         this.inFlightFrames += 1;
         submitted = true;
+        this.gcMirror.noteFrame();
         this.peakInFlightFrames = Math.max(
           this.peakInFlightFrames,
           this.inFlightFrames,
@@ -560,6 +750,7 @@ export class WebGpuTerminalRuntime {
         // which starts as soon as this one resolves. A burst therefore costs a wait per GPU round
         // trip instead of one per frame, and a frame is held back only while two are unconfirmed.
         if (this.pendingWaits === 0) this.confirmFrames();
+        if (revealed.length > 0) this.revealAfterPresent(revealed);
       }
       // Anything an atlas replaced this frame may still be named by commands
       // just submitted; without a submission nothing can reference it.
@@ -578,6 +769,20 @@ export class WebGpuTerminalRuntime {
       this.scheduleAtlasReap();
     }
     this.requestFrame();
+  }
+
+  /**
+   * A pane's DOM background hides the canvas until its first frame is on screen; the runtime
+   * lifts it once the GPU finished that frame, so tab switches never flash the card behind.
+   */
+  private revealAfterPresent(panes: readonly WebGpuRuntimeSurface[]): void {
+    const generation = this.generation;
+    void this.confirmFrames().then(() => {
+      if (this.disposed || generation !== this.generation) return;
+      for (const pane of panes) {
+        if (this.surfaces.has(pane)) pane.handleCanvasRevealed?.();
+      }
+    });
   }
 
   /**
@@ -695,6 +900,9 @@ export class WebGpuTerminalRuntime {
     this.assertLive();
     this.assertHealthy();
     initialized = true;
+    const configuration = this.canvasConfiguration();
+    for (const target of this.windows.values())
+      target.reconfigure(configuration);
   }
 
   private async createSharedResources(
@@ -896,13 +1104,14 @@ export class WebGpuTerminalRuntime {
     for (const entry of this.atlases.values()) entry.atlas.dispose();
     this.atlases.clear();
     // The runtime never presents again, so its canvases have no further use.
-    this.canvasPool.dispose();
+    this.disposeWindows();
     this.releaseDevice();
   }
 
   /**
-   * Drops the device. Canvases stay in the pool and are reconfigured for the next generation
-   * (`WebGpuCanvasPool`), because destroying a presented one would leave its swapchain behind.
+   * Drops the device. Window canvases stay in place and are reconfigured for the next
+   * generation (`WebGpuWindowCanvas.reconfigure`), because destroying a presented one would
+   * leave its swapchain behind.
    */
   private releaseDevice(): void {
     this.generation += 1;
@@ -974,26 +1183,6 @@ function fontAtlasKey(metrics: TerminalFontMetrics): string {
     metrics.deviceCellHeight,
     metrics.deviceBaseline,
   ].join("|");
-}
-
-/**
- * `localStorage["terax:terminal-canvas-park-ms"]` tunes how long an idle canvas keeps its size
- * before it is parked at 1x1 (`off` never parks); unset means the pool's default.
- */
-const CANVAS_PARK_STORAGE_KEY = "terax:terminal-canvas-park-ms";
-export function canvasParkDelayMs(): number | undefined {
-  try {
-    const value =
-      typeof window === "undefined"
-        ? null
-        : (window.localStorage?.getItem(CANVAS_PARK_STORAGE_KEY) ?? null);
-    if (value === null) return undefined;
-    if (value === "off") return Number.POSITIVE_INFINITY;
-    const delay = Number(value);
-    return Number.isFinite(delay) && delay >= 0 ? delay : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 /** A per-frame wall-clock allowance for glyph rasterization. */

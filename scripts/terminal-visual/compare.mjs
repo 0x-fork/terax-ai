@@ -2,6 +2,7 @@
 //   node compare.mjs diff <dir> <a> <b> [out.png]     per-pixel diff of two captures
 //   node compare.mjs png <dir> <name> [scale] [x y w h] export one capture (optionally cropped, upscaled)
 //   node compare.mjs crisp <dir> <name>               edge sharpness / fractional-edge statistics
+//   node compare.mjs grid <dir> <split> <single>      split-pane capture (grid.html) against one pane of the same size
 import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
@@ -135,7 +136,86 @@ if (command === "png") {
     }
   }
   console.log(JSON.stringify({ steps, multiPixelRamps: partial }));
+} else if (command === "grid") {
+  // Every pane's rectangle (its grid area when the rectangle's size differs from the reference's by
+  // a pixel of rounding) must equal the single-pane capture byte for byte; everything outside the
+  // panes' rectangles (dividers, gaps) must be the clear colour, so nothing bleeds across a
+  // scissor edge; panes and dividers must abut exactly.
+  const [splitName, singleName] = rest;
+  const split = load(splitName);
+  const single = load(singleName);
+  const reference = single.meta.panes[0];
+  const cellW = split.meta.cell.width;
+  const cellH = split.meta.cell.height;
+  const [cr, cg, cb] = split.meta.clear;
+  const covered = new Uint8Array(split.width * split.height);
+  const report = { panes: [], outsideNotClear: 0, abutting: [], referenceSize: `${reference.cols}x${reference.rows}` };
+  const referenceWidth = reference.cols * cellW;
+  const referenceHeight = reference.rows * cellH;
+  const same = (a, b, ax, ay, bx, by) =>
+    split.rgba[(ay * split.width + ax) * 4] === single.rgba[(by * single.width + bx) * 4] &&
+    split.rgba[(ay * split.width + ax) * 4 + 1] === single.rgba[(by * single.width + bx) * 4 + 1] &&
+    split.rgba[(ay * split.width + ax) * 4 + 2] === single.rgba[(by * single.width + bx) * 4 + 2];
+  for (const [index, pane] of split.meta.panes.entries()) {
+    const { x, y } = pane.viewport;
+    const width = pane.cols * cellW;
+    const height = pane.rows * cellH;
+    let differing = 0;
+    if (width !== referenceWidth || height !== referenceHeight) {
+      report.panes.push({ index, sizeMismatch: `${pane.cols}x${pane.rows}` });
+      continue;
+    }
+    // The grid area, and the whole rectangle (slack included: glyph overhang past the last
+    // column lands there) where it has the reference's size.
+    const full = pane.viewport.width === reference.viewport.width && pane.viewport.height === reference.viewport.height;
+    const compareWidth = full ? pane.viewport.width : width;
+    const compareHeight = full ? pane.viewport.height : height;
+    for (let row = 0; row < compareHeight; row += 1) {
+      for (let col = 0; col < compareWidth; col += 1) {
+        if (!same(0, 0, x + col, y + row, col, row)) differing += 1;
+      }
+    }
+    const v = pane.viewport;
+    const h = pane.host;
+    report.panes.push({
+      index,
+      rect: v,
+      grid: `${width}x${height}`,
+      compared: full ? "rectangle" : "grid area",
+      differingPixels: differing,
+      // The canvas rectangle is the DOM box, snapped the way the engine snaps it.
+      viewportIsHostBox: v.x === h.x && v.y === h.y && v.width === h.width && v.height === h.height,
+    });
+    for (let row = 0; row < v.height; row += 1) for (let col = 0; col < v.width; col += 1) covered[(v.y + row) * split.width + v.x + col] = 1;
+  }
+  for (let pixel = 0; pixel < split.width * split.height; pixel += 1) {
+    if (covered[pixel]) continue;
+    if (
+      split.rgba[pixel * 4] !== cr ||
+      split.rgba[pixel * 4 + 1] !== cg ||
+      split.rgba[pixel * 4 + 2] !== cb
+    )
+      report.outsideNotClear += 1;
+  }
+  // Panes and the dividers between them must meet edge to edge.
+  for (const divider of split.meta.dividers) {
+    const vertical = divider.height > divider.width;
+    const before = split.meta.panes
+      .map((p) => p.host)
+      .filter((h) => (vertical ? h.x + h.width === divider.x && h.y < divider.y + divider.height && h.y + h.height > divider.y : h.y + h.height === divider.y && h.x < divider.x + divider.width && h.x + h.width > divider.x));
+    const after = split.meta.panes
+      .map((p) => p.host)
+      .filter((h) => (vertical ? h.x === divider.x + divider.width && h.y < divider.y + divider.height && h.y + h.height > divider.y : h.y === divider.y + divider.height && h.x < divider.x + divider.width && h.x + h.width > divider.x));
+    report.abutting.push({ divider, before: before.length, after: after.length });
+  }
+  const bad =
+    report.panes.some((p) => p.sizeMismatch || p.differingPixels > 0 || p.viewportIsHostBox === false) ||
+    report.outsideNotClear > 0 ||
+    report.abutting.some((d) => d.before === 0 || d.after === 0);
+  console.log(JSON.stringify(report, null, 1));
+  console.log(bad ? "GRID CHECK FAILED" : "GRID CHECK PASSED");
+  process.exit(bad ? 1 : 0);
 } else {
-  console.error("usage: compare.mjs diff|png|crisp <dir> ...");
+  console.error("usage: compare.mjs diff|png|crisp|grid <dir> ...");
   process.exit(2);
 }

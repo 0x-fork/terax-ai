@@ -14,6 +14,12 @@ if (fakeRatio > 0) {
     get: () => fakeRatio,
     configurable: true,
   });
+  // The engine's device-pixel boxes belong to the real ratio, not the faked one: observe the
+  // content box only, so every size derives from the faked ratio.
+  const observe = ResizeObserver.prototype.observe;
+  ResizeObserver.prototype.observe = function (target, options) {
+    return observe.call(this, target, options?.box === "device-pixel-content-box" ? undefined : options);
+  };
 }
 // Lets a test change the ratio live, as dragging between displays would.
 (window as unknown as { __setDpr: (value: number) => void }).__setDpr = (value) => {
@@ -119,6 +125,9 @@ const number = (key: string, fallback: number) => {
   const value = Number(params.get(key));
   return params.has(key) && Number.isFinite(value) ? value : fallback;
 };
+const stageElement = document.querySelector("#stage") as HTMLElement;
+stageElement.style.setProperty("--area-width", `${number("aw", 1600)}px`);
+stageElement.style.setProperty("--area-height", `${number("ah", 1000)}px`);
 host.style.setProperty("--host-width", `${number("w", 1000)}px`);
 host.style.setProperty("--host-height", `${number("h", 640)}px`);
 host.style.setProperty("--host-left", `${number("left", 0)}px`);
@@ -333,7 +342,7 @@ await settle();
 
 type Capture = { width: number; height: number; rgba: Uint8Array };
 
-// Reads the canvas the surface presented in its most recent frame.
+// Reads the pane's part of the window canvas in the most recent frame.
 async function captureFrame(): Promise<Capture> {
   if (surfaceKind === "webgl") return captureWebGl();
   const wait = new Promise<GPUTexture>((resolve) => {
@@ -352,12 +361,23 @@ async function captureFrame(): Promise<Capture> {
   device.queue.submit([commands.finish()]);
   await buffer.mapAsync(GPUMapMode.READ);
   const source = new Uint8Array(buffer.getMappedRange());
-  const rgba = new Uint8Array(texture.width * texture.height * 4);
+  // The canvas is shared by every pane of the window: keep the pane's grid area only, which is
+  // what its own canvas held before the window canvas existed.
+  const stats = surface.diagnostics() as unknown as {
+    viewport: { x: number; y: number } | null;
+    cols: number;
+    rows: number;
+  };
+  const x0 = stats.viewport?.x ?? 0;
+  const y0 = stats.viewport?.y ?? 0;
+  const width = Math.min(texture.width - x0, stats.cols * metrics.deviceCellWidth);
+  const height = Math.min(texture.height - y0, stats.rows * metrics.deviceCellHeight);
+  const rgba = new Uint8Array(width * height * 4);
   const bgra = texture.format.startsWith("bgra");
-  for (let y = 0; y < texture.height; y += 1) {
-    for (let x = 0; x < texture.width; x += 1) {
-      const from = y * bytesPerRow + x * 4;
-      const to = (y * texture.width + x) * 4;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const from = (y0 + y) * bytesPerRow + (x0 + x) * 4;
+      const to = (y * width + x) * 4;
       rgba[to] = source[from + (bgra ? 2 : 0)];
       rgba[to + 1] = source[from + 1];
       rgba[to + 2] = source[from + (bgra ? 0 : 2)];
@@ -366,7 +386,7 @@ async function captureFrame(): Promise<Capture> {
   }
   buffer.unmap();
   buffer.destroy();
-  return { width: texture.width, height: texture.height, rgba };
+  return { width, height, rgba };
 }
 
 // Reads the WebGL renderer's last frame (top row first).
@@ -433,6 +453,24 @@ const api = {
   },
   diagnostics: () => surface.diagnostics(),
   /**
+   * Resizes the terminal area and the pane host together, like dragging the window edge, and
+   * fires the window `resize` event (a hidden browser pane delivers no ResizeObserver callbacks).
+   */
+  async resizeTo(width: number, height: number) {
+    stageElement.style.setProperty("--area-width", `${width + number("left", 0)}px`);
+    stageElement.style.setProperty("--area-height", `${height + number("top", 0)}px`);
+    host.style.setProperty("--host-width", `${width}px`);
+    host.style.setProperty("--host-height", `${height}px`);
+    window.dispatchEvent(new Event("resize"));
+    await frames(3);
+  },
+  /** What the native live-resize notification does on macOS. */
+  async gesture(active: boolean) {
+    const module = await import("@/modules/terminal/lib/terminalResizeGesture");
+    module.setNativeLiveResize(active);
+    await frames(2);
+  },
+  /**
    * `pattern=sprites` only: measures line continuity across cell boundaries and,
    * when the revision has the procedural glyph generator, compares the frame
    * with the one it predicts. Saves `<name>.check.json`.
@@ -495,7 +533,7 @@ if (autoCapture) {
 }
 
 // ?bench=spinner|rewrite|stream&ticks=N measures main-thread time per frame
-// by driving renderFrame directly (no scheduler), after a warm-up.
+// by driving prepareFrame and encode directly (no scheduler), after a warm-up.
 const benchKind = params.get("bench");
 if (benchKind) {
   const runtimeModule = await import("@/modules/terminal/ghostty/gpu/WebGpuTerminalRuntime");
@@ -526,7 +564,29 @@ if (benchKind) {
     if (benchKind === "rewrite") return dynamic(0);
     return dynamic(tick);
   };
-  const encoder = () => resources.device.createCommandEncoder();
+  // The window canvas is not involved: panes draw into an offscreen target of their own size.
+  const rect = (surface.diagnostics() as unknown as {
+    viewport: { x: number; y: number; width: number; height: number };
+  }).viewport;
+  const target = resources.device.createTexture({
+    size: [rect.x + rect.width, rect.y + rect.height],
+    format: resources.format,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+  const targetView = target.createView();
+  const drawPane = (): GPUCommandBuffer => {
+    const commands = resources.device.createCommandEncoder();
+    const pass = commands.beginRenderPass({
+      colorAttachments: [
+        { view: targetView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } },
+      ],
+    });
+    pass.setViewport(rect.x, rect.y, rect.width, rect.height, 0, 1);
+    pass.setScissorRect(rect.x, rect.y, rect.width, rect.height);
+    surface.encode(pass, resources);
+    pass.end();
+    return commands.finish();
+  };
   // performance.now() is coarsened to 0.1 ms, so time batches of ticks.
   const BATCH = 10;
   const tickTimes: number[] = [];
@@ -537,13 +597,8 @@ if (benchKind) {
     for (let index = 0; index < BATCH; index += 1) {
       const tick = batch * BATCH + index;
       write(content(tick));
-      let commands: GPUCommandEncoder | null = null;
-      const rendered = surface.renderFrame(
-        () => (commands ??= encoder()),
-        resources,
-      );
-      if (commands && rendered) {
-        resources.device.queue.submit([(commands as GPUCommandEncoder).finish()]);
+      if (surface.prepareFrame(resources)) {
+        resources.device.queue.submit([drawPane()]);
         if (measured) drawn += 1;
       }
     }

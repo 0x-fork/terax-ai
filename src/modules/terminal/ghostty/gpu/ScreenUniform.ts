@@ -18,6 +18,13 @@ export type ScreenUniformState = {
   readonly rows: number;
   readonly cellWidth: number;
   readonly cellHeight: number;
+  /** The pane's rectangle in the shared window canvas, whole device pixels. */
+  readonly viewport: {
+    readonly x: number;
+    readonly y: number;
+    readonly width: number;
+    readonly height: number;
+  };
   readonly textBlinkVisible: boolean;
   readonly searchActive: boolean;
   readonly cursor: CursorRect | null;
@@ -49,8 +56,10 @@ export class ScreenUniform {
     const uints = this.uints;
     const ints = this.ints;
     uints.fill(0);
-    floats[SCREEN_OFFSET.gridSize / 4] = state.cols * state.cellWidth;
-    floats[SCREEN_OFFSET.gridSize / 4 + 1] = state.rows * state.cellHeight;
+    floats[SCREEN_OFFSET.viewportSize / 4] = state.viewport.width;
+    floats[SCREEN_OFFSET.viewportSize / 4 + 1] = state.viewport.height;
+    uints[SCREEN_OFFSET.origin / 4] = state.viewport.x;
+    uints[SCREEN_OFFSET.origin / 4 + 1] = state.viewport.y;
     uints[SCREEN_OFFSET.cellSize / 4] = state.cellWidth;
     uints[SCREEN_OFFSET.cellSize / 4 + 1] = state.cellHeight;
     uints[SCREEN_OFFSET.dims / 4] = state.cols;

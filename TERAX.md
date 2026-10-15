@@ -39,49 +39,69 @@ high-water mark; nothing may retain a view into a disposed model's memory.
 Scrollback summed over all leaves is capped by a budget (192 MiB, scaled fairly
 between leaves, never pruning history already held). Presentation resources are
 shared, bounded, and released for hidden leaves.
-WebGPU canvases are leased from a shared pool rather than owned by persistent
-models. A presented WebGPU canvas is never destroyed, unconfigured, shrunk or
+All visible WebGPU panes of a window draw into one canvas that covers the
+terminal area (`gpu/WebGpuWindowCanvas.ts`; the `[data-terminal-area]` layer of
+`TerminalStack`, behind the tab layers). Each pane renders into its device-pixel
+snapped rectangle (`gpu/PaneRects.ts`, measured on layout changes only) with
+`setViewport` and `setScissorRect`, which keeps glyph overhang out of the
+neighbour; the shader takes viewport size and origin from the uniform, so a
+pane's pixels equal what a canvas of its own showed (verified byte for byte,
+`scripts/terminal-visual/grid.html`). Canvas textures are not preserved between
+frames, so a window frame clears the canvas and encodes every visible pane in one
+pass (cell buffers stay resident on the GPU, no per-cell work). Per-pane dirty
+tracking still decides whether a frame is needed: an unchanged window acquires
+no texture (`windowFrameNeeded`). `SurfaceFramePacer` decides which panes prepare
+in a frame; a pane whose rectangle moved always does. Pane DOM is transparent
+once the canvas has shown the pane's first frame (until then it paints the theme
+colour, so a tab switch never flashes the card behind); scrollbars, selection,
+IME, block overlays and cursor styles stay per-pane DOM above the canvas.
+A presented WebGPU canvas is never destroyed, unconfigured, shrunk or
 dropped while the runtime lives: WebKit (macOS 26) keeps the swapchain of such a
 canvas in the WebContent process for good (three buffers, about 30 MiB for a
-2000x1300 canvas, whatever the teardown order and garbage collection), so every
-teardown leaks. A hidden pane returns its canvas to the pool still configured
-and sized; the next visible pane takes the idle canvas whose backing size
-already fits (`CanvasBackingStore.surplusFor`, zero reallocation), else the
-closest one. A canvas is created only when none is idle, so the pool never holds
-more than the peak number of simultaneously visible panes. Idle canvases keep
-their size for ten seconds (`localStorage["terax:terminal-canvas-park-ms"]`,
-`off` disables), then park at 1x1 while staying configured; a shrink and regrow
-is a transient (+2.3 MiB while cycling, returned once quiet), unlike a destroy.
-Parking exists because tab switches can show the incoming panes before the
-outgoing ones release (React runs effects in tree order), which briefly holds
-one canvas more than is visible. A replaced or recovered GPU device
-reconfigures the same elements (`lease.reconfigure`, measured flat). Only
-disposing the runtime itself tears canvases down. Reused targets stay hidden
-until the new owner's frame is encoded. Nearby backing sizes reuse storage; the
-canvas is always styled backing/ratio and drawn through an exact viewport, so
-text is never scaled.
-Resizing keeps the model and the PTY in step and the backing store still.
+2000x1300 canvas, whatever the teardown order and garbage collection), and keeps
+every swapchain a resizing canvas retires until JavaScriptCore collects its
+wrappers (minutes), so every teardown or resize leaks. A tab switch, a split or a
+divider drag therefore only changes viewports: zero canvas allocations. The
+canvas is reallocated only when the terminal area itself changes size, at most
+twice per window drag (below). With no visible pane (an editor tab is active) or
+an occluded window it is paused (hidden after a short delay when empty), never released. A replaced or
+recovered GPU device reconfigures the same element, and a remounted area takes
+over the old one's canvas. Only disposing the runtime tears it down. The WebGL
+fallback stays per pane (its own canvas and opaque background inside the pane
+root): a WebGPU failure in one pane falls that pane back, and a failure of the
+shared runtime falls every pane back.
+Every submitted window frame is mirrored to JavaScriptCore (`gpu/GcPressure.ts`):
+the wrappers of a frame (texture, view, encoder, pass, command buffer) pin about
+13 KiB of WebKit malloc that JavaScriptCore does not count, so without help it
+collects them after minutes (20 MiB a minute for a streaming agent). Allocating and
+dropping a 126 KiB `ArrayBuffer` per frame (ten times the native cost; measured:
+unfinalized canvas textures after 120 s 2,626 without, 195 with it, no change in
+instructions per second) makes young-generation collections run steadily.
+Resizing keeps the model and the PTY in step.
 `TerminalResizeSync` resizes the Ghostty model and tells the PTY (SIGWINCH) in
 one synchronous call, model first, and rate limits that call to once per 100 ms
 while the host keeps changing (first change at once, then every interval, then
 the last one within an interval; `lib/resizeThrottle.ts`). Ghostty clears the
 prompt on every model resize and relies on the shell's SIGWINCH redraw, so the
 two must never drift apart; there is no second PTY debounce, and a size the
-shell never heard about is never applied. Between applications the surface keeps
-its last grid and frame and the host clips or pads it. A resize gesture (a pane
-divider via `terminalResizeInteraction`, the native macOS live resize
+shell never heard about is never applied. A resize at a shell prompt holds the
+pane's presentation (it keeps drawing its previous frame) until the shell's
+redraw ends or 70 ms pass (`core/ResizePromptHold.ts`, driven by the OSC 133
+events; only at a prompt, never in the alternate screen), so the prompt does not
+flash blank. Between applications the pane keeps its last grid and frame inside
+its already updated rectangle. A resize gesture (the native macOS live resize
 `NSWindowWillStart/DidEndLiveResize` forwarded as `liveResize` in
-`terax:window-presentation`, or a burst of host size changes from one surface
-less than 150 ms apart, `lib/terminalResizeGesture.ts`) makes the backing store
-grow-only: it keeps its allocation while the pane shrinks, and when the pane
-outgrows it, allocates once, on both axes, to the largest size the pane can reach
-(`gpu/GestureBacking.ts`: host plus the screen room the window has left when the
-window itself is being dragged, else the terminal area; capped by the device limit).
-When the gesture ends the held size lands at once and the backing
-compacts to the nearby size, so a drag costs at most one growth and one
-compaction. WebKit keeps every swapchain a resizing canvas retires until the
-drag ends, so reallocating per step multiplied the footprint by the number of
-steps. The WebGL canvas follows the same rules.
+`terax:window-presentation`, or a burst of size changes of the terminal area
+less than 150 ms apart, `lib/terminalResizeGesture.ts`; a pane divider drag via
+`terminalResizeInteraction` also keeps pane buffers compact-on-end but never
+touches the canvas) makes the window canvas's backing store grow-only: it keeps
+its allocation while the area shrinks, and when the area outgrows it, allocates
+once, on both axes, to the largest size it can reach (`gpu/GestureBacking.ts`:
+the area plus the screen room the window has left when the window itself is being
+dragged, else the window; capped by the device limit). When the gesture ends the
+held grids land at once and the backing compacts to the nearby size, so a drag
+costs at most one growth and one compaction. The WebGL canvas follows the same
+rules per pane.
 
 The WebGPU path (renderer v2, `docs/architecture/terminal-renderer-v2.md`) runs
 no per-cell JavaScript. Ghostty encodes 16-byte cell records natively and
@@ -97,8 +117,9 @@ while something is highlighted, so none of them rewrites cell records.
 Geometry is pixel exact. Fonts are measured at size times ratio and cells are
 whole device pixels (`TerminalFontMetrics.deviceCell*`). `cellWidth` and
 `cellHeight` are the CSS size, device divided by ratio, and are what fit,
-hit-testing, selection, links and block overlays use. The backing store holds at
-least cols by rows device cells (exactly that outside drags; slack is clipped) and the canvas origin is translated onto the device
+hit-testing, selection, links and block overlays use. A pane's rectangle in the
+window canvas holds at least cols by rows device cells (slack is background, the
+scissor clips the rest) and the canvas origin is translated onto the device
 pixel grid when the observer, ratio or window size changes. A ratio change
 re-measures the font and rebuilds atlas and buffers.
 Each terminal maps Ghostty glyph ids to a glyph atlas shared per font and ratio.
@@ -248,14 +269,14 @@ excludes WebContent and GPU processes and is not total application memory.
 
 Ghostty presentation uses shared native macOS occlusion/sleep and DOM visibility
 tracking. Every renderer pauses immediately. The WebGPU renderer does nothing
-more: frames and timers stop, while canvases (configured, at full size), cell
+more: frames and timers stop, while the window canvas (configured, at full size), cell
 buffers, glyph maps and atlas textures stay resident, so coming back from a
 Space switch, minimize or sleep costs one redraw and no allocation. Releasing
-them is worse than keeping them (see the canvas pool above). The WebGL fallback
+them is worse than keeping them (see the window canvas above). The WebGL fallback
 still reclaims its renderer after two seconds of continuous occlusion, and at
 once on sleep, because its dropped canvases are garbage collected (measured:
-transient, no growth). Hidden tabs release their leases immediately (a WebGPU
-canvas goes back to the pool). Per-pane pacing prevents focused output from
+transient, no growth). Hidden tabs release their buffers and atlas lease immediately and
+leave the window canvas (its size is kept). Per-pane pacing prevents focused output from
 raising background pane cadence. Panes that are neither focused nor being
 interacted with snap to one shared tick (30 Hz, 15 Hz in an unfocused window):
 a pane that turns dirty waits for the end of its tick and presents with every
@@ -387,6 +408,7 @@ BYOK. Cloud providers via `@ai-sdk/*`: **OpenAI, Anthropic, Google, xAI, Cerebra
 - **Tailwind v4** - no `tailwind.config.*`, config is in `src/App.css` via `@theme`. Use `cn()` from `@/lib/utils`.
 - Animation: `motion` (Framer Motion successor). Resizable layout: `react-resizable-panels`.
 - **Animation cost**: nothing animates forever at display rate. Tailwind `animate-spin`/`animate-pulse` are redefined in `globals.css` with `steps()` (12 and ~4 fps), the text shimmer uses 40 steps per sweep, recording indicators use `.terax-blink`, a pending tool approval uses the finite `.terax-attention-pulse`, and persisted history (`bash_background`) never animates. `modules/theme/windowActivity.ts` sets `html[data-window-inactive]` while the window is unfocused, hidden or occluded (DOM focus, document visibility and the terminal's shared native presentation feed, no extra native listener); that attribute pauses every CSS animation and an animated background image freezes on a still frame (`surfaceFrame.ts`). `prefers-reduced-motion` still removes the rest.
+- **Compositing budget**: every composited layer costs a backing store, and WebKit allocates a new one per window-resize step for each layer that follows the window. At rest the shell has three layers with contents (page tile, terminal canvas, the terminal's hidden textarea); everything else is clip layers without backing. Do not add `will-change`, 3D transforms (`translateZ`, `transform-gpu`), `backdrop-filter`/`backdrop-blur` or blur filters to anything mounted by default; popovers, HUDs and chips use an opaque `bg-popover`/`bg-card` instead of a translucent blurred one. Only the allowlist in `src/styles/compositingBudget.test.ts` (modal scrims, the background-image overlay, ...) may, each with a reason. A static background image gets no layer (`surfaceOwnsLayer`). While a window drag is live, `html[data-live-resize]` (`modules/theme/livePageResize`, macOS only) gives the document an invisible size rounded up to 512 px so WebKit keeps one page tile size across the drag instead of one per step (`docs/architecture/app-lab.md`, "Compositing layers").
 - **Startup graph**: neither window may preload the AI SDK, zod, Streamdown, CodeMirror or the icon set. `vite.config.ts` splits chunks with two prioritised `codeSplitting` groups (eager `react`/`radix`/`ghostty-vt` outrank lazy features, because a lazy chunk's recursive dependency capture once swallowed React's CJS entry and made the eager `react` chunk import every AI provider). `src/app/dist-budget.test.ts` builds into a temp dir with sourcemaps and fails if any forbidden package or chunk is reachable from `index.html`/`settings.html`; `pnpm check:dist` runs the same check on `dist/`. `eager-budget.test.ts` keeps the source-graph check.
 - **Long AI chats**: messages older than the newest two get `content-visibility: auto` with an estimated `contain-intrinsic-size` (`messageHeightEstimate.ts`), so layout and paint cost tracks what is near the viewport.
 - **Window vibrancy**: the `windowVibrancy` pref drives `WindowVibrancyBridge` (main window only - `window_set_backdrop` targets its caller). `html[data-vibrancy="on"]` (off by default; an explicitly stored choice always wins) makes `<html>`/`<body>` transparent and redefines `--frame` with alpha, so only the chrome frosts; panes keep `--background` so terminal text stays on a solid surface and the terminal canvas still matches its container. The opaque colour the pre-paint script parks on `<html>` would cover the backdrop, so `applyVibrancy` clears it while the effect is on; there is deliberately no localStorage fast path, since pre-declaring the effect would show a see-through window on any launch where the native call has not landed yet. Repeat applications are deduped, and only Mica is rebuilt on a light/dark flip (NSVisualEffectView adapts on its own).
