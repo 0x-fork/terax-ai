@@ -74,8 +74,10 @@ class ScenarioRun {
       if (this.scenario.name !== "occlusion" || !phase.endsWith("-hidden"))
         await this.ensureFront();
       const app = this.app();
+      const layers = await this.layerTree(phase);
       const { retry } = await reportPhase(this.reportUrl, phase, {
         ...extra,
+        ...(layers ? { layers } : {}),
         attempt,
         refronted: this.refronted,
         diag: collectDiagnostics(app.tabs, app.activeId),
@@ -84,6 +86,32 @@ class ScenarioRun {
       this.refronted += 1;
       await this.native({ cmd: "activate" });
       await pause(1000);
+    }
+  }
+
+  /**
+   * The web view's composited layer tree (UI-process mirror of WebKit's layers; see
+   * `bench_window layers`). The full list is kept at rest, only the counts elsewhere.
+   */
+  async layerTree(phase: string): Promise<Record<string, unknown> | null> {
+    const full = /^(baseline|setup-complete|measure-start)$/.test(phase);
+    const brief = /^(shrink-1|grow-1|resize-settled)$/.test(phase);
+    if (!full && !brief) return null;
+    try {
+      const tree = await this.native({ cmd: "layers" });
+      // The document must never scroll (a drag-time overflow strip is not interactive).
+      const root = document.scrollingElement;
+      const page = {
+        scroll: [window.scrollX, window.scrollY],
+        scrollSize: [root?.scrollWidth ?? 0, root?.scrollHeight ?? 0],
+        viewport: [window.innerWidth, window.innerHeight],
+        liveResize: document.documentElement.hasAttribute("data-live-resize"),
+      };
+      if (full) return { ...tree, page };
+      const { layers: _list, ...counts } = tree;
+      return { ...counts, page };
+    } catch {
+      return null;
     }
   }
 
@@ -344,6 +372,7 @@ async function resizeScenario(run: ScenarioRun): Promise<void> {
       count: steps,
       intervalMs,
       live,
+      layersMid: cycle === 1,
     });
     await run.sync(`shrink-${cycle}`, {
       cycle,

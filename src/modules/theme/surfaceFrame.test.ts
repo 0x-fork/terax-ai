@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { surfaceFrame } from "./surfaceFrame";
+import { surfaceFrame, surfaceOwnsLayer } from "./surfaceFrame";
 
 const base = {
   animated: true,
@@ -54,5 +54,32 @@ describe("surfaceFrame", () => {
     expect(surfaceFrame({ ...base, inactive: true, hasStill: false })).toBe(
       "live",
     );
+  });
+});
+
+describe("surfaceOwnsLayer", () => {
+  it("gives a static, unblurred image no layer of its own", () => {
+    expect(
+      surfaceOwnsLayer({ animated: false, blurActive: false, frame: "live" }),
+    ).toBe(false);
+  });
+
+  it("composites the blur filter, not the resize that suspends it", () => {
+    expect(
+      surfaceOwnsLayer({ animated: false, blurActive: true, frame: "live" }),
+    ).toBe(true);
+    expect(
+      surfaceOwnsLayer({ animated: false, blurActive: false, frame: "live" }),
+    ).toBe(false);
+  });
+
+  it("composites animated frames except while they are hidden", () => {
+    for (const frame of ["live", "still"] as const)
+      expect(
+        surfaceOwnsLayer({ animated: true, blurActive: false, frame }),
+      ).toBe(true);
+    expect(
+      surfaceOwnsLayer({ animated: true, blurActive: false, frame: "hidden" }),
+    ).toBe(false);
   });
 });

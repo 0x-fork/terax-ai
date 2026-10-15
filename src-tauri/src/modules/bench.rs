@@ -91,6 +91,9 @@ pub enum WindowAction {
         interval_ms: f64,
         #[serde(default = "yes")]
         live: bool,
+        /// Also capture the layer tree in the middle of the drag (see `Layers`).
+        #[serde(default)]
+        layers_mid: bool,
     },
     Hide {
         #[serde(default = "order_out")]
@@ -108,6 +111,10 @@ pub enum WindowAction {
     },
     /// WebKit's own full-GC request for the web processes of this pool.
     Gc,
+    /// The web view's Core Animation layer tree in this (UI) process. WebKit mirrors the web
+    /// process's composited layers one to one as `CALayer`s here, so counting them (and their
+    /// sizes, contents, masks and clips) shows what the page's CSS made composited.
+    Layers,
 }
 
 fn yes() -> bool {
@@ -195,14 +202,19 @@ mod platform {
                 count,
                 interval_ms,
                 live,
+                layers_mid,
             } => {
                 let started = Instant::now();
+                let mut mid = Value::Null;
                 let live_state = if live {
                     live_resize(&window, true).await?
                 } else {
                     Value::Null
                 };
-                for _ in 0..count {
+                for step in 0..count {
+                    if layers_mid && step == count / 2 {
+                        mid = layers(&window).await?;
+                    }
                     tokio::time::sleep(Duration::from_secs_f64(interval_ms.max(0.0) / 1000.0))
                         .await;
                     main(&app, move |app| {
@@ -222,6 +234,7 @@ mod platform {
                     "ms": started.elapsed().as_secs_f64() * 1000.0,
                     "live": live_state,
                     "liveEnd": live_end,
+                    "layersMid": mid,
                 }))
             }
             WindowAction::Hide { mode } => {
@@ -284,6 +297,7 @@ mod platform {
                 Ok(json!({"ok": true}))
             }
             WindowAction::Gc => gc(&window).await,
+            WindowAction::Layers => layers(&window).await,
         }
     }
 
@@ -440,6 +454,117 @@ mod platform {
         rx.await.map_err(|error| format!("snapshot: {error}"))
     }
 
+    /// One mirrored layer, depth first. Only what decides memory and compositing cost.
+    fn describe_layers(
+        layer: &AnyObject,
+        depth: u32,
+        out: &mut Vec<Value>,
+        totals: &mut LayerTotals,
+    ) {
+        let bounds: NSRect = unsafe { msg_send![layer, bounds] };
+        let scale: f64 = unsafe { msg_send![layer, contentsScale] };
+        let contents: Option<Retained<AnyObject>> = unsafe { msg_send![layer, contents] };
+        let hidden: bool = unsafe { msg_send![layer, isHidden] };
+        let opacity: f32 = unsafe { msg_send![layer, opacity] };
+        let clips: bool = unsafe { msg_send![layer, masksToBounds] };
+        let radius: f64 = unsafe { msg_send![layer, cornerRadius] };
+        let mask: Option<Retained<AnyObject>> = unsafe { msg_send![layer, mask] };
+        let name: Option<Retained<AnyObject>> = unsafe { msg_send![layer, name] };
+        let name = name
+            .map(|name| {
+                let text: *const std::ffi::c_char = unsafe { msg_send![&*name, UTF8String] };
+                if text.is_null() {
+                    String::new()
+                } else {
+                    unsafe { std::ffi::CStr::from_ptr(text) }
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            })
+            .unwrap_or_default();
+        let class = layer.class().name().to_string_lossy().into_owned();
+        let pixels = if contents.is_some() && !hidden {
+            bounds.size.width * bounds.size.height * scale * scale
+        } else {
+            0.0
+        };
+        totals.count += 1;
+        if contents.is_some() {
+            totals.with_contents += 1;
+            totals.backing_pixels += pixels;
+        }
+        if mask.is_some() {
+            totals.masks += 1;
+        }
+        if clips {
+            totals.clips += 1;
+        }
+        if hidden {
+            totals.hidden += 1;
+        }
+        // Backing stores are 4 bytes a pixel (BGRA, or 8 for wide colour).
+        if out.len() < 600 {
+            out.push(json!({
+                "depth": depth,
+                "class": class,
+                "name": name,
+                "size": [bounds.size.width.round(), bounds.size.height.round()],
+                "scale": scale,
+                "contents": contents.is_some(),
+                "hidden": hidden,
+                "opacity": opacity,
+                "clips": clips,
+                "radius": radius,
+                "mask": mask.is_some(),
+                "backingMiB": (pixels * 4.0 / 1_048_576.0 * 1000.0).round() / 1000.0,
+            }));
+        }
+        let subs: Option<Retained<AnyObject>> = unsafe { msg_send![layer, sublayers] };
+        if let Some(subs) = subs {
+            let count: usize = unsafe { msg_send![&*subs, count] };
+            for index in 0..count {
+                let child: Retained<AnyObject> =
+                    unsafe { msg_send![&*subs, objectAtIndex: index] };
+                describe_layers(&child, depth + 1, out, totals);
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct LayerTotals {
+        count: u32,
+        with_contents: u32,
+        masks: u32,
+        clips: u32,
+        hidden: u32,
+        backing_pixels: f64,
+    }
+
+    async fn layers(window: &WebviewWindow) -> Result<Value, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        window
+            .with_webview(move |platform| {
+                let web = unsafe { &*platform.inner().cast::<AnyObject>() };
+                let root: Option<Retained<AnyObject>> = unsafe { msg_send![web, layer] };
+                let mut list = Vec::new();
+                let mut totals = LayerTotals::default();
+                if let Some(root) = root {
+                    describe_layers(&root, 0, &mut list, &mut totals);
+                }
+                let _ = tx.send(json!({
+                    "count": totals.count,
+                    "withContents": totals.with_contents,
+                    "masks": totals.masks,
+                    "clips": totals.clips,
+                    "hidden": totals.hidden,
+                    "backingMiB": (totals.backing_pixels * 4.0 / 1_048_576.0 * 10.0).round() / 10.0,
+                    "layers": list,
+                }));
+            })
+            .map_err(|error| format!("with_webview: {error}"))?;
+        rx.await.map_err(|error| format!("layers: {error}"))
+    }
+
     async fn gc(window: &WebviewWindow) -> Result<Value, String> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         window
@@ -513,7 +638,8 @@ mod tests {
                 dh: 0.0,
                 count: 10,
                 interval_ms: 16.0,
-                live: true
+                live: true,
+                layers_mid: false
             }
         );
         let hide: WindowAction = serde_json::from_value(json!({"cmd": "hide"})).unwrap();

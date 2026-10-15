@@ -1,4 +1,5 @@
 export { ThemeProvider, useTheme, type Theme } from "./ThemeProvider";
+export { LivePageResizeBridge } from "./LivePageResizeBridge";
 export { WindowVibrancyBridge } from "./WindowVibrancyBridge";
 export {
   useWindowInactive,

@@ -30,6 +30,23 @@ export function surfaceFrame(input: {
 }
 
 /**
+ * Whether the background overlay needs a compositing layer of its own.
+ *
+ * A layer costs a window-sized backing store (several, while the window
+ * resizes: WebKit allocates a new one at every step), so it is only worth it
+ * when something would otherwise repaint the page tiles: the blur filter or an
+ * animated image's frames. A static image without blur paints into the page
+ * once and never changes. Nothing is shown while an animated image is hidden.
+ */
+export function surfaceOwnsLayer(input: {
+  animated: boolean;
+  blurActive: boolean;
+  frame: SurfaceFrame;
+}): boolean {
+  return input.animated ? input.frame !== "hidden" : input.blurActive;
+}
+
+/**
  * Renders the first frame of an (animated) image to a PNG blob, or null when
  * the platform cannot decode it. `createImageBitmap` yields the first frame
  * of GIF / APNG / animated WebP.

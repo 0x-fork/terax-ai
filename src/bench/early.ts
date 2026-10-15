@@ -33,12 +33,30 @@ export async function installBenchEarly(): Promise<BenchConfig | null> {
   } catch (error) {
     console.error("[bench] localStorage unavailable:", error);
   }
+  injectExperimentCss();
   if (config.reportUrl) forwardPageErrors(config.reportUrl);
   if (config.scenario?.instrument) installGpuCounters();
   (
     window as unknown as { __teraxBenchConfig?: BenchConfig }
   ).__teraxBenchConfig = config;
   return config;
+}
+
+/**
+ * `--toggle css=<rules>` appends a stylesheet before the first paint, so a compositing
+ * experiment (`will-change`, `contain`, a different clip) needs no rebuild.
+ */
+function injectExperimentCss(): void {
+  try {
+    const css = window.localStorage.getItem(`${BENCH_FLAG_PREFIX}css`);
+    if (!css) return;
+    const style = document.createElement("style");
+    style.dataset.benchExperiment = "";
+    style.textContent = css;
+    document.head.append(style);
+  } catch {
+    // Storage or head unavailable: run the scenario unmodified.
+  }
 }
 
 /** Uncaught errors and console.error reach the orchestrator, so a dead page is not a silent hang. */

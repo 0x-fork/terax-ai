@@ -6,6 +6,7 @@ import {
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { consumeLaunchFiles, getLaunchDir } from "@/lib/launchDir";
+import { IS_MAC } from "@/lib/platform";
 import { quoteShellArg } from "@/lib/shellQuote";
 import { usePresence } from "@/lib/usePresence";
 import { useZoom } from "@/lib/useZoom";
@@ -102,6 +103,7 @@ import type { TerminalSearchController } from "@/modules/terminal/search/Termina
 import { bindTerminalWindowFocus } from "@/modules/terminal/ghostty/renderScheduling";
 import { subscribeWindowPresentation } from "@/modules/terminal/ghostty/windowPresentation";
 import {
+  LivePageResizeBridge,
   ThemeProvider,
   useThemeFileEditing,
   WindowActivityBridge,
@@ -1576,6 +1578,7 @@ export default function App() {
           )}
 
           <WindowVibrancyBridge />
+          {IS_MAC ? <LivePageResizeBridge /> : null}
           <WindowActivityBridge
             bindFocus={bindTerminalWindowFocus}
             subscribePresentation={subscribeWindowPresentation}

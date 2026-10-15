@@ -224,6 +224,48 @@ and WebKit itself. `performance.memory` does not exist in WebKit, so the JS heap
 cannot be read from the page.
 
 
+## Compositing layers (HEAD `561d820`)
+
+`bench_window layers` walks the web view's Core Animation tree in the UI process. WebKit mirrors
+the page's composited layers one to one there, with their debug names, sizes, clips, masks and
+whether they hold contents; the driver attaches it to `setup-complete` / `baseline` /
+`measure-start` (full list) and to `shrink-1`, `grow-1`, `resize-settled` (counts), and
+`resizeSteps` can capture it in the middle of a drag (`layersMid`, first shrink). `--toggle
+css=<rules>` injects a stylesheet before first paint, so a compositing experiment needs no rebuild.
+Reports: `resource-evidence-2026-10-15/layers-*.json` (`layers-exp-*` are the experiments).
+
+At rest (idle shell, 1280x820 @2x) the shell is 33 to 37 layers, **3 with contents**: the page
+tile (16.8 MiB per buffer, six 512 px tiles at rest), the terminal's hidden `<textarea>` (12x11,
+a composited scroll container) and the WebGPU canvas. The rest are clip layers without a backing
+store (the rounded `.terax-pane` is one `contents clipping` layer, radius 13). The 48 MiB of
+WebContent IOSurface at rest is the page tile held in about three buffers plus the canvas
+swapchain, not a dozen layers. No `will-change`, 3D transform, backdrop-filter or filter exists in
+the default state; removing the pane's rounded clip changed neither footprint nor WindowServer/GPU
+CPU (`layers-exp-pane-no-clip-resize`, `layers-exp-agents-steady-*`), so it stays.
+
+During a live resize WebKit collapses the page into **one tile of exactly the viewport size**
+(`tile at 0,0 [1044,702]`) and allocates a new viewport-sized IOSurface at every step (11 to 17
+MiB); they are volatile only after the drag. That is the empty page's 420 MiB: with `#root`
+hidden the app peaks at 493 MiB total (`layers-exp-root-hidden-resize`), hiding the canvas changes
+nothing. The page-side lever is the tile size: while `html[data-live-resize]` is set (resize
+events less than 250 ms apart, macOS only) `body::after` gives the document an invisible size
+rounded up to 512 px, WebKit then keeps one 1536x1024 tile across the drag and reuses its buffers.
+Static variants (`layers-exp-ghost-static-*`): 512 px peaked lowest, 128/256 px less, a fixed
+3000x2000 worse (the tile becomes the whole 96 MiB document), so the quantum is 512 and it is
+gesture-scoped (a static one costs +8 MiB per buffer at rest). The document never scrolls
+(`page.scroll` stays `[0,0]` in the reports).
+
+| `resize`, 3 cycles of 120 steps, 3 runs each | base | with live-resize tile quantum |
+| --- | --- | --- |
+| peak total (1 s timeline), MiB | 856, 907, 818 | 718, 601, 620 |
+| peak WebContent, MiB | 656, 719, 623 | 503, 413, 420 |
+| at rest (baseline sample), total MiB | 253, 270, 267 | 266, 266, 265 |
+| `idle` total / WC IOSurface / wakeups per s | 198.5 / 47.9 / 268 | 197.2 / 47.9 / 263 |
+| `tabs` 20 switches, baseline to last switch | +54.5 | +55.3 |
+
+What remains of the drag peak is the terminal canvas growing in the grow half (about +120 MiB per
+cycle in both builds) and the WebKit floor.
+
 ## Limits
 
 macOS only, one display (2048x1152 points at 100 Hz here), fresh profile with default

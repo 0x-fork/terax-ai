@@ -5,7 +5,11 @@ import {
 import { BG_OPACITY_RENDER_FACTOR } from "@/modules/settings/store";
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { renderStillFrame, surfaceFrame } from "./surfaceFrame";
+import {
+  renderStillFrame,
+  surfaceFrame,
+  surfaceOwnsLayer,
+} from "./surfaceFrame";
 import { useWindowInactive } from "./WindowActivityBridge";
 
 const OVERLAY_Z = 2147483646;
@@ -111,7 +115,11 @@ function BackgroundImage({ fastImageId }: { fastImageId: string | null }) {
         backgroundPosition: "center",
         opacity: renderedOpacity,
         filter: blurActive ? `blur(${blur}px)` : undefined,
-        transform: "translateZ(0)",
+        // Own layer only when the blur or the animation needs one (see
+        // `surfaceOwnsLayer`); a static image paints into the page.
+        transform: surfaceOwnsLayer({ animated, blurActive, frame })
+          ? "translateZ(0)"
+          : undefined,
         transition: `opacity ${FADE_IN_MS}ms ease-out`,
       }}
     />,

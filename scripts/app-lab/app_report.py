@@ -499,9 +499,13 @@ def compute_metrics(report: dict) -> dict[str, float]:
     last_event = samples[-1]["event"] if samples else {}
     diag = last_event.get("diag") or {}
     pool = (diag.get("ghosttyWebGpu") or {}).get("canvases") or {}
-    for key in ("created", "reused", "reconfigured", "destroyed", "idle", "leased", "parked"):
+    for key in ("created", "reused", "reconfigured", "destroyed", "idle", "leased", "parked", "backingStoreResizes", "windowFrames"):
         if key in pool and isinstance(pool[key], (int, float)):
             metrics[f"pool.{key}"] = pool[key]
+    mirror = (diag.get("ghosttyWebGpu") or {}).get("gcMirror") or {}
+    for key in ("frames", "allocations", "allocatedBytes"):
+        if key in mirror:
+            metrics[f"gc_mirror.{key}"] = mirror[key]
     metrics["dom.max_canvases"] = max((diag_of(s).get("dom") or {}).get("canvases", 0) for s in samples)
     core = diag.get("ghosttyCore") or {}
     if core:
@@ -799,6 +803,10 @@ def experiment_row(report: dict) -> list[str]:
     last = next((s for s in reversed(samples) if "cycle" in s["event"] and s["event"]["cycle"] > 0), None)
     if last:
         resizes = sum((x["surface"] or {}).get("backingStoreResizes", 0) for x in diag_of(last).get("ghosttySessions") or [])
+        # One shared window canvas: the runtime counts its swapchain allocations (including the first).
+        window = pool_of(last).get("backingStoreResizes")
+        if window is not None:
+            resizes = window
 
     def f(value, signed=False):
         return "-" if value is None else (f"{value:+.0f}" if signed else f"{value:.0f}")

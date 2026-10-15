@@ -244,6 +244,22 @@ html[data-vibrancy="on"] {
 html[data-chrome="borderless"] .terax-bg-surface {
   border-radius: 12px;
 }
+/* Window drag (macOS WebKit): while `data-live-resize` is set (see
+ * modules/theme/livePageResize) the document is given an invisible size rounded
+ * up to the tile quantum, so the page tile does not change size at every step.
+ * WebKit allocates a new viewport-sized IOSurface per step otherwise (hundreds
+ * of MiB for a drag) and frees them only after it ends. Hidden and
+ * non-interactive: nothing paints or hit-tests there. */
+html[data-live-resize] body::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: round(up, 100vw, 512px);
+  height: round(up, 100vh, 512px);
+  visibility: hidden;
+  pointer-events: none;
+}
 .zoom-content {
   zoom: var(--app-zoom);
 }
