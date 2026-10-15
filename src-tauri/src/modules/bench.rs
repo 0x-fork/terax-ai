@@ -115,6 +115,30 @@ pub enum WindowAction {
     /// process's composited layers one to one as `CALayer`s here, so counting them (and their
     /// sizes, contents, masks and clips) shows what the page's CSS made composited.
     Layers,
+    /// A real key event through the window's `sendEvent:`: the web view's first responder runs
+    /// it through the system input context (input sources, dead keys), like a physical key.
+    #[serde(rename_all = "camelCase")]
+    Key {
+        chars: String,
+        #[serde(default)]
+        chars_ignoring_modifiers: Option<String>,
+        key_code: u16,
+        /// `NSEventModifierFlags` (shift 1<<17, control 1<<18, option 1<<19, command 1<<20).
+        #[serde(default)]
+        flags: usize,
+        #[serde(default)]
+        up: bool,
+        #[serde(default)]
+        repeat: bool,
+    },
+    /// The web view's `NSTextInputClient`, the way an input method drives it.
+    #[serde(rename_all = "camelCase")]
+    Text {
+        /// `setMarked`, `insert` or `unmark`.
+        op: String,
+        #[serde(default)]
+        text: String,
+    },
 }
 
 fn yes() -> bool {
@@ -145,7 +169,7 @@ mod platform {
     use objc2::msg_send;
     use objc2::rc::Retained;
     use objc2::runtime::{AnyClass, AnyObject};
-    use objc2_foundation::NSRect;
+    use objc2_foundation::{NSPoint, NSRange, NSRect, NSString};
     use std::time::{Duration, Instant};
 
     /// Sends a message with an optional `sender` argument (`orderOut:` and friends).
@@ -298,7 +322,109 @@ mod platform {
             }
             WindowAction::Gc => gc(&window).await,
             WindowAction::Layers => layers(&window).await,
+            WindowAction::Key {
+                chars,
+                chars_ignoring_modifiers,
+                key_code,
+                flags,
+                up,
+                repeat,
+            } => {
+                main(&app, move |app| {
+                    send_key(
+                        app,
+                        &chars,
+                        chars_ignoring_modifiers.as_deref().unwrap_or(&chars),
+                        key_code,
+                        flags,
+                        up,
+                        repeat,
+                    )
+                })
+                .await
+            }
+            WindowAction::Text { op, text } => text_input(&window, op, text).await,
         }
+    }
+
+    fn send_key(
+        app: &AppHandle,
+        chars: &str,
+        chars_ignoring_modifiers: &str,
+        key_code: u16,
+        flags: usize,
+        up: bool,
+        repeat: bool,
+    ) -> Value {
+        const KEY_DOWN: usize = 10;
+        const KEY_UP: usize = 11;
+        let class = AnyClass::get(c"NSEvent").expect("AppKit is loaded");
+        let chars = NSString::from_str(chars);
+        let ignoring = NSString::from_str(chars_ignoring_modifiers);
+        let window = ns_window(app);
+        let process_info: Retained<AnyObject> = unsafe {
+            msg_send![
+                AnyClass::get(c"NSProcessInfo").expect("Foundation is loaded"),
+                processInfo
+            ]
+        };
+        let uptime: f64 = unsafe { msg_send![&*process_info, systemUptime] };
+        let number: isize = unsafe { msg_send![window, windowNumber] };
+        let event: Option<Retained<AnyObject>> = unsafe {
+            msg_send![
+                class,
+                keyEventWithType: if up { KEY_UP } else { KEY_DOWN },
+                location: NSPoint::new(0.0, 0.0),
+                modifierFlags: flags,
+                timestamp: uptime,
+                windowNumber: number,
+                context: None::<&AnyObject>,
+                characters: &*chars,
+                charactersIgnoringModifiers: &*ignoring,
+                isARepeat: repeat,
+                keyCode: key_code
+            ]
+        };
+        let Some(event) = event else {
+            return json!({"ok": false, "error": "no event"});
+        };
+        unsafe {
+            let _: () = msg_send![window, sendEvent: &*event];
+        }
+        json!({"ok": true})
+    }
+
+    async fn text_input(window: &WebviewWindow, op: String, text: String) -> Result<Value, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        window
+            .with_webview(move |platform| {
+                let web = unsafe { &*platform.inner().cast::<AnyObject>() };
+                let none = NSRange::new(usize::MAX >> 1, 0);
+                let string = NSString::from_str(&text);
+                let ok = match op.as_str() {
+                    "setMarked" => {
+                        let selected = NSRange::new(text.encode_utf16().count(), 0);
+                        unsafe {
+                            let _: () = msg_send![web, setMarkedText: &*string, selectedRange: selected, replacementRange: none];
+                        }
+                        true
+                    }
+                    "insert" => {
+                        unsafe {
+                            let _: () = msg_send![web, insertText: &*string, replacementRange: none];
+                        }
+                        true
+                    }
+                    "unmark" => {
+                        send_plain!(web, unmarkText);
+                        true
+                    }
+                    _ => false,
+                };
+                let _ = tx.send(json!({"ok": ok}));
+            })
+            .map_err(|error| format!("with_webview: {error}"))?;
+        rx.await.map_err(|error| format!("text: {error}"))
     }
 
     /// Runs `work` on the main thread with the app handle and returns its result.
@@ -523,8 +649,7 @@ mod platform {
         if let Some(subs) = subs {
             let count: usize = unsafe { msg_send![&*subs, count] };
             for index in 0..count {
-                let child: Retained<AnyObject> =
-                    unsafe { msg_send![&*subs, objectAtIndex: index] };
+                let child: Retained<AnyObject> = unsafe { msg_send![&*subs, objectAtIndex: index] };
                 describe_layers(&child, depth + 1, out, totals);
             }
         }

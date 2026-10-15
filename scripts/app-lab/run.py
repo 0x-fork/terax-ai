@@ -16,6 +16,7 @@ Scenarios (`--scenario`):
   occlusion      order the window out/front `--cycles` times
   agents-steady  1 visible + `--hidden-agents` hidden agent tabs for `--duration` s (CPU/energy)
   idle           one idle shell for `--duration` s
+  input          native key events / input-method calls into a PTY reader (pass/fail in page.log)
 
 The app runs from an isolated bundle (identifier app.crynta.terax.app-lab, its own HOME), never
 the user's profile; the bench build refuses to start under the product identifier. Build once
@@ -89,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gc", nargs="?", const="private", choices=["private", "alloc"], help="after the idle tail, request a full garbage collection and sample +2 s/+10 s: 'private' (default) is WebKit's testing SPI, 'alloc' is allocation pressure from the page (what an in-app valve could do)")
     p.add_argument("--hold-tab", type=int, help="tabs: index of the tab shown at baseline (and for the whole run with --no-switch), in creation order")
     p.add_argument("--valve", metavar="EVERY_S:CHUNKS:MB", help="mitigation probe: every EVERY_S seconds the page allocates CHUNKS zero-filled ArrayBuffers of MB MiB to push JavaScriptCore into a full GC (tabs scenario)")
-    p.add_argument("--probe", choices=["blur", "readonly", "caret-transparent", "caret-animation-manual", "zero-size", "clip", "display-contents"], help="idle: remove one suspected source of idle display refreshes before measuring")
+    p.add_argument("--probe", choices=["blur", "readonly", "caret-transparent", "caret-animation-manual", "zero-size", "clip", "display-contents", "selection", "selection-nofocus-div"], help="idle: remove one suspected source of idle display refreshes before measuring")
     p.add_argument("--no-switch", action="store_true", help="tabs control: same loop, timing, samples and workload, but never switch tabs")
     p.add_argument("--vibrancy", choices=["on", "off"], help="set the window vibrancy preference through the app's own store before the scenario (default: the app default, off)")
     p.add_argument("--cwd-shell", type=Path, help="working directory of shell tabs; the app is launched in it, so the first tab and the file explorer start there (default: the isolated HOME)")

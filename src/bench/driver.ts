@@ -1,6 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { setWindowVibrancy } from "@/modules/settings/store";
 import { whenSessionReady, writeToSession } from "@/modules/terminal";
+import {
+  readTerminalClipboard,
+  writeTerminalClipboard,
+} from "@/modules/terminal/lib/terminalClipboard";
 import { collectDiagnostics } from "./diagnostics";
 import { nativeWindow, reportError, reportPhase } from "./report";
 import type { BenchAppApi, BenchConfig, BenchScenario } from "./types";
@@ -87,6 +91,12 @@ class ScenarioRun {
       await this.native({ cmd: "activate" });
       await pause(1000);
     }
+  }
+
+  async log(line: string): Promise<void> {
+    await fetch(`${this.reportUrl}/log`, { method: "POST", body: line }).catch(
+      () => undefined,
+    );
   }
 
   /**
@@ -438,6 +448,8 @@ async function agentsSteadyScenario(run: ScenarioRun): Promise<void> {
 
 /** Idle-wakeup probes: take away one suspected source of page-driven display refreshes. */
 const IDLE_PROBE_CSS: Record<string, string> = {
+  selection:
+    "textarea[aria-label='Terminal input']::selection { background: transparent !important; color: transparent !important; }",
   "caret-transparent":
     "textarea, input { caret-color: transparent !important; }",
   "caret-animation-manual":
@@ -451,6 +463,19 @@ const IDLE_PROBE_CSS: Record<string, string> = {
 
 function applyIdleProbe(probe: string | undefined): void {
   if (probe === "blur") (document.activeElement as HTMLElement | null)?.blur();
+  if (probe === "selection") {
+    const el = document.activeElement;
+    if (el instanceof HTMLTextAreaElement) {
+      el.value = "\u00a0";
+      el.setSelectionRange(0, 1);
+    }
+  }
+  if (probe === "selection-nofocus-div") {
+    const div = document.createElement("div");
+    div.tabIndex = -1;
+    document.body.append(div);
+    div.focus({ preventScroll: true });
+  }
   if (probe === "readonly") {
     for (const input of document.querySelectorAll<HTMLTextAreaElement>(
       "textarea",
@@ -479,6 +504,191 @@ async function idleScenario(run: ScenarioRun): Promise<void> {
   await run.collectGarbage();
 }
 
+const CMD = 1 << 20;
+const OPT = 1 << 19;
+const CTRL = 1 << 18;
+const SHIFT = 1 << 17;
+
+type KeyStroke = {
+  chars: string;
+  code: number;
+  flags?: number;
+  ignoring?: string;
+};
+
+const INPUT_READER =
+  'python3 -u -c \'import os,tty;tty.setraw(0);print("READY",end="\\r\\n");[print("RX:"+os.read(0,256).hex(),end="\\r\\n") for _ in iter(int,1)]\'';
+
+const hex = (text: string) =>
+  Array.from(new TextEncoder().encode(text), (b) =>
+    b.toString(16).padStart(2, "0"),
+  ).join("");
+
+/**
+ * Real WKWebView input: native key events (`sendEvent:`, through the system input context) and
+ * the input method's `NSTextInputClient` calls, with a raw-mode reader in the PTY printing the
+ * bytes it receives. Results go to the orchestrator's page.log as `[input-check]` lines.
+ */
+async function inputScenario(run: ScenarioRun): Promise<void> {
+  const { leafId } = await run.booted();
+  const textarea = (): HTMLTextAreaElement | null =>
+    document.querySelector<HTMLTextAreaElement>(
+      "textarea[aria-label='Terminal input']",
+    );
+  const armed = () => {
+    const el = textarea();
+    return (
+      el !== null &&
+      el.value === "\u00a0" &&
+      el.selectionStart === 0 &&
+      el.selectionEnd === 1 &&
+      document.activeElement === el
+    );
+  };
+  const results: string[] = [];
+  const report = async (line: string) => {
+    results.push(line);
+    await run.log(`[input-check] ${line}`);
+  };
+  textarea()?.focus();
+  writeToSession(leafId, `${INPUT_READER}\r`);
+  await run.waitFor(
+    () => (run.app().readBuffer(leafId, 100) ?? "").includes("READY"),
+    "input reader",
+  );
+  let seen = 0;
+  const received = () =>
+    (run.app().readBuffer(leafId, 300) ?? "")
+      .split("\n")
+      .map((line) => /RX:([0-9a-f]+)/.exec(line)?.[1])
+      .filter((value): value is string => value !== undefined);
+  const key = async (stroke: KeyStroke, repeat = false) => {
+    for (const up of [false, true]) {
+      await run.native({
+        cmd: "key",
+        chars: stroke.chars,
+        charsIgnoringModifiers: stroke.ignoring ?? stroke.chars,
+        keyCode: stroke.code,
+        flags: stroke.flags ?? 0,
+        up,
+        repeat: repeat && !up,
+      });
+      await pause(15);
+    }
+  };
+  const text = async (op: string, value = "") => {
+    await run.native({ cmd: "text", op, text: value });
+  };
+  const check = async (
+    name: string,
+    expected: string,
+    action: () => Promise<void>,
+  ) => {
+    await action();
+    await pause(400);
+    const all = received();
+    const got = all.slice(seen).join("");
+    seen = all.length;
+    const ok = got === expected;
+    await report(
+      `${ok ? "PASS" : "FAIL"} ${name}: got ${got || "-"} want ${expected} armed=${armed()}`,
+    );
+  };
+  const A = { chars: "a", code: 0 };
+  await key(A);
+  await pause(300);
+  seen = received().length;
+  await report(`warm-up key delivered=${seen}`);
+  await check("plain a", "61", () => key(A));
+  await check("shift+z", "5a", () =>
+    key({ chars: "Z", ignoring: "z", code: 6, flags: SHIFT }),
+  );
+  await check("return", "0d", () => key({ chars: "\r", code: 36 }));
+  await check("backspace", "7f", () => key({ chars: "\u007f", code: 51 }));
+  await check("tab", "09", () => key({ chars: "\t", code: 48 }));
+  await check("left arrow", "1b5b44", () =>
+    key({ chars: "\uf702", code: 123, flags: 1 << 23 }),
+  );
+  await check("ctrl+c", "03", () =>
+    key({ chars: "\u0003", ignoring: "c", code: 8, flags: CTRL }),
+  );
+  await check("option+a (å)", "c3a5", () =>
+    key({ chars: "å", ignoring: "a", code: 0, flags: OPT }),
+  );
+  await check("repeat x5", "6262626262", async () => {
+    for (let index = 0; index < 5; index++)
+      await key({ chars: "b", code: 11 }, index > 0);
+  });
+  // Synthetic NSEvents do not reach the keyboard layout's dead-key state, so the dead key is
+  // driven the way the system delivers it: marked "´" (compositionstart), then "é" committed.
+  await check("dead key option+e, e (marked + commit)", "c3a9", async () => {
+    await text("setMarked", "\u00b4");
+    await pause(100);
+    await report(
+      `dead-key mid-composition value=${JSON.stringify(textarea()?.value)}`,
+    );
+    await text("insert", "\u00e9");
+  });
+  await check("IME marked + commit", "e697a5e69cac", async () => {
+    await text("setMarked", "に");
+    await pause(100);
+    const first = textarea()?.value;
+    await text("setMarked", "にほ");
+    await pause(100);
+    const second = textarea()?.value;
+    await report(
+      `ime mid-composition values=${JSON.stringify([first, second])}`,
+    );
+    await text("insert", "日本");
+  });
+  await check("IME commit then key", "e38182" + "61", async () => {
+    await text("setMarked", "あ");
+    await pause(50);
+    await text("insert", "あ");
+    await pause(100);
+    await key(A);
+  });
+  await check("emoji insertText", hex("😀"), () => text("insert", "😀"));
+  const saved = await readTerminalClipboard();
+  await writeTerminalClipboard("pasted-text");
+  await check("cmd+v paste", hex("pasted-text"), () =>
+    key({ chars: "v", code: 9, flags: CMD }),
+  );
+  await writeTerminalClipboard("SENTINEL");
+  await key({ chars: "c", code: 8, flags: CMD });
+  await pause(300);
+  const afterCopy = await readTerminalClipboard();
+  await report(
+    `${afterCopy === "SENTINEL" ? "PASS" : "FAIL"} cmd+c without selection leaves clipboard: ${JSON.stringify(afterCopy)}`,
+  );
+  await check("cmd+a then x", "78", async () => {
+    await key({ chars: "a", code: 0, flags: CMD });
+    await key({ chars: "x", code: 7 });
+  });
+  await writeTerminalClipboard(saved);
+  const first = run.app().activeId;
+  await check("tab switch away and back, then a", "61", async () => {
+    const second = await run.newShellTab();
+    await pause(500);
+    run.select(second.tabId);
+    await pause(500);
+    run.select(first);
+    await pause(800);
+    await key(A);
+  });
+  await check("window ordered out and back, then a", "61", async () => {
+    await run.native({ cmd: "hide", mode: "orderout" });
+    await pause(1500);
+    await run.native({ cmd: "show", mode: "orderout" });
+    await pause(1000);
+    await key(A);
+  });
+  await report(`final armed=${armed()}`);
+  await report(
+    `summary ${results.filter((line) => line.startsWith("FAIL")).length} failures of ${results.filter((line) => /^(PASS|FAIL)/.test(line)).length}`,
+  );
+}
+
 const SCENARIOS: Record<
   BenchScenario["name"],
   (run: ScenarioRun) => Promise<void>
@@ -488,6 +698,7 @@ const SCENARIOS: Record<
   occlusion: occlusionScenario,
   "agents-steady": agentsSteadyScenario,
   idle: idleScenario,
+  input: inputScenario,
 };
 
 let started = false;

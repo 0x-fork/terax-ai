@@ -9,6 +9,7 @@ import {
 import type { GhosttyTerminalModelApi } from "../GhosttyTerminalModel";
 import { encodeTerminalPaste } from "./terminalInputEncoding";
 
+import { TerminalInputProxy } from "@/modules/terminal/ghostty/input/TerminalInputProxy";
 import { TerminalNativeSelection } from "@/modules/terminal/ghostty/input/TerminalNativeSelection";
 
 const DUPLICATE_INPUT_WINDOW_MS = 75;
@@ -148,6 +149,7 @@ export type GhosttyInputControllerOptions = {
 export class GhosttyInputController {
   private readonly encoder = new TextEncoder();
   private readonly isMac: boolean;
+  private readonly proxy: TerminalInputProxy;
   private readonly nativeSelection: TerminalNativeSelection | null;
   private readonly pressedKeys = new Map<string, KeyEvent>();
   private composing = false;
@@ -161,8 +163,10 @@ export class GhosttyInputController {
 
   constructor(private readonly options: GhosttyInputControllerOptions) {
     this.isMac = options.isMac ?? /Mac|iPhone|iPad/.test(navigator.userAgent);
+    this.proxy = new TerminalInputProxy(options.input);
     this.nativeSelection = options.getSelection
       ? new TerminalNativeSelection({
+          proxy: this.proxy,
           input: options.input,
           target: options.pointerTarget,
           getSelection: options.getSelection,
@@ -204,6 +208,7 @@ export class GhosttyInputController {
     if (this.disposed) return;
     this.disposed = true;
     this.nativeSelection?.dispose();
+    this.proxy.dispose();
     this.pressedKeys.clear();
     const { input, pointerTarget } = this.options;
     input.removeEventListener("keydown", this.handleKeyDown);
@@ -367,7 +372,7 @@ export class GhosttyInputController {
       event.inputType === "insertText" ||
         event.inputType === "insertReplacementText",
     );
-    this.options.input.value = "";
+    this.proxy.arm();
   };
 
   private readonly handleCompositionStart = (): void => {
@@ -377,7 +382,7 @@ export class GhosttyInputController {
   private readonly handleCompositionEnd = (event: CompositionEvent): void => {
     this.composing = false;
     if (event.data) this.emitText(event.data, "composition", true, true, true);
-    this.options.input.value = "";
+    this.proxy.arm();
   };
 
   private readonly handlePaste = (event: ClipboardEvent): void => {

@@ -2,6 +2,7 @@ import type { GhosttyTerminalModelApi } from "@/modules/terminal/ghostty/Ghostty
 import { readFile } from "node:fs/promises";
 import { TeraxGhostty } from "@terax/ghostty-core/adapted";
 import { describe, expect, it, vi } from "vitest";
+import { FakeElement, FakeTextArea } from "./fakeTextArea";
 import {
   GhosttyInputController,
   terminalMouseModifiers,
@@ -458,26 +459,6 @@ function inputModel(
     scrollBy: () => false,
     encodeKey: () => new Uint8Array(0),
   } as unknown as GhosttyTerminalModelApi;
-}
-
-class FakeElement extends EventTarget {
-  getBoundingClientRect(): DOMRect {
-    return {
-      left: 0,
-      top: 0,
-      right: 800,
-      bottom: 480,
-      width: 800,
-      height: 480,
-      x: 0,
-      y: 0,
-      toJSON: () => ({}),
-    } as DOMRect;
-  }
-}
-
-class FakeTextArea extends FakeElement {
-  value = "";
 }
 
 function keyboardEvent(

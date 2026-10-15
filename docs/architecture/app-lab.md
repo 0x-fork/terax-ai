@@ -46,6 +46,7 @@ not.
 | `occlusion` | window ordered out and back 20 times (3 s hidden, 2 s visible) |
 | `agents-steady` | 1 visible plus 6 hidden agent tabs for 60 s |
 | `idle` | one idle shell for 30 s |
+| `input` | real key events and input-method calls into a raw-mode PTY reader; pass/fail lines in `page.log` (no measurements) |
 
 Options that matter: `--window WxH` (default 1280x820 points), `--cwd-shell` / `--cwd-agent`
 (different directories make the explorer and git panel follow the switch), `--vibrancy on|off`,
@@ -217,14 +218,18 @@ weight was chosen with `--instrument --local-storage terax:terminal-gc-mirror=<b
 
 ### Idle wakeups and the focused terminal input
 
-An idle app with one shell and a focused terminal costs 2.9 % of a core and 256 to 276 wakeups/s
-(host 211), against 0.17 % and 9 wakeups/s once the focused `<textarea>` is blurred (`--probe blur`,
-`app-exp-i2-idle-*.json`). `caret-color: transparent`, `caret-animation: manual`, `readonly`, a
-zero-size or clipped textarea, and `content-visibility: hidden` all leave it at 220 to 280 wakeups/s. The page itself
-is quiet in that state (no timers, no `requestAnimationFrame`, no animations, no IPC); the host
-process wakes for WebKit's `CVDisplayLink` threads (ten created and torn down within 8 s of
-sampling at 100 Hz) and the JavaScriptCore `libpas` scavenger. The renderer lab cannot show this: its
-terminals never hold focus.
+An idle app with one shell and a focused terminal cost 3.1 % of a core and 254 wakeups/s
+(host 193), against 0.2 % and 10 wakeups/s once the focused `<textarea>` is blurred (`--probe blur`).
+`caret-color: transparent`, `caret-animation: manual`, `readonly`, a zero-size or clipped textarea
+and `content-visibility: hidden` changed nothing (220 to 280 wakeups/s): a focused editable with a collapsed selection keeps a
+display link running at display rate, whatever the caret paints (consistent with the animated caret fade of macOS 14+).
+The page itself is quiet (no timers, `requestAnimationFrame`, animations or IPC); the host wakes for
+`CVDisplayLink` threads and the JavaScriptCore scavenger. A **non-collapsed selection paints no caret**:
+`--probe selection` (value one placeholder, selected) gives 0.16 % and 10 wakeups/s, as does focusing a
+non-editable element (`selection-nofocus-div`, 0.27 %). `TerminalInputProxy` keeps that selection in
+the product (3 runs: 0.22 to 0.25 % total, host 0.04 %, 10 to 13 wakeups/s). `--scenario input` drives
+the real web view with native key events (`sendEvent:`) and `NSTextInputClient` calls (`setMarkedText`,
+`insertText`) against a raw-mode PTY reader and prints `[input-check]` lines to `page.log`.
 
 ### WebKit malloc attribution (WebContent, fresh launch)
 

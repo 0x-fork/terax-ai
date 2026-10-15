@@ -19,7 +19,7 @@ if str(_RENDERER_PROFILE) not in sys.path:
 import lab_report  # noqa: E402
 from lab_report import MIB, interval, slope, table  # noqa: E402
 
-SCENARIOS = ["tabs", "resize", "occlusion", "agents-steady", "idle"]
+SCENARIOS = ["tabs", "resize", "occlusion", "agents-steady", "idle", "input"]
 ROLES = ["host", "web_content", "gpu", "networking"]
 ROLE_LABELS = {"host": "host", "web_content": "WebContent", "gpu": "GPU", "networking": "Network", "workload": "PTY-procs", "web_content_prewarmed": "WC-prewarm"}
 # Footprint categories worth a column; everything else is rolled into the process total.

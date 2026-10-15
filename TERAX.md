@@ -177,6 +177,12 @@ or search-mask work until presentation resumes.
 Terminal clipboard shortcuts use the native text clipboard plugin on all desktop
 platforms. Context clicks expose the selected text through the input element to
 restore the webview's native text menu; no persistent DOM scrollback is maintained.
+The input `<textarea>` always holds one selected placeholder character
+(`TerminalInputProxy`): a focused editable with a collapsed selection keeps
+WebKit's caret animation (a display link at display rate) running at ~3 % CPU and
+~250 wakeups/s while idle, a non-collapsed selection paints no caret (0.2 %, ~10/s).
+It re-arms after input, key release and focus, never during IME composition, and
+native Copy/Cut without terminal text must not copy the placeholder.
 Unclaimed macOS Command shortcuts reach the native menu after explicit clipboard,
 block-editor, and readline bindings, including when Kitty keyboard mode is active.
 The block prompt retains an enabled terminal input proxy for native menus and
