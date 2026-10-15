@@ -48,6 +48,9 @@ export type SmoothHooks = {
 
 /** The installed probe, or undefined (not a bench run, or not installed yet). */
 export function smoothHooks(): SmoothHooks | undefined {
+  // The literal `false` in a normal build: the key string and the lookup are not emitted even
+  // when a call site forgot its own guard (src/app/dist-budget.test.ts locks `__teraxSmooth`).
+  if (!__TERAX_BENCH__) return undefined;
   return (globalThis as unknown as Record<string, SmoothHooks | undefined>)[
     SMOOTH_KEY
   ];

@@ -911,6 +911,177 @@ describe("WebGPU surface resource lifecycle", () => {
   });
 });
 
+describe("shared atlas growth", () => {
+  it("is not drawable once another pane replaced an atlas resource, until it rebinds", async () => {
+    const h = await harness();
+    h.render();
+    expect(h.surface.drawable()).toBe(true);
+    h.createBindGroup.mockClear();
+    // Another pane grew the shared atlas: the table and textures this pane's bind group names
+    // are retired and destroyed when the frame completes.
+    h.atlas.generation += 1;
+    expect(h.surface.drawable()).toBe(false);
+    // The runtime rebinds every user after all panes prepared, without any upload.
+    h.writeBuffer.mockClear();
+    h.surface.rebindAtlas(h.resources as never);
+    expect(h.createBindGroup).toHaveBeenCalledOnce();
+    expect(h.writeBuffer).not.toHaveBeenCalled();
+    expect(h.surface.drawable()).toBe(true);
+    // Already current: nothing is created again.
+    h.surface.rebindAtlas(h.resources as never);
+    expect(h.createBindGroup).toHaveBeenCalledOnce();
+  });
+
+  it("leaves a pane without bindings of its own to its next prepared frame", async () => {
+    const h = await harness();
+    h.surface.rebindAtlas(h.resources as never);
+    expect(h.createBindGroup).not.toHaveBeenCalled();
+    h.render();
+    h.surface.handleDeviceLoss();
+    h.atlas.generation += 1;
+    h.surface.rebindAtlas(h.resources as never);
+    expect(h.createBindGroup).toHaveBeenCalledOnce();
+  });
+});
+
+describe("a resize gesture ending in a prompt redraw hold", () => {
+  const hostSize = (width: number, height = 640) => ({
+    width,
+    height,
+    left: 0,
+    top: 0,
+  });
+  const holdPresentation = (
+    h: Awaited<ReturnType<typeof harness>>,
+    held: boolean,
+  ) => {
+    h.model.presentationSuppressed = () => held;
+    h.model.deferPresentation = () => held;
+  };
+  const uploadedShift = (h: Awaited<ReturnType<typeof harness>>) => {
+    h.writeBuffer.mockClear();
+    h.render();
+    const upload = h.writeBuffer.mock.calls.find(
+      ([buffer]) => buffer === h.lastUniformBuffer(),
+    );
+    if (!upload) return null;
+    return new Uint32Array((upload[2] as Float32Array).buffer)[
+      SCREEN_OFFSET.shiftY / 4
+    ];
+  };
+
+  it("does not replace the cell buffer while presentation is held, so the pane keeps drawing", async () => {
+    vi.useFakeTimers();
+    const h = await harness();
+    h.render();
+    vi.advanceTimersByTime(500);
+    const token = {};
+    beginTerminalResizeInteraction(token);
+    h.paneRect.value = { x: 0, y: 0, width: 200, height: 160 };
+    h.observe(hostSize(200, 160));
+    h.render();
+    endTerminalResizeInteraction(token);
+    vi.advanceTimersByTime(200);
+    // The resize cleared the prompt: the previous frame stays on screen until the redraw.
+    holdPresentation(h, true);
+    const buffers = h.createBuffer.mock.calls.length;
+    h.render();
+    expect(h.surface.diagnostics().cellCompactions).toBe(0);
+    expect(h.createBuffer).toHaveBeenCalledTimes(buffers);
+    expect(h.surface.drawable()).toBe(true);
+    expect(h.model.compactPresentationResources).not.toHaveBeenCalled();
+    // The redraw ended: the frame that shows it compacts, and the pane is drawable again at
+    // the end of that very frame.
+    holdPresentation(h, false);
+    h.render();
+    expect(h.surface.diagnostics().cellCompactions).toBe(1);
+    expect(h.model.compactPresentationResources).toHaveBeenCalledOnce();
+    expect(h.surface.drawable()).toBe(true);
+  });
+
+  it("keeps the grid shifted up inside the held frame, clamped to what the rectangle still lacks", async () => {
+    vi.useFakeTimers();
+    const h = await harness();
+    h.render();
+    vi.advanceTimersByTime(500);
+    const { rows, deviceCellHeight } = h.surface.diagnostics();
+    const grid = rows * deviceCellHeight;
+    const token = {};
+    beginTerminalResizeInteraction(token);
+    h.cursor.y = rows - 1;
+    h.paneRect.value = { x: 0, y: 0, width: 960, height: 400 };
+    h.observe(hostSize(960, 400));
+    expect(uploadedShift(h)).toBe(grid - 400);
+    endTerminalResizeInteraction(token);
+    vi.advanceTimersByTime(200);
+    holdPresentation(h, true);
+    h.render();
+    // The final layout lands while the old frame is held: it used to snap to the top rows
+    // (shift 0) and cut off the prompt at the bottom.
+    h.paneRect.value = { x: 0, y: 0, width: 960, height: 420 };
+    expect(uploadedShift(h)).toBe(grid - 420);
+    // A rectangle that is lacking more keeps the shift it had; one that is tall enough needs none.
+    h.paneRect.value = { x: 0, y: 0, width: 960, height: 380 };
+    expect(uploadedShift(h)).toBe(grid - 420);
+    h.paneRect.value = { x: 0, y: 0, width: 960, height: grid + 50 };
+    expect(uploadedShift(h)).toBe(0);
+  });
+
+  it("tells hit-testing how far the drawn grid is moved up, in CSS pixels", async () => {
+    vi.useFakeTimers();
+    const h = await harness();
+    h.render();
+    vi.advanceTimersByTime(500);
+    expect(h.surface.gridShiftY()).toBe(0);
+    const { rows, deviceCellHeight } = h.surface.diagnostics();
+    const token = {};
+    beginTerminalResizeInteraction(token);
+    h.cursor.y = rows - 1;
+    h.paneRect.value = { x: 0, y: 0, width: 960, height: 400 };
+    h.observe(hostSize(960, 400));
+    h.render();
+    expect(h.surface.gridShiftY()).toBe(rows * deviceCellHeight - 400);
+    endTerminalResizeInteraction(token);
+    vi.advanceTimersByTime(200);
+    h.render();
+    expect(h.surface.gridShiftY()).toBe(0);
+  });
+});
+
+describe("failure paths", () => {
+  const root = (h: Awaited<ReturnType<typeof harness>>) =>
+    h.elements.find(
+      (e) => e.getAttribute("data-terax-ghostty-surface") === "webgpu",
+    ) as unknown as { style: { backgroundColor: string } };
+
+  it("covers the canvas with its own background when the runtime fails, until the fallback takes over", async () => {
+    const h = await harness();
+    h.render();
+    h.surface.handleCanvasRevealed();
+    expect(root(h).style.backgroundColor).toBe("transparent");
+    // The window canvas is removed with the runtime; a transparent pane would show nothing.
+    const error = new Error("WebGPU validation error");
+    h.surface.handleRuntimeError(error);
+    expect(root(h).style.backgroundColor).toBe("rgb(0 0 0)");
+    expect(h.onError).toHaveBeenCalledWith(error);
+  });
+
+  it("covers the canvas while the device is replaced and is revealed again by the first frame after it", async () => {
+    const h = await harness();
+    h.render();
+    h.surface.handleCanvasRevealed();
+    // Reconfiguring the canvas for the replacement device clears it.
+    h.surface.handleDeviceLoss();
+    expect(root(h).style.backgroundColor).toBe("rgb(0 0 0)");
+    h.resources.generation = 2;
+    h.visibility(true);
+    h.render();
+    expect(root(h).style.backgroundColor).toBe("rgb(0 0 0)");
+    h.surface.handleCanvasRevealed();
+    expect(root(h).style.backgroundColor).toBe("transparent");
+  });
+});
+
 const FONT = {
   family: "monospace",
   size: 14,
@@ -937,9 +1108,7 @@ type FakeFrameState = {
   setCell(index: number, glyph: number): void;
 };
 
-async function harness(
-  options: { scale?: number } = {},
-) {
+async function harness(options: { scale?: number } = {}) {
   let scale = options.scale ?? 1;
   bridge.visible = true;
   const destroy = vi.fn();
@@ -1157,6 +1326,7 @@ async function harness(
       return dims.rows;
     },
     cursor: track("cursor", () => cursor),
+    presentationSuppressed: () => false,
     deferPresentation: () => false,
     consumeGpuFrame: vi.fn(
       track("consumeGpuFrame", (frameOptions?: { resync?: boolean }) =>

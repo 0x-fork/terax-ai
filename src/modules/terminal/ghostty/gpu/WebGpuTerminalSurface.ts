@@ -19,7 +19,7 @@ import { GhosttySearchController } from "../search/GhosttySearchController";
 import { TerminalSelectionController } from "../selection/TerminalSelectionController";
 import { DevicePixelRatioMonitor } from "./DevicePixelRatioMonitor";
 import { TerminalGlyphMap, type RasterBudget } from "./GlyphMap";
-import type { DeviceRect } from "./PaneRects";
+import { type DeviceRect, deviceRectsEqual } from "./PaneRects";
 import { ScreenUniform, type ScreenUniformState } from "./ScreenUniform";
 import { SCREEN_UNIFORM_BYTES } from "./shaders";
 import { fitTerminalViewport } from "./TerminalFit";
@@ -257,6 +257,7 @@ export class WebGpuTerminalSurface
       model: options.model,
       target: this.root,
       cellSize: () => this.cellSize(),
+      gridShiftY: () => this.gridShiftY(),
       shouldIgnoreTarget: (target) =>
         target instanceof Node && this.scrollbar.contains(target),
       onChange: () => {
@@ -440,6 +441,15 @@ export class WebGpuTerminalSurface
     return { width: this.metrics.cellWidth, height: this.metrics.cellHeight };
   }
 
+  /**
+   * CSS pixels the drawn grid is moved up inside the pane while it waits for a resize gesture to
+   * end (see `gridShift`). Hit-testing adds it to the pointer's offset, so a click lands on the
+   * cell that is drawn under it.
+   */
+  gridShiftY(): number {
+    return (this.lastScreenState?.shiftY ?? 0) / this.metrics.scale;
+  }
+
   setCursorEnabled(enabled: boolean): void {
     if (this.cursorEnabled === enabled) return;
     this.cursorEnabled = enabled;
@@ -480,10 +490,36 @@ export class WebGpuTerminalSurface
       this.visible &&
       this.hasFrame &&
       // A replaced buffer leaves the old bind group naming a destroyed one until the next
-      // prepared frame rebinds it.
+      // prepared frame rebinds it; so does an atlas another pane grew (see `rebindAtlas`).
       !this.bindGroupDirty &&
       this.bindGroup !== null &&
+      !this.atlasBindingStale() &&
       this.binding !== null
+    );
+  }
+
+  /**
+   * The shared atlas replaced a texture or its glyph table since this pane's bind group was
+   * made. Another pane grows the atlas while this one may not prepare at all in that frame,
+   * and the old resources are destroyed once the frame completes. Rebinding needs no upload:
+   * the new table holds every glyph written so far. A pane whose own buffers are being
+   * replaced rebinds in its next prepared frame.
+   */
+  rebindAtlas(resources: WebGpuSharedResources): void {
+    if (
+      this.disposed ||
+      this.bindGroupDirty ||
+      this.bindGroup === null ||
+      !this.atlasBindingStale()
+    )
+      return;
+    this.updateBindGroup(resources);
+  }
+
+  private atlasBindingStale(): boolean {
+    const lease = this.atlasLease;
+    return (
+      lease !== null && lease.atlas.generation !== this.boundAtlasGeneration
     );
   }
 
@@ -633,18 +669,11 @@ export class WebGpuTerminalSurface
     const state = this.lastScreenState;
     const rect = this.binding?.rect();
     if (!state || !rect || !this.uniformBuffer) return false;
-    const held = state.viewport;
-    if (
-      held.x === rect.x &&
-      held.y === rect.y &&
-      held.width === rect.width &&
-      held.height === rect.height
-    )
-      return false;
-    const shiftY =
-      this.resizeInteractionActive || this.heldBounds !== null
-        ? state.shiftY
-        : 0;
+    if (deviceRectsEqual(state.viewport, rect)) return false;
+    // The held frame is the grid of the previous size: keep its shift (the cursor row stays on
+    // screen, as during the gesture) but never past what the new rectangle leaves out.
+    const deficit = Math.max(0, state.rows * state.cellHeight - rect.height);
+    const shiftY = Math.min(state.shiftY, deficit);
     this.packAndUpload({ ...state, viewport: rect, shiftY }, device);
     return this.hasFrame;
   }
@@ -657,6 +686,9 @@ export class WebGpuTerminalSurface
   }
 
   handleRuntimeError(error: Error): void {
+    // The window canvas may be gone before the fallback renderer exists: cover it with the
+    // theme colour instead of leaving a transparent pane over nothing.
+    this.coverCanvas();
     this.options.onError(error);
   }
 
@@ -703,6 +735,16 @@ export class WebGpuTerminalSurface
   handleDeviceLoss(): void {
     this.handleVisibilityChange(false);
     this.releaseGpuResources();
+    // Reconfiguring the canvas for the replacement device clears it; the pane covers that
+    // until the window canvas shows its first frame again (`WebGpuWindowCanvas.reconfigure`).
+    this.coverCanvas();
+  }
+
+  /** The pane paints its own background again until the window canvas re-reveals it. */
+  private coverCanvas(): void {
+    if (!this.revealed) return;
+    this.revealed = false;
+    this.updateRootBackground();
   }
 
   diagnostics(): WebGpuTerminalSurfaceStats {
@@ -830,7 +872,7 @@ export class WebGpuTerminalSurface
       (event.clientX - rect.left) / this.metrics.cellWidth,
     );
     const row = Math.floor(
-      (event.clientY - rect.top) / this.metrics.cellHeight,
+      (event.clientY - rect.top + this.gridShiftY()) / this.metrics.cellHeight,
     );
     if (
       column < 0 ||
@@ -966,13 +1008,15 @@ export class WebGpuTerminalSurface
 
   /** App lab only: the grid this host size asks for, for the smoothness probe. */
   private benchWant(bounds: TerminalFitBounds): void {
+    if (!__TERAX_BENCH__) return;
     const fit = fitTerminalViewport(
       bounds.width,
       bounds.height,
       this.metrics,
       bounds.device,
     );
-    if (fit) smoothHooks()?.want(this.benchId, performance.now(), fit.cols, fit.rows);
+    if (fit)
+      smoothHooks()?.want(this.benchId, performance.now(), fit.cols, fit.rows);
   }
 
   private boundsFromEntry(entry: ResizeObserverEntry): TerminalFitBounds {
@@ -1010,7 +1054,15 @@ export class WebGpuTerminalSurface
     if (bounds) {
       this.resizeToHost(bounds, false, true);
     }
-    if (this.compactAfterResize && !this.resizeInteractionActive) {
+    // Compaction replaces the cell buffer, and while presentation is held (the prompt redraw
+    // after the gesture's resize) the pane keeps drawing the old buffer; replacing it would
+    // leave the pane without a bind group until the hold ends. The flag stays set, and the
+    // frame that ends the hold compacts.
+    if (
+      this.compactAfterResize &&
+      !this.resizeInteractionActive &&
+      !this.options.model.presentationSuppressed()
+    ) {
       this.compactAfterResize = false;
       this.options.model.compactPresentationResources();
       this.compactCellCapacity();
@@ -1385,7 +1437,10 @@ export class WebGpuTerminalSurface
     const deficit = state.rows * cell - state.viewport.height;
     if (deficit <= 0) return 0;
     const row = Math.min(state.rows - 1, Math.max(0, cursor.y));
-    return Math.min(deficit, Math.max(0, (row + 1) * cell - state.viewport.height));
+    return Math.min(
+      deficit,
+      Math.max(0, (row + 1) * cell - state.viewport.height),
+    );
   }
 
   /** Packs the uniform and uploads it when it differs from what the GPU holds. */

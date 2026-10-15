@@ -57,5 +57,7 @@ export default defineConfig({
       },
     ],
   },
+  // Product code gates app-lab hooks on this build-time constant (see the app's vite.config.ts).
+  define: { __TERAX_BENCH__: "false" },
   build: { target: "es2022" },
 });

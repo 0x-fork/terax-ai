@@ -472,6 +472,75 @@ describe("WebGpuWindowCanvas", () => {
     expect(t.canvas.isDirty).toBe(true);
   });
 
+  it("re-snaps the canvas to the device pixel grid when only the display ratio changes", () => {
+    const t = setup({ scale: 1.25 });
+    t.area.rect = { left: 100.4, top: 20, width: 700, height: 500 };
+    t.resizeArea(700, 500);
+    expect(t.canvases[0].style.transform).toBe("translate(0.4px, 0px)");
+    // The window moves to a display with another ratio: the rectangle is the same CSS box, so
+    // nothing re-measured it, but the translation that lands it on a device pixel is different.
+    t.setScale(1);
+    const onResize = (
+      (window.addEventListener as ReturnType<typeof vi.fn>).mock.calls.find(
+        ([name]) => name === "resize",
+      ) as [string, () => void]
+    )[1];
+    onResize();
+    const x = Number.parseFloat(
+      /translate\((-?[\d.]+)px/.exec(t.canvases[0].style.transform)?.[1] ?? "",
+    );
+    expect(x).toBeCloseTo(-0.4, 6);
+    // And back to a ratio at which the box already sits on a pixel: no transform at all.
+    t.area.rect = { left: 100, top: 20, width: 700, height: 500 };
+    t.setScale(2);
+    onResize();
+    expect(t.canvases[0].style.transform).toBe("");
+  });
+
+  it("clips a pane laid out partly left of or above the canvas instead of sliding it in", () => {
+    const t = setup();
+    const p = t.pane();
+    const binding = t.canvas.addPane(
+      p,
+      t.host({ left: -3, top: -2, width: 100, height: 100 }) as never,
+    );
+    binding.setBounds({ left: -3, top: -2, width: 100, height: 100 });
+    t.canvas.beginFrame();
+    // The viewport stays inside the target; what was cut off is reported, so the pane's own
+    // origin (x - clipX) stays where the layout put it.
+    expect(binding.rect()).toEqual({
+      x: 0,
+      y: 0,
+      width: 97,
+      height: 98,
+      clipX: 3,
+      clipY: 2,
+    });
+    // Moving it fully inside drops the clip.
+    binding.setBounds({ left: 0, top: 0, width: 100, height: 100 });
+    t.canvas.beginFrame();
+    expect(binding.rect()).toEqual({ x: 0, y: 0, width: 100, height: 100 });
+  });
+
+  it("reveals every pane again after the canvas was reconfigured for a replacement device", () => {
+    const t = setup();
+    const a = t.pane();
+    t.canvas
+      .addPane(a, t.host({ left: 0, top: 0, width: 400, height: 600 }) as never)
+      .setBounds({ left: 0, top: 0, width: 400, height: 600 });
+    t.canvas.beginFrame();
+    expect(t.canvas.encode(t.encoder, t.resources).revealed).toEqual([a]);
+    expect(t.canvas.encode(t.encoder, t.resources).revealed).toEqual([]);
+    // Reconfiguring clears the canvas and the panes cover it again until it has been redrawn.
+    t.canvas.reconfigure({
+      device: { limits: { maxTextureDimension2D: 8192 } } as GPUDevice,
+      format: "bgra8unorm",
+      generation: 2,
+    });
+    t.canvas.beginFrame();
+    expect(t.canvas.encode(t.encoder, t.resources).revealed).toEqual([a]);
+  });
+
   it("asks for a frame when its area changes", () => {
     const t = setup();
     t.requestFrame.mockClear();

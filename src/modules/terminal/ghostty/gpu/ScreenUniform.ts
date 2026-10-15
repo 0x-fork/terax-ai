@@ -24,6 +24,9 @@ export type ScreenUniformState = {
     readonly y: number;
     readonly width: number;
     readonly height: number;
+    /** Device pixels of the pane cut off left of / above the canvas (see `DeviceRect`). */
+    readonly clipX?: number;
+    readonly clipY?: number;
   };
   /**
    * Device pixels the grid is moved up inside the viewport, so a pane shorter than its grid
@@ -63,8 +66,12 @@ export class ScreenUniform {
     uints.fill(0);
     floats[SCREEN_OFFSET.viewportSize / 4] = state.viewport.width;
     floats[SCREEN_OFFSET.viewportSize / 4 + 1] = state.viewport.height;
-    uints[SCREEN_OFFSET.origin / 4] = state.viewport.x;
-    uints[SCREEN_OFFSET.origin / 4 + 1] = state.viewport.y;
+    const clipX = Math.max(0, state.viewport.clipX ?? 0);
+    const clipY = Math.max(0, state.viewport.clipY ?? 0);
+    ints[SCREEN_OFFSET.origin / 4] = state.viewport.x - clipX;
+    ints[SCREEN_OFFSET.origin / 4 + 1] = state.viewport.y - clipY;
+    uints[SCREEN_OFFSET.clip / 4] = clipX;
+    uints[SCREEN_OFFSET.clip / 4 + 1] = clipY;
     uints[SCREEN_OFFSET.cellSize / 4] = state.cellWidth;
     uints[SCREEN_OFFSET.cellSize / 4 + 1] = state.cellHeight;
     uints[SCREEN_OFFSET.dims / 4] = state.cols;

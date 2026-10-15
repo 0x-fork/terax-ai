@@ -375,6 +375,11 @@ export class WebGlTerminalSurface
     return { width: this.metrics.cellWidth, height: this.metrics.cellHeight };
   }
 
+  /** The fallback draws its grid top-anchored during a gesture: nothing is shifted. */
+  gridShiftY(): number {
+    return 0;
+  }
+
   setCursorEnabled(enabled: boolean): void {
     if (this.cursorEnabled === enabled) return;
     this.cursorEnabled = enabled;

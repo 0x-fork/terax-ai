@@ -15,6 +15,11 @@
  * streaming agent, 120 s, about 25 frames a second) the unfinalized canvas textures at the end
  * were 2,626 with no mirroring, 939 at 5x, 195 at 10x and 42 at 20x, WebKit malloc grew by
  * 36, 10, 2.5 MiB and not at all, and WebContent's instructions per second did not move.
+ *
+ * The collector reacts to allocation volume, not to frame count, so the volume is capped
+ * (`GC_MIRROR_MAX_BYTES_PER_SECOND`): at a display's rate the full weight per frame would be
+ * 15 MB/s of zero-filled buffers for the cadence 3 MB/s gives a 25 fps agent. App lab,
+ * 48 frames a second: 6.5 MB/s mirrored before, 4.4 after, WebKit malloc flat either way.
  */
 
 /** WebKit malloc pinned per presented window frame (measured with the app lab, `--instrument`). */
@@ -23,12 +28,24 @@ export const NATIVE_BYTES_PER_FRAME = 12_900;
 export const GC_MIRROR_FACTOR = 10;
 /** Bytes accumulated before one buffer is allocated. */
 export const GC_MIRROR_BATCH_BYTES = 64 * 1024;
+/**
+ * Most bytes mirrored per second. The collector reacts to allocation volume, not to frame
+ * count, so a faster display does not need more of it: at the display rate of a 120 Hz screen
+ * the full weight would be 15 MB/s of zero-filled buffers for the same collection cadence a
+ * 25 fps agent gets from 3 MB/s. The cap sits just above the 25 fps case, which therefore
+ * mirrors every frame as measured; faster frames are mirrored in proportion to the time.
+ */
+export const GC_MIRROR_MAX_BYTES_PER_SECOND = 4 * 1024 * 1024;
 
 export type GcPressureOptions = {
   readonly bytesPerFrame?: number;
   readonly batchBytes?: number;
+  /** Cap on mirrored bytes per second; 0 or less means uncapped. */
+  readonly maxBytesPerSecond?: number;
   /** Replaced in tests; the default allocates an ArrayBuffer. */
   readonly allocate?: (bytes: number) => unknown;
+  /** Replaced in tests; milliseconds. */
+  readonly now?: () => number;
 };
 
 export type GcPressureStats = {
@@ -38,13 +55,20 @@ export type GcPressureStats = {
   readonly allocatedBytes: number;
   readonly bytesPerFrame: number;
   readonly batchBytes: number;
+  readonly maxBytesPerSecond: number;
 };
 
 export class GcPressureMirror {
   private readonly bytesPerFrame: number;
   private readonly batchBytes: number;
+  private readonly maxBytesPerSecond: number;
+  /** Most owed or allowed at once: a quarter second of the cap. */
+  private readonly burstBytes: number;
   private readonly allocate: (bytes: number) => unknown;
+  private readonly now: () => number;
   private pending = 0;
+  private allowance: number;
+  private lastAt: number;
   private frames = 0;
   private allocations = 0;
   private allocatedBytes = 0;
@@ -55,17 +79,40 @@ export class GcPressureMirror {
       options.bytesPerFrame ?? NATIVE_BYTES_PER_FRAME * GC_MIRROR_FACTOR,
     );
     this.batchBytes = Math.max(1, options.batchBytes ?? GC_MIRROR_BATCH_BYTES);
+    const cap = options.maxBytesPerSecond ?? GC_MIRROR_MAX_BYTES_PER_SECOND;
+    this.maxBytesPerSecond = cap > 0 ? cap : Number.MAX_VALUE;
+    this.burstBytes = this.maxBytesPerSecond / 4;
     this.allocate = options.allocate ?? ((bytes) => new ArrayBuffer(bytes));
+    this.now = options.now ?? (() => performance.now());
+    this.allowance = this.burstBytes;
+    this.lastAt = this.now();
   }
 
-  /** A window frame was submitted; allocates a dropped buffer once enough cost has built up. */
+  /**
+   * A window frame was submitted; allocates a dropped buffer once enough cost has built up and
+   * the per-second cap allows it. Cost the cap holds back is not owed later: it is dropped
+   * beyond one burst, because the wrappers it stood for are finalized by the collections the
+   * mirrored volume already triggers.
+   */
   noteFrame(frames = 1): void {
     this.frames += frames;
-    this.pending += this.bytesPerFrame * frames;
-    if (this.pending < this.batchBytes) return;
-    // One buffer for everything owed; the remainder is below one frame's worth.
-    const bytes = Math.floor(this.pending);
+    const now = this.now();
+    this.allowance = Math.min(
+      this.burstBytes,
+      this.allowance + ((now - this.lastAt) * this.maxBytesPerSecond) / 1000,
+    );
+    this.lastAt = now;
+    this.pending = Math.min(
+      this.pending + this.bytesPerFrame * frames,
+      Math.max(this.burstBytes, this.batchBytes),
+    );
+    const bytes = Math.floor(
+      Math.min(this.pending, this.allowance, this.batchBytes * 4),
+    );
+    // Whole batches only: wait for the cost, and for the cap, rather than allocating slivers.
+    if (this.pending < this.batchBytes || bytes < this.batchBytes) return;
     this.pending -= bytes;
+    this.allowance -= bytes;
     this.allocations += 1;
     this.allocatedBytes += bytes;
     this.allocate(bytes);
@@ -79,13 +126,15 @@ export class GcPressureMirror {
       allocatedBytes: this.allocatedBytes,
       bytesPerFrame: this.bytesPerFrame,
       batchBytes: this.batchBytes,
+      maxBytesPerSecond: this.maxBytesPerSecond,
     };
   }
 }
 
 /**
- * `localStorage["terax:terminal-gc-mirror"]`: `off`, or `<bytesPerFrame>[:<batchBytes>]`, for
- * experiments; unset means the defaults above.
+ * `localStorage["terax:terminal-gc-mirror"]`: `off`, or
+ * `<bytesPerFrame>[:<batchBytes>]`, for experiments;
+ * unset means the defaults above.
  */
 const GC_MIRROR_STORAGE_KEY = "terax:terminal-gc-mirror";
 export function gcPressureOptionsFromStorage(): GcPressureOptions {

@@ -82,7 +82,20 @@ describe("clampToCanvas", () => {
     ).toEqual({ x: 700, y: 500, width: 100, height: 100 });
     expect(
       clampToCanvas({ x: -3, y: -2, width: 100, height: 100 }, 800, 600),
-    ).toEqual({ x: 0, y: 0, width: 97, height: 98 });
+    ).toEqual({ x: 0, y: 0, width: 97, height: 98, clipX: 3, clipY: 2 });
+  });
+
+  it("reports only the side that is cut off at the left or top, never the right or bottom", () => {
+    expect(
+      clampToCanvas({ x: -5, y: 10, width: 100, height: 700 }, 800, 600),
+    ).toEqual({ x: 0, y: 10, width: 95, height: 590, clipX: 5, clipY: 0 });
+    const right = clampToCanvas(
+      { x: 700, y: 500, width: 200, height: 200 },
+      800,
+      600,
+    );
+    expect(right?.clipX).toBeUndefined();
+    expect(right?.clipY).toBeUndefined();
   });
 
   it("returns null when nothing is inside", () => {
@@ -109,6 +122,19 @@ describe("equality", () => {
         { x: 1, y: 2, width: 3, height: 5 },
       ),
     ).toBe(false);
+    // A pane clipped by a different amount is a different rectangle even at the same viewport.
+    expect(
+      deviceRectsEqual(
+        { x: 0, y: 0, width: 3, height: 4, clipX: 2 },
+        { x: 0, y: 0, width: 3, height: 4, clipX: 3 },
+      ),
+    ).toBe(false);
+    expect(
+      deviceRectsEqual(
+        { x: 0, y: 0, width: 3, height: 4, clipX: 0 },
+        { x: 0, y: 0, width: 3, height: 4 },
+      ),
+    ).toBe(true);
     expect(deviceRectsEqual(null, null)).toBe(true);
     expect(deviceRectsEqual(null, { x: 0, y: 0, width: 1, height: 1 })).toBe(
       false,

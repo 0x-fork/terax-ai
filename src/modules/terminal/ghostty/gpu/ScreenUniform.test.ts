@@ -211,6 +211,7 @@ describe("shader uniform layout", () => {
       expect(offsets).toMatchObject({
         viewport_size: SCREEN_OFFSET.viewportSize,
         origin: SCREEN_OFFSET.origin,
+        clip: SCREEN_OFFSET.clip,
         cell_size: SCREEN_OFFSET.cellSize,
         dims: SCREEN_OFFSET.dims,
         flags: SCREEN_OFFSET.flags,
@@ -236,6 +237,37 @@ describe("shader uniform layout", () => {
     );
     expect(BACKGROUND_SHADER).not.toMatch(/vec2u\(position\.xy\)/);
     expect(GLYPH_SHADER).toMatch(/vec2i\(screen\.origin\)/);
+  });
+
+  it("keeps a clipped pane's origin signed and tells the vertex stage how much was cut off", () => {
+    const uniform = new ScreenUniform();
+    uniform.pack({
+      ...STATE,
+      viewport: { x: 0, y: 0, width: 97, height: 98, clipX: 3, clipY: 2 },
+    });
+    const { u, i } = view(uniform);
+    const at = (offset: number, word = 0) => offset / 4 + word;
+    // The pane starts three pixels left of and two above the viewport it is clipped to.
+    expect([
+      i[at(SCREEN_OFFSET.origin)],
+      i[at(SCREEN_OFFSET.origin, 1)],
+    ]).toEqual([-3, -2]);
+    expect([u[at(SCREEN_OFFSET.clip)], u[at(SCREEN_OFFSET.clip, 1)]]).toEqual([
+      3, 2,
+    ]);
+    uniform.pack({
+      ...STATE,
+      viewport: { x: 40, y: 8, width: 97, height: 98 },
+    });
+    const plain = view(uniform);
+    expect([
+      plain.i[at(SCREEN_OFFSET.origin)],
+      plain.i[at(SCREEN_OFFSET.origin, 1)],
+    ]).toEqual([40, 8]);
+    expect(plain.u[at(SCREEN_OFFSET.clip)]).toBe(0);
+    // Glyph quads leave the vertex stage relative to the viewport, which starts at the clip.
+    expect(GLYPH_SHADER).toMatch(/-\s+vec2f\(screen\.clip\)/);
+    expect(GLYPH_SHADER).toMatch(/origin: vec2i,\s+clip: vec2u,/);
   });
 
   it("moves the grid up by the shift in the cell pass and in the glyph pass alike", () => {

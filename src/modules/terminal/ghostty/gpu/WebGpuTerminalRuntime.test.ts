@@ -701,6 +701,191 @@ describe("WebGpuTerminalRuntime", () => {
       30 * mirror.bytesPerFrame,
     );
   });
+
+  describe("a shared glyph atlas", () => {
+    /**
+     * A pane that binds the atlas's current table and texture the way the real surface does,
+     * rasterizes glyphs when asked, and records any draw that names a destroyed resource.
+     */
+    function createAtlasPane(runtime: WebGpuTerminalRuntime) {
+      const pane = createSurface();
+      const state = {
+        lease: null as ReturnType<
+          WebGpuTerminalRuntime["acquireGlyphAtlas"]
+        > | null,
+        boundGeneration: 0,
+        table: null as GPUBuffer | null,
+        coverage: null as GPUTextureView | null,
+        pending: [] as string[],
+        indices: new Map<string, number>(),
+        violations: [] as string[],
+      };
+      const atlas = () =>
+        (state.lease as NonNullable<typeof state.lease>).atlas;
+      const bind = () => {
+        state.table = atlas().tableBuffer;
+        state.coverage = atlas().coverageTextureView;
+        state.boundGeneration = atlas().generation;
+      };
+      state.lease = runtime.acquireGlyphAtlas(METRICS, pane);
+      bind();
+      pane.prepareFrame.mockImplementation(() => {
+        const texts = state.pending.splice(0);
+        for (const text of texts)
+          state.indices.set(text, atlas().resolve(text, 0));
+        atlas().commit();
+        if (state.boundGeneration !== atlas().generation) bind();
+        return true;
+      });
+      const rebind = vi.fn(() => {
+        if (state.boundGeneration !== atlas().generation) bind();
+      });
+      Object.assign(pane, { rebindAtlas: rebind });
+      pane.drawable.mockImplementation(
+        () => state.boundGeneration === atlas().generation,
+      );
+      const destroyed = (resource: { destroy: unknown } | null) =>
+        resource !== null &&
+        vi.mocked(resource.destroy as () => void).mock.calls.length > 0;
+      pane.encode.mockImplementation(() => {
+        if (destroyed(state.table)) state.violations.push("table");
+        const texture = (state.coverage as unknown as { texture: GPUTexture })
+          .texture;
+        if (destroyed(texture)) state.violations.push("coverage texture");
+      });
+      return { pane, state, rebind };
+    }
+
+    /** Views remember their texture, so a draw can be checked against what was destroyed. */
+    const trackTextures = (h: ReturnType<typeof createHarness>) =>
+      vi
+        .mocked(h.device.createTexture)
+        .mockImplementation((descriptor: GPUTextureDescriptor) => {
+          const texture = {
+            width: (descriptor.size as number[])[0],
+            height: (descriptor.size as number[])[1],
+            format: descriptor.format,
+            createView: vi.fn(() => ({ texture })),
+            destroy: vi.fn(),
+          };
+          return texture as unknown as GPUTexture;
+        });
+
+    /** Lets the work-done promises resolve so retired resources are destroyed. */
+    const settle = async () => {
+      for (let turn = 0; turn < 5; turn++) await Promise.resolve();
+    };
+
+    it("grows its glyph table under one pane while a split neighbour idles, without the neighbour drawing a destroyed resource", async () => {
+      vi.useFakeTimers();
+      const h = createHarness();
+      trackTextures(h);
+      const runtime = await createRuntime();
+      const busy = createAtlasPane(runtime);
+      const idle = createAtlasPane(runtime);
+      join(runtime, busy.pane, { ...FULL, width: 400 });
+      join(runtime, idle.pane, { ...FULL, left: 400, width: 400 });
+      const atlas = busy.state.lease?.atlas as NonNullable<
+        typeof busy.state.lease
+      >["atlas"];
+      expect(idle.state.lease?.atlas).toBe(atlas);
+
+      // Both panes show some text.
+      busy.state.pending.push("a", "b");
+      idle.state.pending.push("x", "y", "z");
+      runtime.schedule(busy.pane);
+      runtime.schedule(idle.pane);
+      h.flushFrame(0);
+      await settle();
+      const firstTable = atlas.tableBuffer;
+      const idleIndices = new Map(idle.state.indices);
+      const idleGeneration = idle.state.boundGeneration;
+      idle.pane.prepareFrame.mockClear();
+
+      // The busy pane rasterizes far more distinct glyphs than the 1,024-entry table holds.
+      busy.state.pending.push(
+        ...Array.from({ length: 1_300 }, (_, i) =>
+          String.fromCodePoint(0x4e00 + i),
+        ),
+      );
+      runtime.schedule(busy.pane);
+      await vi.advanceTimersByTimeAsync(40);
+      h.flushFrame(performance.now());
+      // The idle pane did not prepare, yet it was rebound before the window encoded it.
+      expect(idle.pane.prepareFrame).not.toHaveBeenCalled();
+      expect(idle.rebind).toHaveBeenCalled();
+      expect(atlas.tableBuffer).not.toBe(firstTable);
+      expect(idle.state.boundGeneration).toBe(atlas.generation);
+      expect(idle.state.boundGeneration).toBeGreaterThan(idleGeneration);
+      expect(idle.pane.encode).toHaveBeenCalledTimes(2);
+      await settle();
+      // The retired table is gone once the frame completed ...
+      expect(vi.mocked(firstTable.destroy)).toHaveBeenCalledOnce();
+
+      // ... and the next frame draws the idle pane from the new one.
+      busy.state.pending.push("!");
+      runtime.schedule(busy.pane);
+      await vi.advanceTimersByTimeAsync(40);
+      h.flushFrame(performance.now());
+      await settle();
+      expect(idle.pane.encode).toHaveBeenCalledTimes(3);
+      expect(idle.state.table).toBe(atlas.tableBuffer);
+      expect(idle.state.violations).toEqual([]);
+      expect(busy.state.violations).toEqual([]);
+      expect(idle.pane.handleRuntimeError).not.toHaveBeenCalled();
+      expect(runtime.diagnostics()).toMatchObject({
+        healthy: true,
+        lastError: null,
+        atlasGrowths: 0,
+      });
+      expect(h.destroyDevice).not.toHaveBeenCalled();
+      // The idle pane's glyphs keep their indices, and the new table holds their entries.
+      for (const [text, index] of idleIndices)
+        expect(atlas.resolve(text, 0)).toBe(index);
+      const uploads = vi
+        .mocked(h.device.queue.writeBuffer)
+        .mock.calls.filter(([buffer]) => buffer === atlas.tableBuffer);
+      const whole = uploads.find(([, offset]) => offset === 0);
+      if (!whole) throw new Error("the new glyph table was not uploaded whole");
+      const data = whole[2] as Uint32Array;
+      const words = new Uint32Array(data.buffer, data.byteOffset, data.length);
+      for (const index of idleIndices.values())
+        expect(words[index * 4 + 1]).not.toBe(0);
+    });
+
+    it("prepares every pane that uses an atlas in the frame that flushes it, whatever its pace", async () => {
+      vi.useFakeTimers();
+      const h = createHarness();
+      trackTextures(h);
+      const runtime = await createRuntime();
+      const focused = createAtlasPane(runtime);
+      const background = createAtlasPane(runtime);
+      background.pane.isFocused.mockReturnValue(false);
+      join(runtime, focused.pane, { ...FULL, width: 400 });
+      join(runtime, background.pane, { ...FULL, left: 400, width: 400 });
+      focused.state.pending.push("a");
+      background.state.pending.push("b");
+      runtime.schedule(focused.pane);
+      runtime.schedule(background.pane);
+      h.flushFrame(0);
+      await vi.advanceTimersByTimeAsync(1);
+      focused.pane.prepareFrame.mockClear();
+      background.pane.prepareFrame.mockClear();
+
+      // A full atlas asks for a flush: every glyph index is invalid from this frame on.
+      vi.advanceTimersByTime(8);
+      const atlasEpoch = focused.state.lease?.atlas.epoch ?? 0;
+      focused.state.lease?.requestFlush();
+      // The first frame the pacer allows: the focused pane is due, the background one is not.
+      for (let wait = 0; wait < 200 && h.frames.size === 0; wait++)
+        await vi.advanceTimersByTimeAsync(1);
+      h.flushFrame(performance.now());
+      expect(focused.state.lease?.atlas.epoch).toBeGreaterThan(atlasEpoch);
+      // The background pane's tick is far off, but its uploaded cells name flushed indices.
+      expect(focused.pane.prepareFrame).toHaveBeenCalledOnce();
+      expect(background.pane.prepareFrame).toHaveBeenCalledOnce();
+    });
+  });
 });
 
 function createHarness() {

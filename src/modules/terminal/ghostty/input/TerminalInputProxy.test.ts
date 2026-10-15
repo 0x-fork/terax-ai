@@ -252,3 +252,81 @@ describe("TerminalInputProxy", () => {
     h.controller.dispose();
   });
 });
+
+describe("TerminalInputProxy off macOS", () => {
+  // WebKitGTK and Chromium can publish a non-collapsed selection of a focused textarea as the
+  // X11 PRIMARY selection, and screen readers announce it: the placeholder is macOS only.
+  it("never selects anything: the field stays empty with a collapsed selection", () => {
+    const h = setup({ isMac: false });
+    expect(h.input.value).toBe("");
+    expect(h.input.selectionStart).toBe(h.input.selectionEnd);
+    for (const type of ["focus", "keyup", "input"]) {
+      fire(h.input, type);
+      expect(h.input.value).toBe("");
+      expect(h.input.selectionStart).toBe(h.input.selectionEnd);
+    }
+    h.controller.dispose();
+  });
+
+  it("empties the field after handled input, as before the placeholder existed", () => {
+    const h = setup({ isMac: false });
+    h.input.replaceSelection("x");
+    fire(h.input, "beforeinput", { inputType: "insertText", data: "x" });
+    expect(h.text()).toBe("x");
+    expect(h.input.value).toBe("");
+    h.input.replaceSelection("é");
+    fire(h.input, "compositionstart");
+    fire(h.input, "compositionend", { data: "é" });
+    expect(h.text()).toBe("xé");
+    expect(h.input.value).toBe("");
+    h.controller.dispose();
+  });
+
+  it("leaves a composition and the context menu's text alone", () => {
+    const h = setup({ isMac: false });
+    fire(h.input, "compositionstart");
+    h.input.value = "に";
+    fire(h.input, "keyup");
+    expect(h.input.value).toBe("に");
+    fire(h.input, "compositionend", { data: "日" });
+    expect(h.input.value).toBe("");
+
+    const input = new FakeTextArea();
+    const proxy = new TerminalInputProxy(
+      input as unknown as HTMLTextAreaElement,
+      { placeholder: false },
+    );
+    proxy.expose("selected output");
+    input.select();
+    fire(input, "focus");
+    expect(input.value).toBe("selected output");
+    proxy.release();
+    expect(input.value).toBe("");
+    expect(input.selectionStart).toBe(input.selectionEnd);
+    proxy.dispose();
+    h.controller.dispose();
+  });
+
+  it("enables the placeholder by the platform unless told otherwise", () => {
+    for (const [isMac, inputPlaceholder, armed] of [
+      [true, undefined, true],
+      [false, undefined, false],
+      [false, true, true],
+      [true, false, false],
+    ] as const) {
+      const input = new FakeTextArea();
+      const controller = new GhosttyInputController({
+        model: model(),
+        input: input as unknown as HTMLTextAreaElement,
+        pointerTarget: new FakeElement() as unknown as HTMLElement,
+        cellSize: () => ({ width: 10, height: 20 }),
+        isMac,
+        inputPlaceholder,
+        onCopy: () => false,
+        onData: () => {},
+      });
+      expect(input.value === PLACEHOLDER).toBe(armed);
+      controller.dispose();
+    }
+  });
+});

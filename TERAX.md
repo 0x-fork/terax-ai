@@ -76,7 +76,8 @@ the wrappers of a frame (texture, view, encoder, pass, command buffer) pin about
 collects them after minutes (20 MiB a minute for a streaming agent). Allocating and
 dropping a 126 KiB `ArrayBuffer` per frame (ten times the native cost; measured:
 unfinalized canvas textures after 120 s 2,626 without, 195 with it, no change in
-instructions per second) makes young-generation collections run steadily.
+instructions per second) makes young-generation collections run steadily. At most
+4 MiB a second is mirrored, so display-rate frames allocate no more than a 25 fps agent.
 Resizing applies one synchronized model + PTY resize per gesture. Every SIGWINCH
 makes zsh/fish and Ink-based agents redraw, and redraws that do not line up with a
 reflowed grid leave duplicates in scrollback, so during a resize gesture (native
@@ -174,8 +175,8 @@ or search-mask work until presentation resumes.
 Terminal clipboard shortcuts use the native text clipboard plugin on all desktop
 platforms. Context clicks expose the selected text through the input element to
 restore the webview's native text menu; no persistent DOM scrollback is maintained.
-The input `<textarea>` always holds one selected placeholder character
-(`TerminalInputProxy`): a focused editable with a collapsed selection keeps
+On macOS the input `<textarea>` always holds one selected placeholder character
+(`TerminalInputProxy`; elsewhere it stays empty, a selection could take X11 PRIMARY): a focused editable with a collapsed selection keeps
 WebKit's caret animation (a display link at display rate) running at ~3 % CPU and
 ~250 wakeups/s while idle, a non-collapsed selection paints no caret (0.2 %, ~10/s).
 It re-arms after input, key release and focus, never during IME composition, and

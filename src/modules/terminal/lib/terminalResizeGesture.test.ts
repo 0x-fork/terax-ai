@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   GESTURE_GAP_MS,
+  NATIVE_STALE_MS,
   noteTerminalHostResize,
   resetTerminalResizeGestureForTest,
   setNativeLiveResize,
@@ -120,6 +121,61 @@ describe("terminalResizeGesture", () => {
     }
     expect(terminalResizeInteractionActive()).toBe(true);
     setNativeLiveResize(false);
+    expect(terminalResizeInteractionActive()).toBe(false);
+  });
+
+  it("stops trusting a native live resize whose end signal was lost", () => {
+    const listener = vi.fn();
+    const stop = subscribeTerminalResizeInteraction(listener);
+    const surface = {};
+    setNativeLiveResize(true);
+    noteTerminalHostResize(surface);
+    expect(terminalResizeInteractionActive()).toBe(true);
+    // No end signal ever arrives and the window stops changing size.
+    vi.advanceTimersByTime(NATIVE_STALE_MS + 1);
+    expect(terminalResizeInteractionActive()).toBe(true);
+    // The next host resize finds the claim stale: it is an ordinary resize again, applied at
+    // once, not the first of thirty seconds of held ones.
+    noteTerminalHostResize(surface);
+    expect(terminalResizeInteractionActive()).toBe(false);
+    expect(listener).toHaveBeenLastCalledWith(false);
+    vi.advanceTimersByTime(GESTURE_GAP_MS * 2);
+    noteTerminalHostResize(surface);
+    expect(terminalResizeInteractionActive()).toBe(false);
+    // A late or repeated end signal is harmless, and a new live resize works again.
+    setNativeLiveResize(false);
+    setNativeLiveResize(true);
+    expect(terminalResizeInteractionActive()).toBe(true);
+    setNativeLiveResize(false);
+    expect(terminalResizeInteractionActive()).toBe(false);
+    stop();
+  });
+
+  it("keeps a native live resize that pauses briefly mid-drag", () => {
+    const surface = {};
+    setNativeLiveResize(true);
+    for (let step = 0; step < 20; step++) {
+      vi.advanceTimersByTime(NATIVE_STALE_MS - 100);
+      noteTerminalHostResize(surface);
+      expect(terminalResizeInteractionActive()).toBe(true);
+    }
+    setNativeLiveResize(false);
+    expect(terminalResizeInteractionActive()).toBe(false);
+  });
+
+  it("keeps a burst gesture alive past the interaction watchdog while the host keeps changing", () => {
+    const surface = {};
+    noteTerminalHostResize(surface);
+    vi.advanceTimersByTime(16);
+    noteTerminalHostResize(surface);
+    expect(terminalResizeInteractionActive()).toBe(true);
+    // A non-native drag that lasts 45 s, a host change every 100 ms.
+    for (let step = 0; step < 450; step++) {
+      vi.advanceTimersByTime(100);
+      noteTerminalHostResize(surface);
+    }
+    expect(terminalResizeInteractionActive()).toBe(true);
+    vi.advanceTimersByTime(GESTURE_GAP_MS);
     expect(terminalResizeInteractionActive()).toBe(false);
   });
 });

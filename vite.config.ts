@@ -1,12 +1,32 @@
 import babel from "@rolldown/plugin-babel";
 import tailwindcss from "@tailwindcss/vite";
 import react, { reactCompilerPreset } from "@vitejs/plugin-react";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { defineConfig, type PluginOption, type UserConfig } from "vite";
 import Inspect from "vite-plugin-inspect";
 
 const host = process.env.TAURI_DEV_HOST;
 const rootDir = import.meta.dirname;
+
+// The app-lab driver (`TERAX_BENCH=1`) may only be built for the lab's own identifier
+// (scripts/app-lab/run.py sets TERAX_BENCH_IDENTIFIER): a stray `TERAX_BENCH=1 pnpm build` or
+// `tauri build` would otherwise ship the driver under the product identifier. The Rust side
+// refuses to start a bench binary under it too (modules/bench.rs); this fails the build early.
+if (process.env.TERAX_BENCH === "1") {
+  const product = (
+    JSON.parse(
+      readFileSync(path.join(rootDir, "src-tauri/tauri.conf.json"), "utf8"),
+    ) as { identifier: string }
+  ).identifier;
+  const identifier = process.env.TERAX_BENCH_IDENTIFIER;
+  if (!identifier || identifier === product) {
+    throw new Error(
+      `TERAX_BENCH=1 builds the app-lab driver and needs its own TERAX_BENCH_IDENTIFIER ` +
+        `(not the product identifier ${product}); run scripts/app-lab/run.py instead`,
+    );
+  }
+}
 
 // Bundle/treemap analysis is opt-in: `ANALYZE=true pnpm build` emits stats.html.
 const analyze = process.env.ANALYZE === "true";

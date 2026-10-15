@@ -7,7 +7,7 @@
  * All coordinates are integer device pixels; nothing is filtered.
  */
 
-export const SCREEN_UNIFORM_BYTES = 176;
+export const SCREEN_UNIFORM_BYTES = 192;
 
 /** Byte offsets of `Screen` fields; the TypeScript packer mirrors this layout. */
 export const SCREEN_OFFSET = {
@@ -25,11 +25,16 @@ export const SCREEN_OFFSET = {
   selectionColor: 80,
   selectionLines: 96,
   selectionColumns: 112,
-  /** Device-pixel origin of the pane's viewport; fragment coordinates are window-relative. */
+  /**
+   * Device-pixel origin of the pane (signed: a pane laid out partly left of or above the canvas
+   * starts before its viewport); fragment coordinates are window-relative.
+   */
   origin: 120,
-  decoration: 128,
-  contrast: 144,
-  gamma: 160,
+  /** Device pixels of the pane cut off at the canvas's left and top edge (viewport starts there). */
+  clip: 128,
+  decoration: 144,
+  contrast: 160,
+  gamma: 176,
 } as const;
 
 export const SCREEN_FLAG_TEXT_BLINK_VISIBLE = 1;
@@ -37,6 +42,16 @@ export const SCREEN_FLAG_SEARCH_ACTIVE = 2;
 export const SCREEN_FLAG_SELECTION_ACTIVE = 4;
 export const SCREEN_FLAG_SELECTION_RECTANGULAR = 8;
 
+/*
+ * Notes on the shader source below (kept out of the WGSL strings: they ship in the bundle):
+ * - `cell_background` is the displayed background of a cell after search and selection. The
+ *   trailing half of a wide character takes both from its lead, as the previous renderer
+ *   treated the pair as one span.
+ * - Fragment coordinates are relative to the window canvas, not to the pane's viewport.
+ * - A glyph that overhangs to the left is clipped where the neighbour's background differs,
+ *   so it cannot paint over a selection or a coloured cell.
+ * - Cell-exact shapes (box drawing, shades) keep their coverage as drawn, without contrast.
+ */
 const COMMON = /* wgsl */ `
 struct Screen {
   viewport_size: vec2f,
@@ -51,7 +66,8 @@ struct Screen {
   selection_color: vec4f,
   selection_lines: vec4i,
   selection_columns: vec2i,
-  origin: vec2u,
+  origin: vec2i,
+  clip: vec2u,
   decoration: vec4u,
   contrast: vec4f,
   gamma: vec4f,
@@ -109,9 +125,6 @@ fn search_state(cell_index: u32) -> u32 {
   return (word >> ((cell_index & 3u) * 8u)) & 3u;
 }
 
-// The displayed background of a cell after search and selection. The trailing
-// half of a wide character takes both from its lead, exactly as the previous
-// renderer treated the pair as one span.
 fn cell_background(index: u32, row: u32, col: u32) -> vec3f {
   var lead_col = col;
   if (is_spacer_tail(index, col)) { lead_col = col - 1u; }
@@ -185,7 +198,6 @@ fn decoration_color(
 
 @fragment
 fn fragment_main(@builtin(position) position: vec4f) -> @location(0) vec4f {
-  // Fragment coordinates are relative to the window canvas, not to the pane's viewport.
   let local_position = position.xy - vec2f(screen.origin) + vec2f(0.0, f32(screen.shift_y));
   let pixel = vec2u(local_position);
   let cell = pixel / screen.cell_size;
@@ -269,8 +281,6 @@ fn vertex_main(
   var drawn = size;
   var skipped = 0;
 
-  // A glyph that overhangs to the left is clipped where the neighbour's
-  // background differs, so it cannot paint over a selection or a coloured cell.
   let padding = i32(screen.decoration.w);
   let bearing_x = low_signed(entry.z);
   if (bearing_x < -padding) {
@@ -290,7 +300,8 @@ fn vertex_main(
     vec2f(0.0, 1.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0),
   );
   let corner = corners[vertex_index];
-  let pixel = vec2f(origin) + corner * vec2f(drawn) - vec2f(0.0, f32(screen.shift_y));
+  let pixel = vec2f(origin) + corner * vec2f(drawn) - vec2f(0.0, f32(screen.shift_y)) -
+    vec2f(screen.clip);
   var output: VertexOutput;
   output.position = vec4f(
     pixel.x / screen.viewport_size.x * 2.0 - 1.0,
@@ -334,7 +345,6 @@ fn fragment_main(
     return vec4f(sample.rgb, sample.a * color.a);
   }
   let coverage = textureLoad(coverage_texture, texel, 0).r;
-  // Cell-exact shapes (box drawing, shades) keep their coverage as drawn.
   if ((glyph_flags & 2u) != 0u) { return vec4f(color.rgb, color.a * coverage); }
   return vec4f(color.rgb, color.a * apply_contrast(coverage, color.rgb));
 }

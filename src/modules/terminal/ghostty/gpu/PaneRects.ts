@@ -19,6 +19,13 @@ export type DeviceRect = {
   readonly y: number;
   readonly width: number;
   readonly height: number;
+  /**
+   * Device pixels of the pane that lie left of / above the canvas and are cut off (a pane laid
+   * out partly outside the area). The rectangle is what remains, and the pane's own origin is
+   * `x - clipX`, `y - clipY`. Absent means none.
+   */
+  readonly clipX?: number;
+  readonly clipY?: number;
 };
 
 /**
@@ -63,7 +70,9 @@ export function snapPaneRect(
 
 /**
  * The part of a rectangle that lies inside a canvas of the given size, or null when nothing is
- * left. WebGPU rejects a viewport or scissor rectangle that leaves the render target.
+ * left. WebGPU rejects a viewport or scissor rectangle that leaves the render target. What is
+ * cut off at the left or top is reported (`clipX`, `clipY`), so the pane keeps its place and
+ * is clipped rather than slid to the canvas edge.
  */
 export function clampToCanvas(
   rect: DeviceRect,
@@ -75,7 +84,10 @@ export function clampToCanvas(
   const x1 = Math.min(canvasWidth, rect.x + rect.width);
   const y1 = Math.min(canvasHeight, rect.y + rect.height);
   if (x1 <= x0 || y1 <= y0) return null;
-  return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+  const clipX = x0 - rect.x;
+  const clipY = y0 - rect.y;
+  const clamped = { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+  return clipX > 0 || clipY > 0 ? { ...clamped, clipX, clipY } : clamped;
 }
 
 export function deviceRectsEqual(
@@ -85,7 +97,12 @@ export function deviceRectsEqual(
   if (a === b) return true;
   if (!a || !b) return false;
   return (
-    a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height
+    a.x === b.x &&
+    a.y === b.y &&
+    a.width === b.width &&
+    a.height === b.height &&
+    (a.clipX ?? 0) === (b.clipX ?? 0) &&
+    (a.clipY ?? 0) === (b.clipY ?? 0)
   );
 }
 

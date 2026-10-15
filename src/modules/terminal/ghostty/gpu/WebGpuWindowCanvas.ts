@@ -318,6 +318,9 @@ export class WebGpuWindowCanvas {
     this.device = configuration.device;
     this.reconfigurations += 1;
     this.dirty = true;
+    // Reconfiguring cleared the canvas, and the panes cover it again (`handleDeviceLoss`):
+    // each one is revealed anew by the first frame the replacement device draws for it.
+    for (const state of this.panes.values()) state.drawn = false;
   }
 
   /**
@@ -514,6 +517,10 @@ export class WebGpuWindowCanvas {
     this.readAreaRect();
     const box = this.areaCss;
     if (!box) return;
+    // The snap offset depends on the ratio as well as the rectangle: a move to a display with
+    // another ratio leaves the rectangle alone (`readAreaRect` reports no change) but needs a
+    // different translation. Idempotent when nothing differs.
+    this.applyTransform(box);
     // Rounded up, so the canvas always covers the area: pane rectangles are clamped to it and
     // anything beyond the area is clipped by the area itself.
     this.areaDevice = {

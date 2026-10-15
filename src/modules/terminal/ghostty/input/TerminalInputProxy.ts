@@ -9,6 +9,11 @@
  * Rules: keep (value, selection) at (placeholder, 0..1) whenever nothing else
  * owns the field, and never touch either while an IME composition is in
  * progress or while the native context menu is given real text to copy.
+ *
+ * This is a WebKit/macOS fix and macOS only: on WebKitGTK or Chromium a
+ * non-collapsed selection in a focused textarea can take over the X11 PRIMARY
+ * selection and is announced by screen readers. Elsewhere (`placeholder:
+ * false`) the field stays empty with a collapsed selection, as before.
  */
 export const TERMINAL_INPUT_PLACEHOLDER = " ";
 
@@ -22,11 +27,21 @@ type ProxyInput = Pick<
   | "removeEventListener"
 >;
 
+export type TerminalInputProxyOptions = {
+  /** Keep the selected placeholder (macOS). Otherwise the field is kept empty. */
+  readonly placeholder: boolean;
+};
+
 export class TerminalInputProxy {
   private composing = false;
   private exposed = false;
+  private readonly placeholder: boolean;
 
-  constructor(private readonly input: ProxyInput) {
+  constructor(
+    private readonly input: ProxyInput,
+    options: TerminalInputProxyOptions = { placeholder: true },
+  ) {
+    this.placeholder = options.placeholder;
     input.addEventListener("compositionstart", this.compositionStart);
     input.addEventListener("compositionend", this.compositionEnd);
     input.addEventListener("input", this.settle);
@@ -50,6 +65,10 @@ export class TerminalInputProxy {
   arm(): void {
     if (this.composing || this.exposed) return;
     const { input } = this;
+    if (!this.placeholder) {
+      if (input.value !== "") input.value = "";
+      return;
+    }
     if (input.value !== TERMINAL_INPUT_PLACEHOLDER)
       input.value = TERMINAL_INPUT_PLACEHOLDER;
     if (input.selectionStart !== 0 || input.selectionEnd !== 1)

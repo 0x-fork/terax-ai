@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   GC_MIRROR_BATCH_BYTES,
   GC_MIRROR_FACTOR,
+  GC_MIRROR_MAX_BYTES_PER_SECOND,
   GcPressureMirror,
   gcPressureOptionsFromStorage,
   NATIVE_BYTES_PER_FRAME,
@@ -39,37 +40,101 @@ describe("GcPressureMirror", () => {
     expect(allocate).toHaveBeenCalledOnce();
   });
 
-  it("mirrors the whole cost without drifting over many frames", () => {
+  /** A mirror on a fake clock, fed frames at a steady rate. */
+  function run(framesPerSecond: number, seconds: number, options = {}) {
     const sizes: number[] = [];
+    let clock = 0;
     const mirror = new GcPressureMirror({
+      allocate: (bytes) => sizes.push(bytes),
+      now: () => clock,
+      ...options,
+    });
+    const frames = Math.round(framesPerSecond * seconds);
+    for (let frame = 0; frame < frames; frame++) {
+      clock += 1000 / framesPerSecond;
+      mirror.noteFrame();
+    }
+    return {
+      sizes,
+      mirror,
+      total: sizes.reduce((sum, bytes) => sum + bytes, 0),
+    };
+  }
+
+  it("mirrors the whole cost without drifting over many frames", () => {
+    const { sizes, total } = run(100, 60, {
       bytesPerFrame: 12_900,
       batchBytes: 64 * 1024,
-      allocate: (bytes) => sizes.push(bytes),
     });
-    for (let frame = 0; frame < 6_000; frame++) mirror.noteFrame();
-    const total = sizes.reduce((sum, bytes) => sum + bytes, 0);
-    // Everything owed was allocated except what is still below one batch.
+    // Under the cap everything owed is allocated except what is still below one batch.
     expect(total).toBeLessThanOrEqual(6_000 * 12_900);
     expect(6_000 * 12_900 - total).toBeLessThan(64 * 1024);
     expect(
       sizes.every((bytes) => bytes >= 64 * 1024 && bytes < 64 * 1024 + 12_900),
     ).toBe(true);
+  });
+
+  it("mirrors every frame of a 25 fps stream, the case the weight was measured at", () => {
+    const { sizes, mirror } = run(25, 60);
+    expect(sizes).toHaveLength(25 * 60);
+    expect(new Set(sizes)).toEqual(new Set([129_000]));
+    expect(mirror.diagnostics().allocations).toBe(25 * 60);
+  });
+
+  it("caps the mirrored bytes per second at the display rate instead of allocating a buffer per frame", () => {
+    const seconds = 20;
+    const { sizes, total, mirror } = run(120, seconds);
+    const cap = GC_MIRROR_MAX_BYTES_PER_SECOND;
+    // The old behaviour was 120 buffers of 129 KB a second (15 MB/s).
+    expect(120 * seconds * 129_000).toBeGreaterThan(3 * cap * seconds);
+    expect(total).toBeLessThanOrEqual(cap * seconds + cap / 4);
+    // The allowance is used, not left idle: the cadence the collector sees is the 25 fps one.
+    expect(total).toBeGreaterThan(cap * seconds * 0.9);
+    expect(sizes.length).toBeLessThan(120 * seconds * 0.6);
+    expect(Math.max(...sizes)).toBeLessThanOrEqual(4 * GC_MIRROR_BATCH_BYTES);
     expect(mirror.diagnostics()).toMatchObject({
-      frames: 6_000,
-      allocations: sizes.length,
-      allocatedBytes: total,
+      frames: 120 * seconds,
+      maxBytesPerSecond: cap,
     });
   });
 
-  it("never allocates a buffer big enough to be a full collection's trigger", () => {
+  it("does not store up cost the cap held back: a stall is followed by one burst, not a debt", () => {
     const sizes: number[] = [];
+    let clock = 0;
     const mirror = new GcPressureMirror({
       allocate: (bytes) => sizes.push(bytes),
+      now: () => clock,
     });
-    for (let frame = 0; frame < 100_000; frame++) mirror.noteFrame();
+    // A long run of frames in the same instant (a backlog drained at once).
+    for (let frame = 0; frame < 5_000; frame++) mirror.noteFrame();
+    const burst = sizes.reduce((sum, bytes) => sum + bytes, 0);
+    expect(burst).toBeLessThanOrEqual(GC_MIRROR_MAX_BYTES_PER_SECOND / 4);
+    sizes.length = 0;
+    // Time passing refills at the cap; frames after it owe at most one burst.
+    clock += 10_000;
+    for (let frame = 0; frame < 5_000; frame++) mirror.noteFrame();
+    expect(sizes.reduce((sum, bytes) => sum + bytes, 0)).toBeLessThanOrEqual(
+      GC_MIRROR_MAX_BYTES_PER_SECOND / 4,
+    );
+  });
+
+  it("can run uncapped for experiments", () => {
+    const { sizes } = run(120, 5, { maxBytesPerSecond: 0 });
+    expect(sizes).toHaveLength(600);
+    // Frames in one instant (no time passes) are not special either.
+    const same: number[] = [];
+    const mirror = new GcPressureMirror({
+      maxBytesPerSecond: 0,
+      now: () => 0,
+      allocate: (bytes) => same.push(bytes),
+    });
+    for (let frame = 0; frame < 50; frame++) mirror.noteFrame();
+    expect(same).toHaveLength(50);
+  });
+
+  it("never allocates a buffer big enough to be a full collection's trigger", () => {
+    const { sizes } = run(60, 600);
     expect(Math.max(...sizes)).toBeLessThan(1024 * 1024);
-    // At 60 frames a second this is about 7 MiB of short-lived buffers a second, not a spike.
-    expect(sizes.length).toBe(100_000);
   });
 
   it("is inert when disabled", () => {

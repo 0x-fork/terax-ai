@@ -65,6 +65,12 @@ export interface WebGpuRuntimeSurface extends WindowCanvasPane {
   ): boolean;
   /** The pane's first frame reached the screen: its DOM background can step aside. */
   handleCanvasRevealed?(): void;
+  /**
+   * The shared glyph atlas replaced a texture or its table since this pane bound them (another
+   * pane grew it). Rebinds without uploading anything, so the pane never draws a destroyed
+   * resource whatever its pace. Called after every pane prepared, before the window encodes.
+   */
+  rebindAtlas?(resources: WebGpuSharedResources): void;
   handleRuntimeReset(resources: WebGpuSharedResources): void;
   handleRuntimeError(error: Error): void;
   /** Pause or resume. Pausing stops rendering and timers and releases no GPU resource. */
@@ -82,6 +88,8 @@ type AtlasEntry = {
   lastUsed: number;
   flushRequested: boolean;
   lastFlush: number;
+  /** Atlas generation the users were last rebound for (see `rebindAtlasUsers`). */
+  seenGeneration: number;
 };
 
 export type GlyphAtlasLease = {
@@ -191,7 +199,10 @@ export class WebGpuTerminalRuntime {
   private readonly surfaces = new Set<WebGpuRuntimeSurface>();
   private dirtySurfaces = new Set<WebGpuRuntimeSurface>();
   private renderSurfaces = new Set<WebGpuRuntimeSurface>();
-  /** Panes whose rectangle changed this frame; they prepare whatever their pace. */
+  /**
+   * Panes that must prepare in this frame whatever their pace: their rectangle changed, or an
+   * atlas flush invalidated the glyph indices their uploaded cells name.
+   */
   private readonly movedSurfaces = new Set<WebGpuRuntimeSurface>();
   private readonly atlases = new Map<string, AtlasEntry>();
   private device: GPUDevice | null = null;
@@ -382,7 +393,9 @@ export class WebGpuTerminalRuntime {
         lastUsed: performance.now(),
         flushRequested: false,
         lastFlush: Number.NEGATIVE_INFINITY,
+        seenGeneration: 0,
       };
+      entry.seenGeneration = entry.atlas.generation;
       this.atlases.set(key, entry);
     }
     const owned = entry;
@@ -690,7 +703,7 @@ export class WebGpuTerminalRuntime {
       let due = 0;
       // Flushes happen before any surface prepares, so no upload in this frame
       // can read indices that a later flush would invalidate.
-      this.applyAtlasFlushes();
+      this.applyAtlasFlushes(batch);
       const budget = createRasterBudget(RASTER_BUDGET_MS);
 
       for (const surface of batch) {
@@ -722,6 +735,10 @@ export class WebGpuTerminalRuntime {
         }
       }
       this.movedSurfaces.clear();
+      // A pane that grew the shared atlas retired textures and the glyph table the other panes'
+      // bind groups still name, whether or not those panes prepared in this frame. Rebind them
+      // before anything is encoded and before the retired resources are released.
+      this.rebindAtlasUsers(resources);
 
       if (due === 0) this.idleAnimationFrames += 1;
       // One command buffer for every window; a window with nothing new draws nothing and
@@ -840,7 +857,28 @@ export class WebGpuTerminalRuntime {
     return completion;
   }
 
-  private applyAtlasFlushes(): void {
+  private rebindAtlasUsers(resources: WebGpuSharedResources): void {
+    for (const entry of this.atlases.values()) {
+      const generation = entry.atlas.generation;
+      if (generation === entry.seenGeneration) continue;
+      entry.seenGeneration = generation;
+      for (const surface of entry.users) {
+        if (!this.surfaces.has(surface)) continue;
+        try {
+          surface.rebindAtlas?.(resources);
+        } catch (error) {
+          surface.handleRuntimeError(toError(error));
+        }
+      }
+    }
+  }
+
+  /**
+   * Flushes the atlases that asked for it (between frames, before any pane prepares). A flush
+   * invalidates every glyph index, so each user prepares in this very frame whatever its pace:
+   * a pane that waited for its tick would be drawn with indices that now name other glyphs.
+   */
+  private applyAtlasFlushes(batch: Set<WebGpuRuntimeSurface>): void {
     const now = performance.now();
     for (const entry of this.atlases.values()) {
       if (!entry.flushRequested || !entry.atlas.active) continue;
@@ -848,7 +886,11 @@ export class WebGpuTerminalRuntime {
       entry.flushRequested = false;
       entry.lastFlush = now;
       entry.atlas.flush();
-      for (const surface of entry.users) this.dirtySurfaces.add(surface);
+      for (const surface of entry.users) {
+        if (!this.surfaces.has(surface)) continue;
+        batch.add(surface);
+        this.movedSurfaces.add(surface);
+      }
     }
   }
 

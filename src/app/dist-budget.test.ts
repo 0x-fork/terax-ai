@@ -1,5 +1,11 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -212,6 +218,48 @@ describe("built startup graph", () => {
     }
   });
 
+  it("refuses to build the app-lab driver without its own identifier, and under the product one", () => {
+    const build = (extra: Record<string, string>) =>
+      execFileSync(
+        process.execPath,
+        [
+          join(root, "node_modules/vite/bin/vite.js"),
+          "build",
+          "--outDir",
+          join(outDir, "guarded"),
+          "--logLevel",
+          "error",
+        ],
+        {
+          cwd: root,
+          env: {
+            ...process.env,
+            NODE_ENV: "production",
+            TERAX_BENCH: "1",
+            ...extra,
+          },
+          stdio: "pipe",
+          timeout: 60_000,
+        },
+      );
+    const failure = (extra: Record<string, string>): string => {
+      try {
+        build(extra);
+      } catch (error) {
+        return String((error as { stderr?: Buffer }).stderr ?? error);
+      }
+      return "";
+    };
+    expect(failure({ TERAX_BENCH_IDENTIFIER: "" })).toContain(
+      "TERAX_BENCH_IDENTIFIER",
+    );
+    expect(failure({ TERAX_BENCH_IDENTIFIER: "app.crynta.terax" })).toContain(
+      "not the product identifier",
+    );
+    // Nothing was emitted by either attempt.
+    expect(existsSync(join(outDir, "guarded"))).toBe(false);
+  });
+
   it("contains none of the app-lab benchmark driver (TERAX_BENCH is off)", () => {
     // The driver (src/bench) and its Tauri commands exist only in builds made with
     // TERAX_BENCH=1: `__TERAX_BENCH__` is the literal `false` otherwise, so its lazy import, the
@@ -221,6 +269,9 @@ describe("built startup graph", () => {
       "bench_window",
       "bench_exit",
       "__teraxBenchConfig",
+      // The smoothness probe's seam (src/bench/smoothHooks.ts): product code reports to it
+      // only behind __TERAX_BENCH__, and the lookup itself is gated too.
+      "__teraxSmooth",
       "terax:bench:",
       "TERAX_BENCH",
       "__TERAX_BENCH__",

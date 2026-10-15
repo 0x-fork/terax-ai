@@ -409,6 +409,35 @@ describe("GhosttyInputController", () => {
     controller.dispose();
   });
 
+  it("reports the cell that is drawn under the pointer while the grid is shifted up", () => {
+    const input = new FakeTextArea();
+    const pointerTarget = new FakeElement();
+    const onData = vi.fn();
+    let shift = 40;
+    const controller = new GhosttyInputController({
+      model: inputModel((mode) => mode === 1003 || mode === 1006),
+      input: input as unknown as HTMLTextAreaElement,
+      pointerTarget: pointerTarget as unknown as HTMLElement,
+      cellSize: () => ({ width: 10, height: 20 }),
+      gridShiftY: () => shift,
+      onData,
+      onCopy: () => false,
+      isMac: false,
+    });
+    const report = (clientY: number) => {
+      onData.mockClear();
+      pointerTarget.dispatchEvent(
+        mouseEvent("mousemove", { clientX: 15, clientY }),
+      );
+      return new TextDecoder().decode(onData.mock.calls[0][0]);
+    };
+    // 25 px down with the grid moved up 40 px is 65 px into the grid: row 4 (1-based).
+    expect(report(25)).toBe("\x1b[<32;2;4M");
+    shift = 0;
+    expect(report(31)).toBe("\x1b[<32;2;2M");
+    controller.dispose();
+  });
+
   it("deduplicates identical mouse-motion reports within a cell", () => {
     const input = new FakeTextArea();
     const pointerTarget = new FakeElement();
