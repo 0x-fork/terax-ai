@@ -1,3 +1,7 @@
+import {
+  beginTerminalResizeInteraction,
+  endTerminalResizeInteraction,
+} from "@/modules/terminal/lib/terminalResizeInteraction";
 import type { TerminalDamage } from "@/modules/terminal/backend/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
@@ -470,44 +474,116 @@ describe("resizing the host", () => {
     ...ORIGIN,
   });
 
-  it("resizes the model and tells the PTY in the same call, at most once per interval during a drag", async () => {
+  it("leaves the model and the PTY alone during a gesture and applies the final size once at its end", async () => {
     vi.useFakeTimers();
-    const h = await harness({ resizeIntervalMs: 100 });
+    const h = await harness();
     h.render();
     vi.advanceTimersByTime(500);
     const first = h.surface.diagnostics();
     h.onResize.mockClear();
+    h.model.setPixelSize.mockClear();
 
+    const token = {};
+    beginTerminalResizeInteraction(token);
     // A drag: a new host width every 16 ms for a second, a frame after each.
-    const applied: Array<[number, number]> = [];
-    h.onResize.mockImplementation((cols: number, rows: number) => {
-      applied.push([cols, rows]);
-      // The model already has the size the PTY is told about.
-      expect(h.surface.diagnostics().cols).toBe(cols);
-      expect(h.surface.diagnostics().rows).toBe(rows);
-    });
     for (let step = 1; step <= 62; step++) {
       h.observe(hostSize(960 - step * 8));
       h.render();
       vi.advanceTimersByTime(16);
       h.render();
+      // The pane's rectangle follows the host at once ...
+      expect(h.setBounds).toHaveBeenLastCalledWith(
+        expect.objectContaining({ width: 960 - step * 8 }),
+      );
     }
-    vi.advanceTimersByTime(100);
+    // ... while neither the grid nor the shell heard about any of it.
+    expect(h.onResize).not.toHaveBeenCalled();
+    expect(h.model.setPixelSize).not.toHaveBeenCalled();
+    expect(h.surface.diagnostics().cols).toBe(first.cols);
+    expect(h.surface.diagnostics().deferredGridResizes).toBeGreaterThan(30);
+
+    endTerminalResizeInteraction(token);
+    // The burst detector of the observer is quiet 150 ms after the last change.
+    vi.advanceTimersByTime(200);
     h.render();
 
-    expect(applied.length).toBeGreaterThanOrEqual(9);
-    expect(applied.length).toBeLessThanOrEqual(11);
-    // The final width lands within one interval of the last movement.
+    // One synchronized resize at the final size.
+    expect(h.onResize).toHaveBeenCalledOnce();
     const last = h.surface.diagnostics();
     expect(last.cols).toBe(Math.floor((960 - 62 * 8) / 8));
-    expect(applied[applied.length - 1]).toEqual([last.cols, last.rows]);
+    expect(h.onResize).toHaveBeenCalledWith(last.cols, last.rows);
     expect(last.cols).toBeLessThan(first.cols);
-    expect(h.surface.diagnostics().deferredGridResizes).toBeGreaterThan(30);
   });
 
-  it("applies the first change at once and every non-drag fit immediately", async () => {
+  it("moves the grid up inside a shorter pane so the cursor row stays visible, only while the gesture lasts", async () => {
     vi.useFakeTimers();
-    const h = await harness({ resizeIntervalMs: 100 });
+    const h = await harness();
+    h.render();
+    vi.advanceTimersByTime(500);
+    const shift = () => {
+      h.writeBuffer.mockClear();
+      h.render();
+      const upload = h.writeBuffer.mock.calls.find(
+        ([buffer]) => buffer === h.lastUniformBuffer(),
+      );
+      if (!upload) return null;
+      return new Uint32Array((upload[2] as Float32Array).buffer)[
+        SCREEN_OFFSET.shiftY / 4
+      ];
+    };
+    const { rows, deviceCellHeight } = h.surface.diagnostics();
+
+    const token = {};
+    beginTerminalResizeInteraction(token);
+    h.paneRect.value = { x: 0, y: 0, width: 960, height: 400 };
+    h.observe(hostSize(960, 400));
+    // The prompt is on the last row: the grid moves up by what the pane lost.
+    h.cursor.y = rows - 1;
+    expect(shift()).toBe(rows * deviceCellHeight - 400);
+    // A cursor near the top is already visible: top-anchored, nothing moves.
+    h.cursor.y = 2;
+    h.observe(hostSize(960, 399));
+    h.paneRect.value = { x: 0, y: 0, width: 960, height: 399 };
+    expect(shift()).toBe(0);
+    // A taller pane than the grid pads at the bottom instead.
+    h.paneRect.value = { x: 0, y: 0, width: 960, height: 900 };
+    h.observe(hostSize(960, 900));
+    expect(shift()).toBe(0);
+
+    h.cursor.y = rows - 1;
+    h.paneRect.value = { x: 0, y: 0, width: 960, height: 400 };
+    h.observe(hostSize(960, 400));
+    expect(shift()).toBe(rows * deviceCellHeight - 400);
+    endTerminalResizeInteraction(token);
+    vi.advanceTimersByTime(200);
+    // The final fit follows the pane; at rest nothing is shifted any more.
+    h.paneRect.value = { x: 0, y: 0, width: 960, height: 400 };
+    expect(shift()).toBe(0);
+  });
+
+  it("does not resize at all when the gesture ends at the size it started with", async () => {
+    vi.useFakeTimers();
+    const h = await harness();
+    h.render();
+    vi.advanceTimersByTime(500);
+    h.onResize.mockClear();
+
+    const token = {};
+    beginTerminalResizeInteraction(token);
+    h.observe(hostSize(600));
+    h.render();
+    h.observe(hostSize(960));
+    h.render();
+    endTerminalResizeInteraction(token);
+    vi.advanceTimersByTime(200);
+    h.render();
+
+    expect(h.onResize).not.toHaveBeenCalled();
+  });
+
+  it("applies every non-gesture fit immediately and in step with the PTY", async () => {
+    vi.useFakeTimers();
+    const h = await harness();
     h.render();
     vi.advanceTimersByTime(500);
     h.onResize.mockClear();
@@ -515,8 +591,10 @@ describe("resizing the host", () => {
     h.observe(hostSize(800));
     h.render();
     expect(h.onResize).toHaveBeenCalledTimes(1);
+    // The model already has the size the PTY is told about.
+    expect(h.surface.diagnostics().cols).toBe(100);
 
-    // A font change is not a drag and is never held back.
+    // A font change is not a gesture and is never held back.
     h.surface.setFontMetrics({
       ...METRICS,
       deviceCellWidth: 10,
@@ -526,56 +604,31 @@ describe("resizing the host", () => {
     expect(h.surface.diagnostics().cols).toBe(80);
   });
 
-  it("keeps the model and PTY still between throttled steps while the pane's rectangle follows the host", async () => {
+  it("treats a burst of host changes as a gesture and lands the last size when it is quiet", async () => {
     vi.useFakeTimers();
-    const h = await harness({ resizeIntervalMs: 100 });
+    const h = await harness();
     h.render();
     vi.advanceTimersByTime(500);
     h.observe(hostSize(900));
     h.render();
     h.onResize.mockClear();
-    h.model.setPixelSize.mockClear();
-    vi.advanceTimersByTime(10);
 
-    h.observe(hostSize(700));
-    h.render();
-
-    expect(h.onResize).not.toHaveBeenCalled();
-    expect(h.model.setPixelSize).not.toHaveBeenCalled();
-    expect(h.surface.diagnostics().cols).toBe(112);
-    // The window canvas heard about the new host right away.
-    expect(h.setBounds).toHaveBeenLastCalledWith(
-      expect.objectContaining({ width: 700 }),
-    );
-    expect(h.schedule).toHaveBeenCalled();
-
-    vi.advanceTimersByTime(90);
-    h.render();
-    expect(h.onResize).toHaveBeenCalledOnce();
-    expect(h.surface.diagnostics().cols).toBe(87);
-  });
-
-  it("applies the held size as soon as the gesture ends, not when the interval is up", async () => {
-    vi.useFakeTimers();
-    // An interval so long that only the end of the gesture can release the held size.
-    const h = await harness({ resizeIntervalMs: 60_000 });
-    h.render();
-    vi.advanceTimersByTime(61_000);
-    h.observe(hostSize(900));
-    h.render();
+    // A second change within 150 ms of the first starts the burst.
     vi.advanceTimersByTime(10);
     h.observe(hostSize(640));
     h.render();
     vi.advanceTimersByTime(100);
+    h.observe(hostSize(560));
     h.render();
+    expect(h.onResize).not.toHaveBeenCalled();
     expect(h.surface.diagnostics().cols).toBe(112);
 
-    // 150 ms without a host change ends the burst the observer saw.
-    vi.advanceTimersByTime(100);
+    // 150 ms without a host change ends it.
+    vi.advanceTimersByTime(200);
     h.render();
 
-    expect(h.surface.diagnostics().cols).toBe(80);
-    expect(h.onResize).toHaveBeenLastCalledWith(80, expect.any(Number));
+    expect(h.onResize).toHaveBeenCalledOnce();
+    expect(h.surface.diagnostics().cols).toBe(70);
   });
 });
 
@@ -885,7 +938,7 @@ type FakeFrameState = {
 };
 
 async function harness(
-  options: { scale?: number; resizeIntervalMs?: number } = {},
+  options: { scale?: number } = {},
 ) {
   let scale = options.scale ?? 1;
   bridge.visible = true;
@@ -1168,7 +1221,6 @@ async function harness(
     onResize,
     onError,
     // Grid changes are rate limited in production; tests that are not about that apply at once.
-    resizeIntervalMs: options.resizeIntervalMs ?? 0,
   });
   surfaces.push(surface);
   const mask: { bytes: number[] | null } = { bytes: null };

@@ -3,6 +3,7 @@ import { bindTerminalInteraction } from "@/modules/terminal/ghostty/input/termin
 import { TerminalScrollbarSync } from "@/modules/terminal/ghostty/gpu/terminalScrollbar";
 import { terminalWindowPresentation } from "@/modules/terminal/ghostty/windowPresentation";
 import type { TerminalSurface } from "@/modules/terminal/backend/contracts";
+import { smoothHooks } from "@/bench/smoothHooks";
 import { noteTerminalHostResize } from "@/modules/terminal/lib/terminalResizeGesture";
 import {
   subscribeTerminalResizeInteraction,
@@ -77,8 +78,6 @@ export type WebGpuTerminalSurfaceOptions = {
   readonly cursorBlink: boolean;
   readonly cursorStyle: "block" | "underline" | "bar";
   readonly onResize: (cols: number, rows: number) => void;
-  /** Minimum time between grid changes while the host is resizing (tests only). */
-  readonly resizeIntervalMs?: number;
   readonly onError: (error: Error) => void;
   readonly onFirstFrame?: () => void;
   readonly onFrame?: () => void;
@@ -90,7 +89,7 @@ export type WebGpuTerminalSurfaceStats = {
   readonly frames: number;
   /** The pane's rectangle in the shared window canvas, device pixels; null before layout. */
   readonly viewport: DeviceRect | null;
-  /** Grid changes applied (model and PTY resized together) and held back by the throttle. */
+  /** Grid changes applied (model and PTY resized together) and held back while a resize gesture was live. */
   readonly gridResizes: number;
   readonly deferredGridResizes: number;
   readonly cellCompactions: number;
@@ -114,10 +113,15 @@ export type WebGpuTerminalSurfaceStats = {
   readonly fit: TerminalFitQueueDiagnostics;
 };
 
+/** App lab: stable id of a surface in the smoothness probe. */
+let benchSurfaceSeq = 0;
+
 export class WebGpuTerminalSurface
   implements TerminalSurface, WebGpuRuntimeSurface
 {
   readonly backend = "ghostty-webgpu" as const;
+  /** App lab: id of this surface in the smoothness probe. */
+  readonly benchId = ++benchSurfaceSeq;
 
   private binding: PaneBinding | null = null;
   private readonly input = document.createElement("textarea");
@@ -133,10 +137,8 @@ export class WebGpuTerminalSurface
   private readonly pixelRatioMonitor: DevicePixelRatioMonitor;
   private readonly fitQueue = new TerminalFitQueue();
   private readonly resizeSync: TerminalResizeSync;
-  /** Newest host measurement a throttled grid change is waiting to apply. */
+  /** Newest host measurement the grid has not followed yet (a resize gesture is live). */
   private heldBounds: TerminalFitBounds | null = null;
-  /** The next queued fit is the end of a gesture and must not wait for the throttle. */
-  private fitImmediate = false;
   private gridResizeCount = 0;
   private deferredGridResizeCount = 0;
   private atlasLease: GlyphAtlasLease | null = null;
@@ -223,8 +225,6 @@ export class WebGpuTerminalSurface
         },
       },
       notify: options.onResize,
-      intervalMs: options.resizeIntervalMs,
-      onDue: () => this.queueFit(this.heldBounds ?? undefined),
     });
     this.cursorBlinking = options.cursorBlink;
     this.theme = options.theme;
@@ -273,7 +273,9 @@ export class WebGpuTerminalSurface
       const entry = entries[entries.length - 1];
       if (!entry) return;
       noteTerminalHostResize(this);
-      this.queueFit(this.boundsFromEntry(entry));
+      const bounds = this.boundsFromEntry(entry);
+      if (__TERAX_BENCH__) this.benchWant(bounds);
+      this.queueFit(bounds);
     });
     this.unsubscribeDamage = options.model.subscribeDamage(() => {
       if (!this.visible || this.documentSuspended || !this.host) return;
@@ -287,10 +289,12 @@ export class WebGpuTerminalSurface
       (active) => {
         this.resizeInteractionActive = active;
         if (active) return;
-        // The gesture is over: land the held grid now and compact what the drag grew.
+        // The gesture is over: the grid follows the final size once (one reflow, one SIGWINCH)
+        // and what the drag grew is compacted. The host is measured when the fit runs, in the
+        // next frame, not now: the last pointer move may not have been laid out yet.
         this.compactAfterResize = true;
-        this.fitImmediate = true;
-        this.queueFit(this.heldBounds ?? undefined);
+        this.fitQueue.request();
+        this.runtime.schedule(this);
       },
     );
     this.root.addEventListener("pointerdown", this.handlePointerDown);
@@ -333,7 +337,6 @@ export class WebGpuTerminalSurface
     this.resizeObserver.disconnect();
     window.removeEventListener?.("resize", this.handleWindowResize);
     this.fitQueue.clear();
-    this.resizeSync.cancel();
     this.heldBounds = null;
     this.pixelRatioMonitor.stop();
     this.clearCursorTimer();
@@ -601,6 +604,11 @@ export class WebGpuTerminalSurface
       return false;
     }
 
+    if (__TERAX_BENCH__) {
+      const now = performance.now();
+      if (model.promptErased?.()) smoothHooks()?.blank(this.benchId, now);
+      smoothHooks()?.shown(this.benchId, now, frame.cols, frame.rows);
+    }
     this.drawCells = expectedCells;
     this.hasFrame = true;
     this.forceFullRedraw = false;
@@ -633,7 +641,11 @@ export class WebGpuTerminalSurface
       held.height === rect.height
     )
       return false;
-    this.packAndUpload({ ...state, viewport: rect }, device);
+    const shiftY =
+      this.resizeInteractionActive || this.heldBounds !== null
+        ? state.shiftY
+        : 0;
+    this.packAndUpload({ ...state, viewport: rect, shiftY }, device);
     return this.hasFrame;
   }
 
@@ -934,7 +946,7 @@ export class WebGpuTerminalSurface
   private queueFit(bounds?: TerminalFitBounds): void {
     if (!this.host) return;
     // The pane's rectangle in the window canvas follows the layout at once; the grid follows
-    // at the pace of the resize throttle.
+    // when the resize gesture ends.
     const measured = bounds ?? this.measureHost();
     this.reportBounds(measured);
     this.fitQueue.request(measured);
@@ -950,6 +962,17 @@ export class WebGpuTerminalSurface
       width: bounds.width,
       height: bounds.height,
     });
+  }
+
+  /** App lab only: the grid this host size asks for, for the smoothness probe. */
+  private benchWant(bounds: TerminalFitBounds): void {
+    const fit = fitTerminalViewport(
+      bounds.width,
+      bounds.height,
+      this.metrics,
+      bounds.device,
+    );
+    if (fit) smoothHooks()?.want(this.benchId, performance.now(), fit.cols, fit.rows);
   }
 
   private boundsFromEntry(entry: ResizeObserverEntry): TerminalFitBounds {
@@ -985,9 +1008,7 @@ export class WebGpuTerminalSurface
     if (!this.host) return;
     const bounds = this.fitQueue.take(() => this.measureHost());
     if (bounds) {
-      const throttled = !this.fitImmediate;
-      this.fitImmediate = false;
-      this.resizeToHost(bounds, false, throttled);
+      this.resizeToHost(bounds, false, true);
     }
     if (this.compactAfterResize && !this.resizeInteractionActive) {
       this.compactAfterResize = false;
@@ -998,14 +1019,16 @@ export class WebGpuTerminalSurface
   }
 
   /**
-   * Fits the grid to the host. `throttled` fits come from the host changing size (observer,
-   * window resize): they apply at most once per interval, so the model and the PTY follow a
-   * drag in lockstep without a SIGWINCH per pointer step. Every other caller applies at once.
+   * Fits the grid to the host. `observed` fits come from the host changing size (observer,
+   * window resize): while a resize gesture is live they leave the grid and the PTY alone (the
+   * pane's rectangle follows the pointer, the existing grid is drawn in it, see
+   * `gridShift`) and the final size is applied once when the gesture ends. Every other caller
+   * applies at once.
    */
   private resizeToHost(
     measuredBounds?: TerminalFitBounds,
     scheduleRender = true,
-    throttled = false,
+    observed = false,
   ): void {
     if (
       !this.host ||
@@ -1043,13 +1066,23 @@ export class WebGpuTerminalSurface
       return;
     }
 
-    const outcome = this.resizeSync.request(cols, rows, throttled);
-    if (outcome === "deferred") {
-      // The grid and the PTY keep their last size; the pane keeps showing its last grid inside
-      // its (already moved) rectangle, background where it is larger, clipped where smaller.
+    if (observed && this.resizeInteractionActive) {
       this.heldBounds = bounds;
       this.deferredGridResizeCount += 1;
       return;
+    }
+    const benchStart = __TERAX_BENCH__ ? performance.now() : 0;
+    const outcome = this.resizeSync.request(cols, rows);
+    if (__TERAX_BENCH__) {
+      const now = performance.now();
+      smoothHooks()?.have(
+        this.benchId,
+        now,
+        this.options.model.cols,
+        this.options.model.rows,
+        outcome === "applied",
+        now - benchStart,
+      );
     }
     this.heldBounds = null;
     const changed = outcome === "applied";
@@ -1304,6 +1337,7 @@ export class WebGpuTerminalSurface
         width: frame.cols * this.metrics.deviceCellWidth,
         height: frame.rows * this.metrics.deviceCellHeight,
       },
+      shiftY: 0,
       textBlinkVisible: this.textBlinkVisible,
       searchActive: this.searchBuffer !== null,
       cursor: showCursor
@@ -1323,7 +1357,35 @@ export class WebGpuTerminalSurface
       ),
       contrast: this.contrast,
     };
-    return this.packAndUpload(state, device);
+    const shiftY = this.gridShift(state, cursor);
+    if (__TERAX_BENCH__ && this.nativeCursorVisible) {
+      // The cursor the application asked for, whatever phase its blink is in.
+      const rect = cursorRect(cursor, cursor.style, this.metrics);
+      const bottom = rect.y + rect.height - shiftY;
+      smoothHooks()?.cursor(
+        this.benchId,
+        bottom > 0 && bottom <= state.viewport.height + 1,
+      );
+    }
+    return this.packAndUpload({ ...state, shiftY }, device);
+  }
+
+  /**
+   * While the grid is waiting for a resize gesture to end, a pane that became shorter than its
+   * grid shows the grid moved up, just enough to keep the cursor row on screen (a prompt at the
+   * bottom stays visible, as in a native terminal) and never past the grid's own height.
+   * Narrower panes clip on the right, taller or wider ones are padded with the background.
+   */
+  private gridShift(
+    state: ScreenUniformState,
+    cursor: ReturnType<GhosttyTerminalModelApi["cursor"]>,
+  ): number {
+    if (!this.resizeInteractionActive && this.heldBounds === null) return 0;
+    const cell = state.cellHeight;
+    const deficit = state.rows * cell - state.viewport.height;
+    if (deficit <= 0) return 0;
+    const row = Math.min(state.rows - 1, Math.max(0, cursor.y));
+    return Math.min(deficit, Math.max(0, (row + 1) * cell - state.viewport.height));
   }
 
   /** Packs the uniform and uploads it when it differs from what the GPU holds. */

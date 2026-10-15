@@ -62,8 +62,6 @@ export type WebGlTerminalSurfaceOptions = {
   readonly cursorBlink: boolean;
   readonly cursorStyle: "block" | "underline" | "bar";
   readonly onResize: (cols: number, rows: number) => void;
-  /** Minimum time between grid changes while the host is resizing (tests only). */
-  readonly resizeIntervalMs?: number;
   readonly onError: (error: Error) => void;
   readonly onFirstFrame?: () => void;
   readonly onFrame?: () => void;
@@ -102,10 +100,6 @@ export class WebGlTerminalSurface
   private readonly pixelRatioMonitor: DevicePixelRatioMonitor;
   private readonly fitQueue = new TerminalFitQueue();
   private readonly resizeSync: TerminalResizeSync;
-  /** Newest host measurement a throttled grid change is waiting to apply. */
-  private heldBounds: Pick<DOMRectReadOnly, "width" | "height"> | null = null;
-  /** The next queued fit is the end of a gesture and must not wait for the throttle. */
-  private fitImmediate = false;
   private renderer: WebGlCellRenderer | null = null;
   private metrics: TerminalFontMetrics;
   private theme: TerminalGpuTheme;
@@ -169,8 +163,6 @@ export class WebGlTerminalSurface
         },
       },
       notify: options.onResize,
-      intervalMs: options.resizeIntervalMs,
-      onDue: () => this.queueFit(this.heldBounds ?? undefined),
     });
     this.theme = options.theme;
     this.cursorBlinking = options.cursorBlink;
@@ -236,10 +228,11 @@ export class WebGlTerminalSurface
           this.gestureStartInner = windowInnerSize();
           return;
         }
-        // The gesture is over: land the held grid now and shrink the backing to fit it.
+        // The gesture is over: the grid follows the final size once and the backing shrinks
+        // to fit it.
         this.compactAfterResize = true;
-        this.fitImmediate = true;
-        this.queueFit(this.heldBounds ?? undefined);
+        this.fitQueue.request();
+        this.runtime.schedule(this);
       },
     );
     this.root.addEventListener("pointerdown", this.handlePointerDown);
@@ -275,8 +268,6 @@ export class WebGlTerminalSurface
     if (!this.host) return;
     this.resizeObserver.disconnect();
     this.fitQueue.clear();
-    this.resizeSync.cancel();
-    this.heldBounds = null;
     this.pixelRatioMonitor.stop();
     this.clearCursorTimer();
     this.clearTextBlinkTimer();
@@ -694,9 +685,7 @@ export class WebGlTerminalSurface
       () => this.host?.getBoundingClientRect() ?? { width: 0, height: 0 },
     );
     if (bounds) {
-      const throttled = !this.fitImmediate;
-      this.fitImmediate = false;
-      this.resizeToHost(bounds, false, throttled);
+      this.resizeToHost(bounds, false, true);
     }
     if (this.compactAfterResize && !this.resizeInteractionActive) {
       this.compactAfterResize = false;
@@ -706,14 +695,15 @@ export class WebGlTerminalSurface
   }
 
   /**
-   * Fits the grid to the host. `throttled` fits come from the host changing size: they apply at
-   * most once per interval so the model and the PTY follow a drag together (see
+   * Fits the grid to the host. `observed` fits come from the host changing size: while a resize
+   * gesture is live they keep the grid, the PTY and the renderer as they are (the host clips
+   * or pads the canvas) and the final size is applied once when the gesture ends (see
    * `TerminalResizeSync`). Every other caller applies at once.
    */
   private resizeToHost(
     measuredBounds?: Pick<DOMRectReadOnly, "width" | "height">,
     scheduleRender = true,
-    throttled = false,
+    observed = false,
   ): void {
     if (!this.host || !this.renderer || this.documentSuspended) return;
     this.fitQueue.clear();
@@ -738,13 +728,10 @@ export class WebGlTerminalSurface
       return;
     }
 
-    const outcome = this.resizeSync.request(cols, rows, throttled);
-    if (outcome === "deferred") {
-      // The grid, the PTY and the renderer keep their last size until the next interval.
-      this.heldBounds = bounds;
+    if (observed && this.resizeInteractionActive) {
       return;
     }
-    this.heldBounds = null;
+    const outcome = this.resizeSync.request(cols, rows);
     const changed = outcome === "applied";
     if (changed) this.selection.reconcile();
     const rendererChanged = this.renderer.resize(

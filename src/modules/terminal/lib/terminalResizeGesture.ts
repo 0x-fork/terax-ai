@@ -1,6 +1,8 @@
 import {
   beginTerminalResizeInteraction,
   endTerminalResizeInteraction,
+  subscribeTerminalResizeInteraction,
+  terminalResizeInteractionActive,
 } from "./terminalResizeInteraction";
 
 /**
@@ -23,6 +25,11 @@ let burstTimer: ReturnType<typeof setTimeout> | null = null;
 let lastChangeAt = Number.NEGATIVE_INFINITY;
 let clock: () => number = () => performance.now();
 let lastBySurface = new WeakMap<object, number>();
+let lastInteractionEndAt = Number.NEGATIVE_INFINITY;
+
+subscribeTerminalResizeInteraction((active) => {
+  if (!active) lastInteractionEndAt = clock();
+});
 
 /** The window reports that the user started or stopped dragging its edge or corner. */
 export function setNativeLiveResize(active: boolean): void {
@@ -43,6 +50,14 @@ export function noteTerminalHostResize(surface: object): void {
     lastChangeAt = now;
     return;
   }
+  // A pointer drag or a native live resize already says when it ends; waiting for a quiet
+  // period after it would only delay the final size.
+  // The layout that lands in the frame after the release is the end of that drag, not a new one.
+  if (
+    terminalResizeInteractionActive() ||
+    clock() - lastInteractionEndAt < GESTURE_GAP_MS
+  )
+    return;
   if (previous === undefined || now - previous > GESTURE_GAP_MS) return;
   burstActive = true;
   lastChangeAt = now;
@@ -73,5 +88,6 @@ export function resetTerminalResizeGestureForTest(now?: () => number): void {
   nativeActive = false;
   lastChangeAt = Number.NEGATIVE_INFINITY;
   lastBySurface = new WeakMap();
+  lastInteractionEndAt = Number.NEGATIVE_INFINITY;
   clock = now ?? (() => performance.now());
 }

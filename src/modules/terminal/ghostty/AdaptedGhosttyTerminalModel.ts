@@ -243,6 +243,10 @@ export class AdaptedGhosttyTerminalModel implements GhosttyTerminalModelApi {
     );
   }
 
+  promptErased(): boolean {
+    return this.resizePromptHold.promptErased;
+  }
+
   deferPresentation(): boolean {
     this.assertLive();
     if (!this.presentationSuppressed()) return false;

@@ -1,3 +1,4 @@
+import { smoothHooks } from "@/bench/smoothHooks";
 import { noteTerminalHostResize } from "@/modules/terminal/lib/terminalResizeGesture";
 import {
   subscribeTerminalResizeInteraction,
@@ -60,6 +61,8 @@ export interface WindowCanvasPane {
   background(): Rgb;
   /** Encodes the pane's draw calls; viewport and scissor already cover its rectangle. */
   encode(pass: GPURenderPassEncoder, resources: WebGpuSharedResources): void;
+  /** App lab: id in the smoothness probe. */
+  readonly benchId?: number;
 }
 
 /** The pane's side of its membership in the window canvas. */
@@ -265,6 +268,8 @@ export class WebGpuWindowCanvas {
     return {
       setBounds: (bounds) => {
         if (!this.panes.has(pane) || cssRectsEqual(state.css, bounds)) return;
+        if (__TERAX_BENCH__ && pane.benchId !== undefined)
+          smoothHooks()?.rect(pane.benchId, performance.now());
         state.css = bounds;
         this.layoutStale = true;
       },
@@ -320,8 +325,22 @@ export class WebGpuWindowCanvas {
    * and recomputes every pane's device rectangle. Reads no DOM.
    */
   beginFrame(): WindowFrameStart {
+    const benchStart = __TERAX_BENCH__ ? performance.now() : 0;
     const reallocated = this.backing.commit();
     if (reallocated) {
+      if (__TERAX_BENCH__) {
+        const now = performance.now();
+        smoothHooks()?.realloc(
+          now,
+          now - benchStart,
+          this.canvas.width,
+          this.canvas.height,
+          this.gestureActive,
+          this.areaDevice
+            ? `${this.areaDevice.width}x${this.areaDevice.height}`
+            : "-",
+        );
+      }
       this.reallocations += 1;
       this.layoutStale = true;
     }
@@ -339,7 +358,11 @@ export class WebGpuWindowCanvas {
                 size.height,
               )
             : null;
-        if (deviceRectsEqual(next, state.rect)) continue;
+        if (deviceRectsEqual(next, state.rect)) {
+          if (__TERAX_BENCH__ && pane.benchId !== undefined)
+            smoothHooks()?.unchanged(pane.benchId);
+          continue;
+        }
         state.rect = next;
         moved.push(pane);
       }
@@ -401,6 +424,11 @@ export class WebGpuWindowCanvas {
       }
     }
     pass.end();
+    if (__TERAX_BENCH__) {
+      const now = performance.now();
+      for (const [pane] of drawable)
+        if (pane.benchId !== undefined) smoothHooks()?.drawn(pane.benchId, now);
+    }
     this.frames += 1;
     this.show();
     return { drawn: drawable.length, revealed };

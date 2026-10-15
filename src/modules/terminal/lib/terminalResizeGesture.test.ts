@@ -6,6 +6,8 @@ import {
   setNativeLiveResize,
 } from "./terminalResizeGesture";
 import {
+  beginTerminalResizeInteraction,
+  endTerminalResizeInteraction,
   subscribeTerminalResizeInteraction,
   terminalResizeInteractionActive,
 } from "./terminalResizeInteraction";
@@ -33,6 +35,39 @@ describe("terminalResizeGesture", () => {
   it("does not treat several surfaces laying out once each as a gesture", () => {
     for (let index = 0; index < 8; index++) noteTerminalHostResize({});
     expect(terminalResizeInteractionActive()).toBe(false);
+  });
+
+  it("leaves the end of a pointer drag to the pointer: no quiet gap is added after release", () => {
+    const token = {};
+    const surface = {};
+    beginTerminalResizeInteraction(token);
+    for (let step = 0; step < 20; step++) {
+      noteTerminalHostResize(surface);
+      vi.advanceTimersByTime(16);
+    }
+    endTerminalResizeInteraction(token);
+    expect(terminalResizeInteractionActive()).toBe(false);
+  });
+
+  it("does not mistake the layout that lands right after a release for a new gesture", () => {
+    const token = {};
+    const surface = {};
+    beginTerminalResizeInteraction(token);
+    noteTerminalHostResize(surface);
+    vi.advanceTimersByTime(16);
+    endTerminalResizeInteraction(token);
+    // The frame after the release delivers the last size change of the same drag.
+    vi.advanceTimersByTime(16);
+    noteTerminalHostResize(surface);
+    vi.advanceTimersByTime(16);
+    noteTerminalHostResize(surface);
+    expect(terminalResizeInteractionActive()).toBe(false);
+    // Later on, a real burst is still recognised.
+    vi.advanceTimersByTime(GESTURE_GAP_MS * 2);
+    noteTerminalHostResize(surface);
+    vi.advanceTimersByTime(16);
+    noteTerminalHostResize(surface);
+    expect(terminalResizeInteractionActive()).toBe(true);
   });
 
   it("starts on the second quick change of one surface and ends after a quiet gap", () => {

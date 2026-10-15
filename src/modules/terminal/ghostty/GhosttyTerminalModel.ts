@@ -135,6 +135,8 @@ export interface GhosttyTerminalModelApi extends TerminalModel {
   renderCells(): TerminalCellReader;
   presentationSuppressed(): boolean;
   deferPresentation(): boolean;
+  /** App lab only: a resize erased the prompt and the shell has not printed it again. */
+  promptErased?(): boolean;
   releasePresentationResources(): void;
   compactPresentationResources(): void;
   setColors(

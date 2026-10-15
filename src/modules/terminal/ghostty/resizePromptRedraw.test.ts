@@ -2,7 +2,6 @@ import { readFile } from "node:fs/promises";
 import { TeraxGhostty } from "@terax/ghostty-core/adapted";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { RESIZE_PROMPT_HOLD_MS } from "./core/ResizePromptHold";
-import { TERMINAL_RESIZE_INTERVAL_MS } from "@/modules/terminal/lib/resizeThrottle";
 import { TerminalResizeSync } from "@/modules/terminal/lib/terminalResizeSync";
 import { AdaptedGhosttyTerminalModel } from "./AdaptedGhosttyTerminalModel";
 
@@ -65,11 +64,10 @@ describe("prompt visibility while resizing (real Ghostty core)", () => {
           pty.push([cols, rows]);
           shellOutput.push(REDRAW_BYTES);
         },
-        onDue: () => {},
       });
       const shellOutput: string[] = [];
 
-      expect(sync.request(50, 10, false)).toBe("applied");
+      expect(sync.request(50, 10)).toBe("applied");
       expect(pty).toEqual([[50, 10]]);
       expect(screen()).not.toContain(PROMPT.trim());
 
@@ -82,7 +80,7 @@ describe("prompt visibility while resizing (real Ghostty core)", () => {
     }
   });
 
-  it("keeps the prompt on screen between throttled resizes and restores it after each", () => {
+  it("a drag costs one resize and one redraw: the prompt is never presented blank", () => {
     vi.useFakeTimers();
     const { model, write, screen } = terminalAtPrompt(80, 10);
     try {
@@ -94,46 +92,36 @@ describe("prompt visibility while resizing (real Ghostty core)", () => {
           pty.push([cols, rows]);
           shellOutput.push(REDRAW_BYTES);
         },
-        onDue: () => {},
-        now: () => Date.now(),
       });
-      const promptBlankMs: number[] = [];
-      let blankSince: number | null = null;
-      const observe = () => {
-        const visible = screen().includes(PROMPT.trim());
-        if (!visible && blankSince === null) blankSince = Date.now();
-        if (visible && blankSince !== null) {
-          promptBlankMs.push(Date.now() - blankSince);
-          blankSince = null;
-        }
+      // What the display showed, one entry per 16 ms frame.
+      let shown = screen();
+      const frames: string[] = [];
+      const frame = () => {
+        shown = model.presentationSuppressed() ? shown : screen();
+        frames.push(shown);
       };
 
-      // A one-second drag, a new width every 16 ms; the shell answers 5 ms after SIGWINCH.
-      for (let elapsed = 0, cols = 80; elapsed < 1000; elapsed += 16, cols--) {
-        const outcome = sync.request(cols, 10, true);
-        observe();
-        if (outcome === "applied") {
-          vi.advanceTimersByTime(5);
-          for (const bytes of shellOutput.splice(0)) write(bytes);
-          observe();
-          vi.advanceTimersByTime(11);
-        } else {
-          // Deferred: the model was not touched, so the prompt cannot have changed.
-          expect(screen()).toContain(PROMPT.trim());
-          vi.advanceTimersByTime(16);
-        }
+      // The gesture: the surface keeps the grid, so the model and the shell see nothing.
+      for (let step = 0; step < 60; step++) {
+        frame();
+        vi.advanceTimersByTime(16);
       }
+      expect(pty).toEqual([]);
+      expect(model.cols).toBe(80);
 
-      expect(pty.length).toBeGreaterThanOrEqual(9);
-      expect(pty.length).toBeLessThanOrEqual(11);
-      // Every PTY size is a size the model has (or had) at the same moment.
-      expect(pty[pty.length - 1]).toEqual([model.cols, model.rows]);
-      // The prompt is blank only for the shell's answer time, never for a whole interval.
-      expect(promptBlankMs.length).toBe(pty.length);
-      for (const blank of promptBlankMs) {
-        expect(blank).toBeLessThan(TERMINAL_RESIZE_INTERVAL_MS / 10);
-      }
+      // The pointer is released: one synchronized resize.
+      expect(sync.request(52, 10)).toBe("applied");
+      frame();
+      vi.advanceTimersByTime(5);
+      for (const bytes of shellOutput.splice(0)) write(bytes);
+      frame();
+      vi.advanceTimersByTime(16);
+      frame();
+
+      expect(pty).toEqual([[52, 10]]);
+      expect(frames.every((text) => text.includes(PROMPT.trim()))).toBe(true);
       expect(screen()).toContain(PROMPT.trim());
+      expect(model.presentationSuppressed()).toBe(false);
     } finally {
       model.dispose();
     }
@@ -216,8 +204,6 @@ describe("holding presentation while the shell redraws the prompt (real Ghostty 
       const sync = new TerminalResizeSync({
         model,
         notify: () => shellOutput.push(REDRAW_BYTES),
-        onDue: () => {},
-        now: () => Date.now(),
       });
       let shown = screen();
       let blankFrames = 0;
@@ -228,7 +214,7 @@ describe("holding presentation while the shell redraws the prompt (real Ghostty 
         if (!shown.includes(PROMPT.trim())) blankFrames += 1;
       };
       for (let elapsed = 0, cols = 80; elapsed < 1000; elapsed += 4, cols--) {
-        const outcome = sync.request(Math.max(20, cols), rows, true);
+        const outcome = sync.request(Math.max(20, cols), rows);
         frame();
         if (outcome === "applied") {
           // The shell answers 8 ms after SIGWINCH; frames keep coming every 4 ms meanwhile.

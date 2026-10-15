@@ -16,6 +16,8 @@ export const SCREEN_OFFSET = {
   cellSize: 8,
   dims: 16,
   flags: 24,
+  /** Device pixels the grid is shifted up inside the viewport (a pane shorter than its grid). */
+  shiftY: 28,
   cursorOrigin: 32,
   cursorSize: 40,
   cursorColor: 48,
@@ -41,7 +43,7 @@ struct Screen {
   cell_size: vec2u,
   dims: vec2u,
   flags: u32,
-  _padding: u32,
+  shift_y: u32,
   cursor_origin: vec2f,
   cursor_size: vec2f,
   cursor_color: vec4f,
@@ -184,7 +186,7 @@ fn decoration_color(
 @fragment
 fn fragment_main(@builtin(position) position: vec4f) -> @location(0) vec4f {
   // Fragment coordinates are relative to the window canvas, not to the pane's viewport.
-  let local_position = position.xy - vec2f(screen.origin);
+  let local_position = position.xy - vec2f(screen.origin) + vec2f(0.0, f32(screen.shift_y));
   let pixel = vec2u(local_position);
   let cell = pixel / screen.cell_size;
   if (cell.x >= screen.dims.x || cell.y >= screen.dims.y) {
@@ -288,7 +290,7 @@ fn vertex_main(
     vec2f(0.0, 1.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0),
   );
   let corner = corners[vertex_index];
-  let pixel = vec2f(origin) + corner * vec2f(drawn);
+  let pixel = vec2f(origin) + corner * vec2f(drawn) - vec2f(0.0, f32(screen.shift_y));
   var output: VertexOutput;
   output.position = vec4f(
     pixel.x / screen.viewport_size.x * 2.0 - 1.0,
@@ -325,7 +327,8 @@ fn fragment_main(
   @interpolate(flat) @location(2) color: vec4f,
   @interpolate(flat) @location(3) glyph_flags: u32,
 ) -> @location(0) vec4f {
-  let texel = texel_origin + vec2i(floor(position.xy)) - vec2i(screen.origin) - quad_origin;
+  let texel = texel_origin + vec2i(floor(position.xy)) - vec2i(screen.origin) +
+    vec2i(0, i32(screen.shift_y)) - quad_origin;
   if ((glyph_flags & 1u) != 0u) {
     let sample = textureLoad(color_texture, texel, 0);
     return vec4f(sample.rgb, sample.a * color.a);

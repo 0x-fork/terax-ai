@@ -1,3 +1,7 @@
+import {
+  beginTerminalResizeInteraction,
+  endTerminalResizeInteraction,
+} from "@/modules/terminal/lib/terminalResizeInteraction";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { GhosttyTerminalModelApi } from "@/modules/terminal/ghostty/GhosttyTerminalModel";
 import type { WindowPresentation } from "@/modules/terminal/ghostty/WindowPresentationPolicy";
@@ -75,16 +79,16 @@ describe("WebGL surface renderer ownership", () => {
 });
 
 describe("WebGL surface resizing", () => {
-  it("resizes the model and tells the PTY together, at most once per interval while the host changes", () => {
-    const h = harness({ resizeIntervalMs: 100 });
+  it("keeps the model, the PTY and the renderer still during a gesture and applies the final size once", () => {
+    const h = harness();
     h.surface.renderFrame(h.renderer as unknown as WebGlCellRenderer);
     vi.advanceTimersByTime(500);
-    const applied: Array<[number, number]> = [];
-    h.onResize.mockImplementation((cols: number, rows: number) => {
-      applied.push([cols, rows]);
-      expect(h.surface.diagnostics().cols).toBe(cols);
-    });
+    const rendererResizes = h.renderer.resize.mock.calls.length;
+    const first = h.surface.diagnostics().cols;
+    h.onResize.mockClear();
 
+    const token = {};
+    beginTerminalResizeInteraction(token);
     for (let step = 1; step <= 62; step++) {
       h.setHost(960 - step * 8);
       h.resize();
@@ -92,33 +96,30 @@ describe("WebGL surface resizing", () => {
       vi.advanceTimersByTime(16);
       h.surface.renderFrame(h.renderer as unknown as WebGlCellRenderer);
     }
-    vi.advanceTimersByTime(100);
+    expect(h.onResize).not.toHaveBeenCalled();
+    expect(h.renderer.resize).toHaveBeenCalledTimes(rendererResizes);
+    expect(h.surface.diagnostics().cols).toBe(first);
+
+    endTerminalResizeInteraction(token);
     h.surface.renderFrame(h.renderer as unknown as WebGlCellRenderer);
 
-    expect(applied.length).toBeGreaterThanOrEqual(9);
-    expect(applied.length).toBeLessThanOrEqual(11);
     const cols = Math.floor((960 - 62 * 8) / 8);
+    expect(h.onResize).toHaveBeenCalledOnce();
+    expect(h.onResize).toHaveBeenCalledWith(cols, expect.any(Number));
     expect(h.surface.diagnostics().cols).toBe(cols);
-    expect(applied[applied.length - 1][0]).toBe(cols);
   });
 
-  it("keeps the renderer's grid still while a size is held", () => {
-    const h = harness({ resizeIntervalMs: 100 });
+  it("applies a change outside a gesture at once", () => {
+    const h = harness();
     h.surface.renderFrame(h.renderer as unknown as WebGlCellRenderer);
     vi.advanceTimersByTime(500);
+    h.onResize.mockClear();
+
     h.setHost(800);
     h.resize();
     h.surface.renderFrame(h.renderer as unknown as WebGlCellRenderer);
-    const rendererResizes = h.renderer.resize.mock.calls.length;
-    h.onResize.mockClear();
-    vi.advanceTimersByTime(10);
 
-    h.setHost(600);
-    h.resize();
-    h.surface.renderFrame(h.renderer as unknown as WebGlCellRenderer);
-
-    expect(h.onResize).not.toHaveBeenCalled();
-    expect(h.renderer.resize).toHaveBeenCalledTimes(rendererResizes);
+    expect(h.onResize).toHaveBeenCalledOnce();
     expect(h.surface.diagnostics().cols).toBe(100);
   });
 });
@@ -175,7 +176,7 @@ function measuringContext() {
   return context;
 }
 
-function harness(options: { resizeIntervalMs?: number } = {}) {
+function harness() {
   vi.useFakeTimers();
   const element = () =>
     Object.assign(new EventTarget(), {
@@ -234,6 +235,7 @@ function harness(options: { resizeIntervalMs?: number } = {}) {
     viewportOriginLine: () => 0,
     modes: () => ({ alternateScreen: false }),
     setPixelSize: vi.fn(),
+    compactPresentationResources: vi.fn(),
     resize: (cols: number, rows: number) => {
       model.cols = cols;
       model.rows = rows;
@@ -252,7 +254,6 @@ function harness(options: { resizeIntervalMs?: number } = {}) {
     cursorStyle: "block",
     onResize,
     onError,
-    resizeIntervalMs: options.resizeIntervalMs ?? 0,
   });
   surfaces.push(surface);
   const hostElement = element();

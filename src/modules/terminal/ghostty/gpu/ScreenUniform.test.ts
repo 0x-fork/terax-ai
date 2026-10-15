@@ -19,6 +19,7 @@ const STATE: ScreenUniformState = {
   cellWidth: 11,
   cellHeight: 21,
   viewport: { x: 0, y: 0, width: 120 * 11, height: 40 * 21 },
+  shiftY: 0,
   textBlinkVisible: true,
   searchActive: false,
   cursor: { x: 22, y: 42, width: 11, height: 21 },
@@ -231,10 +232,29 @@ describe("shader uniform layout", () => {
     // Fragment positions are relative to the whole canvas, but a pane's cells, cursor and
     // glyph quads are relative to its viewport.
     expect(BACKGROUND_SHADER).toMatch(
-      /let local_position = position\.xy - vec2f\(screen\.origin\);/,
+      /let local_position = position\.xy - vec2f\(screen\.origin\) \+ vec2f\(0\.0, f32\(screen\.shift_y\)\);/,
     );
     expect(BACKGROUND_SHADER).not.toMatch(/vec2u\(position\.xy\)/);
     expect(GLYPH_SHADER).toMatch(/vec2i\(screen\.origin\)/);
+  });
+
+  it("moves the grid up by the shift in the cell pass and in the glyph pass alike", () => {
+    expect(BACKGROUND_SHADER).toMatch(/f32\(screen\.shift_y\)/);
+    // Glyph quads leave the vertex stage shifted, and the fragment stage undoes it to find the texel.
+    expect(GLYPH_SHADER).toMatch(/- vec2f\(0\.0, f32\(screen\.shift_y\)\)/);
+    expect(GLYPH_SHADER).toMatch(/vec2i\(0, i32\(screen\.shift_y\)\)/);
+  });
+
+  it("packs the shift as whole device pixels and never negative", () => {
+    const uniform = new ScreenUniform();
+    uniform.pack({ ...STATE, shiftY: 37.4 });
+    expect(new Uint32Array(uniform.data.buffer)[SCREEN_OFFSET.shiftY / 4]).toBe(
+      37,
+    );
+    uniform.pack({ ...STATE, shiftY: -5 });
+    expect(new Uint32Array(uniform.data.buffer)[SCREEN_OFFSET.shiftY / 4]).toBe(
+      0,
+    );
   });
 
   it("binds the storage and texture slots the surface fills", () => {

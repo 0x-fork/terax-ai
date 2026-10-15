@@ -1,3 +1,5 @@
+import { smoothHooks } from "@/bench/smoothHooks";
+import { subscribeTerminalResizeInteraction } from "@/modules/terminal/lib/terminalResizeInteraction";
 import { SurfaceFramePacer } from "@/modules/terminal/ghostty/SurfaceFramePacer";
 import {
   subscribeWindowPresentation,
@@ -228,6 +230,7 @@ export class WebGpuTerminalRuntime {
   private readonly pacer = new SurfaceFramePacer();
   private unbindWindowFocus: () => void = () => {};
   private unbindPresentation: () => void = () => {};
+  private unbindResizeInteraction: () => void = () => {};
   private disposed = false;
 
   private constructor() {}
@@ -241,6 +244,9 @@ export class WebGpuTerminalRuntime {
       );
       runtime.unbindWindowFocus = bindTerminalWindowFocus(
         runtime.handleWindowFocus,
+      );
+      runtime.unbindResizeInteraction = subscribeTerminalResizeInteraction(
+        runtime.handleResizeInteraction,
       );
       return runtime;
     } catch (error) {
@@ -330,6 +336,12 @@ export class WebGpuTerminalRuntime {
       generation: resources.generation,
     };
   }
+
+  /** While a resize gesture is live every pane follows the layout at display rate. */
+  private readonly handleResizeInteraction = (active: boolean): void => {
+    this.pacer.setGesture(active);
+    if (!this.disposed) this.requestFrame();
+  };
 
   interact(surface: WebGpuRuntimeSurface): void {
     if (this.disposed || !this.surfaces.has(surface)) return;
@@ -534,6 +546,7 @@ export class WebGpuTerminalRuntime {
     this.disposed = true;
     this.unbindPresentation();
     this.unbindWindowFocus();
+    this.unbindResizeInteraction();
     this.cancelScheduledFrame();
     if (this.atlasReapTimer !== null) clearTimeout(this.atlasReapTimer);
     this.atlasReapTimer = null;
@@ -639,6 +652,7 @@ export class WebGpuTerminalRuntime {
   }
 
   private flushFrame(frameAt = performance.now()): void {
+    const benchStart = __TERAX_BENCH__ ? performance.now() : 0;
     this.animationFrame = null;
     this.pacer.frameStarted(frameAt);
     this.animationFrames += 1;
@@ -739,6 +753,10 @@ export class WebGpuTerminalRuntime {
       if (encoder && rendered) {
         resources.device.queue.submit([encoder.finish()]);
         this.submittedFrames += 1;
+        if (__TERAX_BENCH__) {
+          const now = performance.now();
+          smoothHooks()?.frame(now, now - benchStart);
+        }
         this.inFlightFrames += 1;
         submitted = true;
         this.gcMirror.noteFrame();

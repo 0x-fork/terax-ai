@@ -50,6 +50,16 @@ export class SurfaceFramePacer {
   private lastFrameAt: number | undefined;
   private refreshMs = DEFAULT_REFRESH_MS;
   private refreshAt = Number.NEGATIVE_INFINITY;
+  private gestureValue = false;
+
+  /**
+   * A resize gesture (window edge, pane divider) is live: panes follow the layout on every
+   * display refresh instead of at their own cadence, because a pane that redraws every other
+   * refresh while its rectangle moves every refresh is the stutter people see.
+   */
+  setGesture(active: boolean): void {
+    this.gestureValue = active;
+  }
 
   interact(surface: Surface, now: number): void {
     this.interactiveUntil.set(surface, now + INTERACTION_PRIORITY_MS);
@@ -144,6 +154,7 @@ export class SurfaceFramePacer {
   ): number {
     const last = this.presentedAt.get(surface);
     if (last === undefined) return Number.NEGATIVE_INFINITY;
+    if (this.gestureValue) return last;
     const interval =
       now < (this.interactiveUntil.get(surface) ?? 0)
         ? FOCUSED_TERMINAL_FRAME_INTERVAL_MS

@@ -62,6 +62,34 @@ describe("per-pane frame pacing", () => {
   });
 });
 
+describe("resize gestures", () => {
+  it("presents every pane on every display refresh while a gesture is live, whatever its cadence", () => {
+    const pacer = new SurfaceFramePacer();
+    const background = { isFocused: () => false };
+    const unfocusedWindowPane = { isFocused: () => true };
+    pacer.presented(background, 0);
+    pacer.presented(unfocusedWindowPane, 0);
+    // Without a gesture both wait for their own cadence.
+    expect(pacer.due(background, true, 8)).toBe(false);
+    expect(pacer.due(unfocusedWindowPane, false, 8)).toBe(false);
+
+    pacer.setGesture(true);
+    for (const now of [8, 16]) {
+      expect(pacer.due(background, true, now)).toBe(true);
+      expect(pacer.due(unfocusedWindowPane, true, now)).toBe(true);
+    }
+    pacer.dirty(background, 10);
+    expect(pacer.plan(new Set([background]), true, 10)).toEqual({
+      kind: "frame",
+    });
+
+    // The gesture ends: the cadence is back.
+    pacer.setGesture(false);
+    pacer.presented(background, 20);
+    expect(pacer.due(background, true, 28)).toBe(false);
+  });
+});
+
 describe("shared frame ticks", () => {
   it("makes a background pane wait for the end of the tick in which it turned dirty", () => {
     const pacer = new SurfaceFramePacer();

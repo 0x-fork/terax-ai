@@ -25,6 +25,11 @@ export type ScreenUniformState = {
     readonly width: number;
     readonly height: number;
   };
+  /**
+   * Device pixels the grid is moved up inside the viewport, so a pane shorter than its grid
+   * (a resize gesture in progress) keeps the cursor row on screen. Zero at rest.
+   */
+  readonly shiftY: number;
   readonly textBlinkVisible: boolean;
   readonly searchActive: boolean;
   readonly cursor: CursorRect | null;
@@ -70,6 +75,7 @@ export class ScreenUniform {
     if (state.selection.active) flags |= SCREEN_FLAG_SELECTION_ACTIVE;
     if (state.selection.rectangular) flags |= SCREEN_FLAG_SELECTION_RECTANGULAR;
     uints[SCREEN_OFFSET.flags / 4] = flags;
+    uints[SCREEN_OFFSET.shiftY / 4] = Math.max(0, Math.round(state.shiftY));
     if (state.cursor) {
       floats[SCREEN_OFFSET.cursorOrigin / 4] = state.cursor.x;
       floats[SCREEN_OFFSET.cursorOrigin / 4 + 1] = state.cursor.y;
