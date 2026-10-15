@@ -6,6 +6,8 @@
  * is what JavaScript still holds (and, with it, what WebKit keeps for them in the WebContent
  * process).
  */
+import { logIpc } from "./eventLog";
+
 type Counters = Record<string, number>;
 
 export const gpuCounters: Counters = { instrumented: 0 };
@@ -142,6 +144,7 @@ function countIpc(): void {
         url.split("?")[0].split("/").pop() ?? "?",
       );
       bump(`ipc.${command}`);
+      logIpc(command);
       const body = init?.body;
       if (typeof body === "string") bump("ipc.bytes", body.length);
       else if (body instanceof ArrayBuffer || ArrayBuffer.isView(body))

@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { BENCH_FLAG_PREFIX } from "./flags";
+import { installEventLog } from "./eventLog";
 import { installGpuCounters } from "./gpuCounters";
+import { installSmoothProbe } from "./smoothProbe";
 import type { BenchConfig } from "./types";
 
 /**
@@ -35,7 +37,11 @@ export async function installBenchEarly(): Promise<BenchConfig | null> {
   }
   injectExperimentCss();
   if (config.reportUrl) forwardPageErrors(config.reportUrl);
-  if (config.scenario?.instrument) installGpuCounters();
+  if (config.scenario?.instrument) {
+    installGpuCounters();
+    installEventLog();
+  }
+  if (config.scenario) installSmoothProbe();
   (
     window as unknown as { __teraxBenchConfig?: BenchConfig }
   ).__teraxBenchConfig = config;

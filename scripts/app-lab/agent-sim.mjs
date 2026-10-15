@@ -10,7 +10,7 @@
 // comparable.
 //
 //   agent-sim.mjs [--seed N] [--history 300] [--spinner-ms 80] [--token-ms 50] [--chars 40]
-//                 [--rows 12] [--block-every-s 7] [--duration S]   (duration 0 = until killed)
+//                 [--rows 12] [--block-every-s 7] [--duration S] [--margin 1]   (duration 0 = until killed)
 
 const options = {
   seed: 1,
@@ -21,6 +21,9 @@ const options = {
   rows: 12,
   "block-every-s": 7,
   duration: 0,
+  // Columns left unused at the right edge. Ink draws full width (0): narrowing the terminal by
+  // one column then wraps every border line; the default of 1 hides that.
+  margin: 1,
 };
 for (let i = 2; i < process.argv.length; i += 2) {
   const key = process.argv[i].replace(/^--/, "");
@@ -55,7 +58,7 @@ const clip = (text, width) => {
   return glyphs.length <= width ? text : glyphs.slice(0, width).join("");
 };
 const dim = (text, width) => `${ESC}90m${clip(text, width)}${ESC}0m`;
-const columns = () => Math.max(40, (process.stdout.columns || 100) - 1);
+const columns = () => Math.max(40, (process.stdout.columns || 100) - options.margin);
 
 const write = (text) => process.stdout.write(text);
 
@@ -152,6 +155,9 @@ const stop = () => {
   write(`${ESC}?25h\r\n`);
   process.exit(0);
 };
+// Ink repaints on the stdout "resize" event; node only refreshes process.stdout.columns (and
+// installs its SIGWINCH handler) when something listens for it.
+process.stdout.on("resize", () => render(false));
 process.on("SIGINT", stop);
 process.on("SIGTERM", stop);
 process.on("SIGHUP", stop);

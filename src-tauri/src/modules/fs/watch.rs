@@ -139,28 +139,53 @@ fn drain_loop(
             }
         }
 
-        let paths = resolve_changes(pending, &shared);
-        if paths.is_empty() {
-            continue;
-        }
-        for path in &paths {
+        let Changes { touched, report } = resolve_changes(pending, &shared);
+        // The file list cache hears about every touched directory, whether or not the
+        // frontend does: an edited ignore file changes the list without changing a name.
+        for path in &touched {
             index.note_change(path);
         }
-        let _ = app.emit("fs:changed", ChangedPayload { paths });
+        if report.is_empty() {
+            continue;
+        }
+        let _ = app.emit("fs:changed", ChangedPayload { paths: report });
     }
 }
 
+/// What one burst resolved to.
+struct Changes {
+    /// Watched directories the backend reported.
+    touched: Vec<String>,
+    /// What the frontend is told: the touched directories whose listing moved, plus registered
+    /// files inside them whose stamp moved.
+    report: Vec<String>,
+}
+
 /// Watched directories that changed, plus registered files inside them whose
-/// stamp moved.
-fn resolve_changes(pending: Pending, shared: &Shared) -> Vec<String> {
+/// stamp moved. A directory whose listing is the one the frontend already has (a file edited
+/// in place, a build rewriting a file) is left out: see `WatchSet::listing_changed`.
+fn resolve_changes(pending: Pending, shared: &Shared) -> Changes {
+    let (touched, locations) = {
+        let set = shared.set.lock().unwrap_or_else(|e| e.into_inner());
+        let touched = pending.resolve(set.dir_keys());
+        let locations: Vec<Option<PathBuf>> = touched.iter().map(|dir| set.dir_path(dir)).collect();
+        (touched, locations)
+    };
+    // Reading the directories happens outside the lock: add/remove never wait for the disk.
+    let signatures: Vec<Option<u64>> = locations
+        .iter()
+        .map(|path| path.as_deref().and_then(plan::listing_signature))
+        .collect();
     let mut set = shared.set.lock().unwrap_or_else(|e| e.into_inner());
-    let dirs = pending.resolve(set.dir_keys());
     let stamp_of = |path: &str| FileStamp::of(std::path::Path::new(path));
-    let mut paths = dirs.clone();
-    for dir in &dirs {
-        paths.extend(set.changed_files_in(dir, &stamp_of));
+    let mut report = Vec::new();
+    for (dir, signature) in touched.iter().zip(signatures) {
+        if set.listing_changed(dir, signature) {
+            report.push(dir.clone());
+        }
+        report.extend(set.changed_files_in(dir, &stamp_of));
     }
-    paths
+    Changes { touched, report }
 }
 
 // Canonical keys keep add/remove symmetric regardless of how the path was spelled.
@@ -249,12 +274,21 @@ pub async fn fs_watch_add(
         if dirs.is_empty() && files.is_empty() {
             return Ok(());
         }
+        // Taken before the OS watch starts (inside `apply`), so a change after it differs.
+        let baselines: Vec<Option<u64>> = dirs
+            .iter()
+            .map(|dir| plan::listing_signature(dir))
+            .collect();
         app.state::<FsWatchState>()
             .with_running(&app, true, |running| {
                 running.apply(|set| {
                     let mut moved = false;
-                    for dir in dirs {
-                        moved |= set.add_dir(to_canon(&dir), dir);
+                    for (dir, signature) in dirs.into_iter().zip(baselines) {
+                        let key = to_canon(&dir);
+                        if set.add_dir(key.clone(), dir) {
+                            set.record_listing(&key, signature);
+                            moved = true;
+                        }
                     }
                     for (dir, key, stamp) in files {
                         set.add_file(dir, key, stamp);
@@ -307,4 +341,72 @@ pub async fn fs_watch_remove(
         Ok(())
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shared_watching(dir: &std::path::Path) -> Shared {
+        let key = to_canon(dir);
+        let mut set = WatchSet::default();
+        assert!(set.add_dir(key.clone(), dir.to_path_buf()));
+        set.record_listing(&key, plan::listing_signature(dir));
+        Shared {
+            set: Mutex::new(set),
+            dirs: Arc::new(RwLock::new(Arc::new(DirSet::new()))),
+        }
+    }
+
+    fn burst(dir: &std::path::Path) -> Pending {
+        let mut pending = Pending::default();
+        pending.merge(Batch {
+            dirs: vec![to_canon(dir)],
+            subtrees: Vec::new(),
+        });
+        pending
+    }
+
+    #[test]
+    fn edits_in_place_reach_the_index_but_not_the_frontend() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ts"), "one").unwrap();
+        let shared = shared_watching(dir.path());
+
+        std::fs::write(dir.path().join("a.ts"), "two, longer").unwrap();
+        let changes = resolve_changes(burst(dir.path()), &shared);
+        assert_eq!(changes.touched, vec![to_canon(dir.path())]);
+        assert!(
+            changes.report.is_empty(),
+            "nothing the explorer shows moved"
+        );
+
+        std::fs::write(dir.path().join("b.ts"), "").unwrap();
+        let changes = resolve_changes(burst(dir.path()), &shared);
+        assert_eq!(changes.report, vec![to_canon(dir.path())]);
+
+        let changes = resolve_changes(burst(dir.path()), &shared);
+        assert!(changes.report.is_empty(), "the new listing is now known");
+
+        std::fs::remove_file(dir.path().join("b.ts")).unwrap();
+        let changes = resolve_changes(burst(dir.path()), &shared);
+        assert_eq!(changes.report, vec![to_canon(dir.path())]);
+    }
+
+    #[test]
+    fn a_registered_file_is_still_reported_when_only_its_contents_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("open.ts");
+        std::fs::write(&file, "one").unwrap();
+        let shared = shared_watching(dir.path());
+        shared.set.lock().unwrap().add_file(
+            to_canon(dir.path()),
+            to_canon(&file),
+            FileStamp::of(&file),
+        );
+
+        std::fs::write(&file, "two, a different length").unwrap();
+        let changes = resolve_changes(burst(dir.path()), &shared);
+        assert_eq!(changes.report, vec![to_canon(&file)]);
+    }
 }

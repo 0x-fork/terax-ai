@@ -21,7 +21,15 @@ export type BenchAppApi = {
 
 /** One scenario, as written by scripts/app-lab/run.py into TERAX_BENCH_SCENARIO. */
 export type BenchScenario = {
-  name: "tabs" | "resize" | "occlusion" | "agents-steady" | "idle" | "input";
+  name:
+    | "tabs"
+    | "resize"
+    | "split-drag"
+    | "occlusion"
+    | "agents-steady"
+    | "idle"
+    | "fs-churn"
+    | "input";
   /** tabs: "2" (shell + agent) or "4" (shell, agent, agent+shell split, shell). */
   variant?: string;
   /** Shell command that starts the synthetic agent (see scripts/app-lab/agent-sim.mjs). */
@@ -34,6 +42,13 @@ export type BenchScenario = {
   durationS?: number;
   warmupS?: number;
   hiddenAgents?: number;
+  /** split-drag: seconds of divider motion per drag, and its amplitude as a share of the pane area. */
+  dragS?: number;
+  dragAmplitude?: number;
+  /** split-drag: mouse sample rate of the synthetic drag (Hz). */
+  mouseHz?: number;
+  /** resize: grow the window before shrinking it (takes it past the size the canvas was allocated for). */
+  growFirst?: boolean;
   steps?: number;
   stepPoints?: number;
   stepIntervalMs?: number;
@@ -50,6 +65,10 @@ export type BenchScenario = {
   holdTab?: number;
   /** tabs control: run the same loop without ever switching tabs. */
   noSwitch?: boolean;
+  /** idle, fs-churn: take a full sample every this many seconds (`tick-N`, with the layer tree). */
+  tickS?: number;
+  /** fs-churn: the orchestrator moves another application to the front; samples need no key window. */
+  unfocused?: boolean;
   /** Patch WebGPU/DOM prototypes with lifecycle counters (src/bench/gpuCounters.ts). */
   instrument?: boolean;
   /** Application preferences to set through the app's own store before the scenario starts. */

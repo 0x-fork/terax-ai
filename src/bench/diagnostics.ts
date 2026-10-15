@@ -1,5 +1,6 @@
 import { terminalDebugStats } from "@/modules/terminal/lib/terminalDiagnostics";
 import type { Tab } from "@/modules/tabs";
+import { drainEventLog, listenerCensus } from "./eventLog";
 import { gpuCounters } from "./gpuCounters";
 
 /** Layout of the open tabs, so a report says which tab each sample was taken on. */
@@ -44,6 +45,7 @@ export function collectDiagnostics(tabs: Tab[], activeId: number) {
     },
     tabs: tabSummary(tabs, activeId),
     counters: gpuCounters.instrumented ? { ...gpuCounters } : null,
+    page: gpuCounters.instrumented ? pageCensus() : null,
     // Running CSS/Web animations keep the compositor committing frames while the window is idle.
     animations: document.getAnimations?.().length ?? null,
     devicePixelRatio: window.devicePixelRatio,
@@ -51,4 +53,28 @@ export function collectDiagnostics(tabs: Tab[], activeId: number) {
     visibility: document.visibilityState,
     hasFocus: document.hasFocus(),
   };
+}
+
+/**
+ * What the page holds besides the terminals, for leak hunting: DOM nodes by kind, explorer rows,
+ * listeners left on long-lived targets, resource-timing entries, and the page events since the
+ * previous sample (see eventLog.ts).
+ */
+function pageCensus() {
+  const log = drainEventLog();
+  return {
+    nodes: countNodes(),
+    explorerRows: document.querySelectorAll("[data-fs-path]").length,
+    listeners: listenerCensus(),
+    resourceEntries: performance.getEntriesByType("resource").length,
+    events: log.events,
+    eventsDropped: log.dropped,
+  };
+}
+
+function countNodes(): number {
+  const walker = document.createTreeWalker(document, NodeFilter.SHOW_ALL);
+  let count = 0;
+  while (walker.nextNode()) count++;
+  return count;
 }

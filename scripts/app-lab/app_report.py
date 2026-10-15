@@ -19,7 +19,7 @@ if str(_RENDERER_PROFILE) not in sys.path:
 import lab_report  # noqa: E402
 from lab_report import MIB, interval, slope, table  # noqa: E402
 
-SCENARIOS = ["tabs", "resize", "occlusion", "agents-steady", "idle", "input"]
+SCENARIOS = ["tabs", "resize", "split-drag", "occlusion", "agents-steady", "idle", "fs-churn", "input"]
 ROLES = ["host", "web_content", "gpu", "networking"]
 ROLE_LABELS = {"host": "host", "web_content": "WebContent", "gpu": "GPU", "networking": "Network", "workload": "PTY-procs", "web_content_prewarmed": "WC-prewarm"}
 # Footprint categories worth a column; everything else is rolled into the process total.
@@ -201,16 +201,19 @@ def qualify(scenario: str, phase: str, event: dict) -> list[str]:
         if diag.get("visibility") != "hidden":
             reasons.append(f"document.visibilityState={diag.get('visibility')} during the hold")
         return reasons
-    if not native.get("appActive"):
+    # `unfocused` scenarios move another application to the front on purpose (a window that stays
+    # visible but is not key, like an app left behind another one); occlusion still disqualifies.
+    unfocused = bool(event.get("unfocused"))
+    if not native.get("appActive") and not unfocused:
         reasons.append("application is not active")
-    if not native.get("key"):
+    if not native.get("key") and not unfocused:
         reasons.append("benchmark window is not key")
     if not native.get("occlusionVisible"):
         reasons.append("window is occluded")
     if diag.get("visibility") != "visible":
         reasons.append(f"document.visibilityState={diag.get('visibility')}")
     gpu = diag.get("ghosttyWebGpu") or {}
-    if gpu and not gpu.get("windowFocused"):
+    if gpu and not gpu.get("windowFocused") and not unfocused:
         reasons.append("renderer reports the window unfocused")
     show = event.get("show")
     if show is not None and not show.get("ok"):
@@ -485,6 +488,71 @@ def _counter_metrics(metrics: dict, by_phase: dict, samples: list[dict]) -> None
         metrics[f"counters.{kind}.alive"] = created - finalized
 
 
+SMOOTH_FIELDS = [
+    ("fps", "fps", None),
+    ("frameIntervalMs", "frame_interval_p95_ms", "p95"),
+    ("busyIntervalMs", "busy_interval_p50_ms", "p50"),
+    ("busyIntervalMs", "busy_interval_p95_ms", "p95"),
+    ("busyIntervalMs", "busy_interval_max_ms", "max"),
+    ("rafIntervalMs", "raf_interval_p95_ms", "p95"),
+    ("refreshMs", "refresh_ms", None),
+    ("frameCostMs", "frame_cost_p95_ms", "p95"),
+    ("frameCostMs", "frame_cost_max_ms", "max"),
+    ("contentAgeMs", "content_age_p50_ms", "p50"),
+    ("contentAgeMs", "content_age_p95_ms", "p95"),
+    ("contentAgeMs", "content_age_max_ms", "max"),
+    ("reflowIntervalMs", "reflow_interval_p50_ms", "p50"),
+    ("reflowIntervalMs", "reflow_interval_p95_ms", "p95"),
+    ("reflowIntervalMs", "reflow_interval_max_ms", "max"),
+    ("rectLagMs", "rect_lag_p95_ms", "p95"),
+    ("rectLagMs", "rect_lag_max_ms", "max"),
+    ("gridStalenessMs", "staleness_p50_ms", "p50"),
+    ("gridStalenessMs", "staleness_p95_ms", "p95"),
+    ("gridStalenessMs", "staleness_max_ms", "max"),
+    ("staleShare", "stale_share", None),
+    ("gridResizesPerS", "grid_resizes_per_s", None),
+    ("settleMs", "settle_ms", None),
+    ("gridResizesMaxPane", "sigwinch_per_pane_max", None),
+    ("cursorClipped", "cursor_clipped_frames", None),
+    ("cursorFrames", "cursor_frames", None),
+    ("resizeCostMs", "resize_cost_p95_ms", "p95"),
+    ("frozenMs", "frozen_ms", None),
+    ("frozenMaxMs", "frozen_max_ms", None),
+    ("frozenOverFrame", "frozen_over_frame", None),
+    ("frozenShare", "frozen_share", None),
+    ("blankFrames", "blank_frames", None),
+    ("erasedPrompts", "erased_prompts", None),
+    ("redrawMs", "redraw_p50_ms", "p50"),
+    ("redrawMs", "redraw_p95_ms", "p95"),
+    ("slowFrames", "slow_frames", None),
+    ("stalledFrames", "stalled_frames", None),
+    ("frames", "frames", None),
+]
+
+
+def _smooth_metrics(metrics: dict, steps: list[dict]) -> None:
+    """Per-gesture smoothness (page-side probe), reduced over the gestures: median and worst."""
+    smooths = [s["event"]["smooth"] for s in steps if isinstance((s.get("event") or {}).get("smooth"), dict)]
+    if not smooths:
+        return
+    metrics["smooth.gestures"] = len(smooths)
+    for field, name, sub in SMOOTH_FIELDS:
+        values = []
+        for smooth in smooths:
+            value = smooth.get(field)
+            if sub is not None and isinstance(value, dict):
+                value = value.get(sub)
+            if isinstance(value, (int, float)):
+                values.append(float(value))
+        if values:
+            metrics[f"smooth.{name}.median"] = statistics.median(values)
+            metrics[f"smooth.{name}.worst"] = max(values) if name not in ("fps", "frames") else min(values)
+    reallocs = [r for smooth in smooths for r in smooth.get("reallocs") or []]
+    metrics["smooth.reallocs"] = len(reallocs)
+    if reallocs:
+        metrics["smooth.realloc_cost_max_ms"] = max(r["costMs"] for r in reallocs)
+
+
 def compute_metrics(report: dict) -> dict[str, float]:
     full = report
     report = usable(report)
@@ -516,7 +584,7 @@ def compute_metrics(report: dict) -> dict[str, float]:
     _timeline_metrics(metrics, full)
     _counter_metrics(metrics, by_phase, samples)
 
-    if scenario in ("tabs", "occlusion", "resize"):
+    if scenario in ("tabs", "occlusion", "resize", "split-drag"):
         base = by_phase.get("baseline")
         if scenario == "tabs":
             switches = sorted(
@@ -546,7 +614,7 @@ def compute_metrics(report: dict) -> dict[str, float]:
                 per[cycle] = bool(hide.get("ok") and hide.get("occluded"))
             metrics["cycles.occluded"] = sum(per.values())
         else:
-            steps = [s for s in samples if phase_of(s).split("-")[0] in ("shrink", "grow")]
+            steps = [s for s in samples if phase_of(s).split("-")[0] in ("shrink", "grow", "drag")]
             visible = [(i + 1, s) for i, s in enumerate(steps)]
             _series_metrics(metrics, "resize.drags", visible, base)
             for sample in steps:
@@ -558,6 +626,7 @@ def compute_metrics(report: dict) -> dict[str, float]:
             window = [(by_phase.get("baseline"), steps[-1])] if base and steps else []
             for start, end in window:
                 _interval_metrics(metrics, "resize.drag", interval(start, end))
+            _smooth_metrics(metrics, steps)
         if "end+30s" in by_phase and "post-gc+10s" in by_phase:
             metrics["footprint.gc_recovered_mib"] = total_mib(by_phase["end+30s"]) - total_mib(by_phase["post-gc+10s"])
             metrics["footprint.gc_recovered.web_content_mib"] = role_mib(by_phase["end+30s"], "web_content") - role_mib(by_phase["post-gc+10s"], "web_content")
@@ -642,6 +711,26 @@ def _interval_table(pairs: list[tuple[str, dict | None]], roles: list[str]) -> s
     return lab_report._interval_table(pairs, roles)
 
 
+def smooth_table(steps: list[dict]) -> str:
+    head = ["gesture", "fps", "int p50", "p95", "max", "raf p95", "lag p95", "lag max", "age p50", "p95", "max", "reflow p50", "p95", "max", "stale%", "settle", "resz/pane", "crsr clip/n", "frozen ms", "max", ">1fr", "frz%", "blank", "erased", "redraw p50", "p95", "cost p95", "reallocs"]
+    rows = [head]
+    for sample in steps:
+        smooth = (sample.get("event") or {}).get("smooth")
+        if not isinstance(smooth, dict):
+            continue
+        f = lambda key, sub: (smooth.get(key) or {}).get(sub, 0)
+        rows.append([
+            phase_of(sample), f"{smooth['fps']:.1f}", f"{f('busyIntervalMs', 'p50'):.1f}", f"{f('busyIntervalMs', 'p95'):.1f}", f"{f('busyIntervalMs', 'max'):.1f}",
+            f"{f('rafIntervalMs', 'p95'):.1f}", f"{f('rectLagMs', 'p95'):.1f}", f"{f('rectLagMs', 'max'):.1f}",
+            f"{f('contentAgeMs', 'p50'):.0f}", f"{f('contentAgeMs', 'p95'):.0f}", f"{f('contentAgeMs', 'max'):.0f}", f"{f('reflowIntervalMs', 'p50'):.0f}", f"{f('reflowIntervalMs', 'p95'):.0f}", f"{f('reflowIntervalMs', 'max'):.0f}", f"{smooth['staleShare'] * 100:.0f}",
+            str(smooth.get("settleMs", "-")), str(smooth.get("gridResizesMaxPane", "-")), f"{smooth.get('cursorClipped', 0)}/{smooth.get('cursorFrames', 0)}", str(smooth["frozenMs"]), str(smooth["frozenMaxMs"]), str(smooth["frozenOverFrame"]), f"{smooth['frozenShare'] * 100:.0f}",
+            str(smooth["blankFrames"]), str(smooth["erasedPrompts"]), f"{f('redrawMs', 'p50'):.0f}", f"{f('redrawMs', 'p95'):.0f}", f"{f('frameCostMs', 'p95'):.1f}",
+            ",".join(f"{r['costMs']:.0f}ms@{r['width']}x{r['height']}" for r in smooth.get("reallocs") or []) or "-",
+        ])
+    widths = [max(len(r[i]) for r in rows) for i in range(len(head))]
+    return "\n".join("  " + "  ".join(c.rjust(w) for c, w in zip(r, widths)) for r in rows)
+
+
 def summarize(report: dict) -> str:
     report = usable(report)
     scenario = scenario_of(report)
@@ -657,7 +746,7 @@ def summarize(report: dict) -> str:
     if scn.get("localStorage"):
         out.append(f"  localStorage: {scn['localStorage']}")
     base = by_phase.get("baseline")
-    if scenario in ("tabs", "occlusion", "resize"):
+    if scenario in ("tabs", "occlusion", "resize", "split-drag"):
         rows_samples = []
         if base:
             rows_samples.append(base)
@@ -666,7 +755,7 @@ def summarize(report: dict) -> str:
         elif scenario == "occlusion":
             body = [s for s in samples if phase_of(s).startswith("cycle-")]
         else:
-            body = [s for s in samples if phase_of(s).split("-")[0] in ("shrink", "grow")]
+            body = [s for s in samples if phase_of(s).split("-")[0] in ("shrink", "grow", "drag")]
         # Long runs: every row for the first 3 and last 3, then every 5th.
         shown = [s for i, s in enumerate(body) if i < 3 or i >= len(body) - 3 or (i + 1) % 5 == 0]
         tail = [by_phase[n] for n in ("cycles-complete", "resize-settled", "end+10s", "end+30s", "post-gc+2s", "post-gc+10s") if n in by_phase]
@@ -687,6 +776,9 @@ def summarize(report: dict) -> str:
         if pairs:
             out.append("\nCPU% (of one core) and energy:")
             out.append(_interval_table(pairs, roles + (["workload"] if any("workload" in (p[1] or {}).get("cpu_pct", {}) for p in pairs) else [])))
+        if scenario in ("resize", "split-drag"):
+            out.append("\nSmoothness per gesture (page-side probe):")
+            out.append(smooth_table([s for s in samples if phase_of(s).split("-")[0] in ("shrink", "grow", "drag")]))
     else:
         rows_samples = [s for s in samples if phase_of(s) in ("setup-complete", "measure-start", "measure-end")]
         out.append("\nFootprint (MiB):")

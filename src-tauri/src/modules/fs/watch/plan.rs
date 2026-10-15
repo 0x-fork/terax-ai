@@ -3,7 +3,9 @@
 //! Everything here is pure so the macOS FSEvents callback and the notify
 //! callback share one tested filter.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -150,6 +152,80 @@ impl FileStamp {
     }
 }
 
+/// Most entries a directory may have for its listing to be fingerprinted: a larger one is
+/// always reported (the walk would cost more than the reload it saves).
+const MAX_FINGERPRINTED_ENTRIES: usize = 50_000;
+
+/// Ignore files change what the explorer shows for *other* entries (dimming), so a rewrite of
+/// one counts as a listing change although no name moved.
+fn is_ignore_file(name: &str) -> bool {
+    matches!(name, ".gitignore" | ".ignore")
+}
+
+/// Order-independent fingerprint of what the explorer renders for a directory: the entry
+/// names and their kinds. Entries are mixed with a commutative sum, so no sort and no
+/// allocation per entry.
+#[derive(Default)]
+pub struct ListingHasher {
+    sum: u64,
+    count: u64,
+}
+
+impl ListingHasher {
+    /// `extra` carries anything else that must count as a change of this entry (an ignore
+    /// file's stamp).
+    pub fn add(&mut self, name: &str, kind: u8, extra: u64) {
+        let mut hasher = DefaultHasher::new();
+        name.hash(&mut hasher);
+        kind.hash(&mut hasher);
+        extra.hash(&mut hasher);
+        self.sum = self.sum.wrapping_add(hasher.finish());
+        self.count += 1;
+    }
+
+    pub fn finish(self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.sum.hash(&mut hasher);
+        self.count.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+/// The fingerprint of `dir`'s listing, or `None` when it cannot be read (gone, denied) or is
+/// too large to fingerprint: callers then report the directory, as they always did.
+pub fn listing_signature(dir: &Path) -> Option<u64> {
+    let mut hasher = ListingHasher::default();
+    for (seen, entry) in std::fs::read_dir(dir).ok()?.enumerate() {
+        if seen >= MAX_FINGERPRINTED_ENTRIES {
+            return None;
+        }
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let kind = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => 1,
+            Ok(kind) if kind.is_symlink() => 2,
+            Ok(_) => 0,
+            Err(_) => 3,
+        };
+        let extra = if is_ignore_file(&name) {
+            match FileStamp::of(&entry.path()) {
+                Some(stamp) => {
+                    let mut hasher = DefaultHasher::new();
+                    stamp.len.hash(&mut hasher);
+                    stamp.modified.hash(&mut hasher);
+                    hasher.finish()
+                }
+                None => 1,
+            }
+        } else {
+            0
+        };
+        hasher.add(&name, kind, extra);
+    }
+    Some(hasher.finish())
+}
+
 struct FileWatch {
     refs: usize,
     stamp: Option<FileStamp>,
@@ -159,6 +235,9 @@ struct DirWatch {
     refs: usize,
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     path: PathBuf,
+    /// Fingerprint of the listing the frontend was last told about (or could have read when the
+    /// directory was registered); `None` until known.
+    listing: Option<u64>,
 }
 
 /// Refcounted directories (explorer expansion and open editors can ask for the
@@ -178,7 +257,14 @@ impl WatchSet {
                 false
             }
             None => {
-                self.dirs.insert(key, DirWatch { refs: 1, path });
+                self.dirs.insert(
+                    key,
+                    DirWatch {
+                        refs: 1,
+                        path,
+                        listing: None,
+                    },
+                );
                 true
             }
         }
@@ -196,6 +282,35 @@ impl WatchSet {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Remembers the listing a newly watched directory had when it was registered, taken before
+    /// the OS watch starts so that any later change differs from it.
+    pub fn record_listing(&mut self, key: &str, signature: Option<u64>) {
+        if let Some(watch) = self.dirs.get_mut(key) {
+            watch.listing = signature;
+        }
+    }
+
+    /// Where a watched directory lives on disk.
+    pub fn dir_path(&self, key: &str) -> Option<PathBuf> {
+        self.dirs.get(key).map(|watch| watch.path.clone())
+    }
+
+    /// Whether the frontend must be told about `key`: its listing (names and kinds) moved since
+    /// the last report. An in-place edit of a file changes the directory's timestamp but not
+    /// its listing, and the explorer renders nothing else, so reporting it would only cost an
+    /// IPC round trip, a reload and the garbage both leave in the web process. A directory
+    /// that cannot be fingerprinted is always reported. The new fingerprint is remembered.
+    pub fn listing_changed(&mut self, key: &str, current: Option<u64>) -> bool {
+        let Some(watch) = self.dirs.get_mut(key) else {
+            return false;
+        };
+        let previous = std::mem::replace(&mut watch.listing, current);
+        match (previous, current) {
+            (Some(before), Some(now)) => before != now,
+            _ => true,
         }
     }
 
@@ -758,6 +873,116 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(5),
             "400k events took {:?}",
             started.elapsed()
+        );
+    }
+
+    fn signature_of(entries: &[(&str, u8)]) -> u64 {
+        let mut hasher = ListingHasher::default();
+        for (name, kind) in entries {
+            hasher.add(name, *kind, 0);
+        }
+        hasher.finish()
+    }
+
+    #[test]
+    fn listing_fingerprint_ignores_order_and_sees_every_kind_of_change() {
+        let base = signature_of(&[("a.ts", 0), ("src", 1), ("b.ts", 0)]);
+        assert_eq!(base, signature_of(&[("b.ts", 0), ("a.ts", 0), ("src", 1)]));
+        assert_ne!(base, signature_of(&[("a.ts", 0), ("src", 1)]), "removed");
+        assert_ne!(
+            base,
+            signature_of(&[("a.ts", 0), ("src", 1), ("b.ts", 0), ("c.ts", 0)]),
+            "added"
+        );
+        assert_ne!(
+            base,
+            signature_of(&[("a.ts", 0), ("src", 1), ("c.ts", 0)]),
+            "renamed"
+        );
+        assert_ne!(
+            base,
+            signature_of(&[("a.ts", 0), ("src", 0), ("b.ts", 0)]),
+            "kind changed"
+        );
+        assert_ne!(
+            signature_of(&[("a", 0), ("a", 0)]),
+            signature_of(&[]),
+            "duplicates count"
+        );
+    }
+
+    #[test]
+    fn an_edit_in_place_leaves_the_listing_alone_and_a_new_entry_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ts"), "one").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let before = listing_signature(dir.path()).unwrap();
+
+        std::fs::write(dir.path().join("a.ts"), "a much longer second version").unwrap();
+        assert_eq!(listing_signature(dir.path()), Some(before), "edit in place");
+
+        std::fs::write(dir.path().join("b.ts"), "").unwrap();
+        let added = listing_signature(dir.path()).unwrap();
+        assert_ne!(added, before);
+
+        std::fs::rename(dir.path().join("b.ts"), dir.path().join("c.ts")).unwrap();
+        let renamed = listing_signature(dir.path()).unwrap();
+        assert_ne!(renamed, added);
+
+        std::fs::remove_file(dir.path().join("c.ts")).unwrap();
+        assert_eq!(listing_signature(dir.path()), Some(before), "back to start");
+
+        std::fs::remove_file(dir.path().join("a.ts")).unwrap();
+        std::fs::create_dir(dir.path().join("a.ts")).unwrap();
+        assert_ne!(
+            listing_signature(dir.path()),
+            Some(before),
+            "a file replaced by a directory of the same name"
+        );
+    }
+
+    #[test]
+    fn rewriting_an_ignore_file_counts_because_it_dims_other_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "target\n").unwrap();
+        std::fs::write(dir.path().join("a.ts"), "x").unwrap();
+        let before = listing_signature(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "target\na.ts\n").unwrap();
+        assert_ne!(listing_signature(dir.path()), Some(before));
+    }
+
+    #[test]
+    fn unreadable_directories_have_no_signature() {
+        assert_eq!(listing_signature(Path::new("/definitely/not/here")), None);
+    }
+
+    #[test]
+    fn only_a_moved_listing_is_reported_and_unknowns_always_are() {
+        let mut set = set_of(&["/w/a", "/w/b"]);
+        // Baseline unknown: the first report goes out and is remembered.
+        assert!(set.listing_changed("/w/a", Some(1)));
+        assert!(!set.listing_changed("/w/a", Some(1)), "same listing");
+        assert!(set.listing_changed("/w/a", Some(2)), "moved");
+        assert!(!set.listing_changed("/w/a", Some(2)));
+        // Unreadable now: reported, and the next readable one is reported again.
+        assert!(set.listing_changed("/w/a", None));
+        assert!(set.listing_changed("/w/a", Some(2)));
+        // A recorded baseline suppresses the first unchanged event.
+        set.record_listing("/w/b", Some(7));
+        assert!(!set.listing_changed("/w/b", Some(7)));
+        // Directories nobody watches are never reported through here.
+        assert!(!set.listing_changed("/w/zzz", Some(1)));
+    }
+
+    #[test]
+    fn releasing_a_directory_forgets_its_baseline() {
+        let mut set = set_of(&["/w/a"]);
+        set.record_listing("/w/a", Some(5));
+        assert!(set.remove_dir("/w/a"));
+        assert!(set.add_dir("/w/a".into(), "/w/a".into()));
+        assert!(
+            set.listing_changed("/w/a", Some(5)),
+            "a re-registered directory starts unknown"
         );
     }
 }

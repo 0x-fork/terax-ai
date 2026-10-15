@@ -7,6 +7,7 @@ import {
 } from "@/modules/terminal/lib/terminalClipboard";
 import { collectDiagnostics } from "./diagnostics";
 import { nativeWindow, reportError, reportPhase } from "./report";
+import { installSmoothProbe, type SmoothSummary } from "./smoothProbe";
 import type { BenchAppApi, BenchConfig, BenchScenario } from "./types";
 
 const pause = (ms: number) =>
@@ -75,7 +76,10 @@ class ScenarioRun {
     extra: Record<string, unknown> = {},
   ): Promise<void> {
     for (let attempt = 1; ; attempt++) {
-      if (this.scenario.name !== "occlusion" || !phase.endsWith("-hidden"))
+      if (
+        !this.scenario.unfocused &&
+        (this.scenario.name !== "occlusion" || !phase.endsWith("-hidden"))
+      )
         await this.ensureFront();
       const app = this.app();
       const layers = await this.layerTree(phase);
@@ -83,6 +87,7 @@ class ScenarioRun {
         ...extra,
         ...(layers ? { layers } : {}),
         attempt,
+        ...(this.scenario.unfocused ? { unfocused: true } : {}),
         refronted: this.refronted,
         diag: collectDiagnostics(app.tabs, app.activeId),
       });
@@ -104,7 +109,9 @@ class ScenarioRun {
    * `bench_window layers`). The full list is kept at rest, only the counts elsewhere.
    */
   async layerTree(phase: string): Promise<Record<string, unknown> | null> {
-    const full = /^(baseline|setup-complete|measure-start)$/.test(phase);
+    const full = /^(baseline|setup-complete|measure-start|tick-\d+)$/.test(
+      phase,
+    );
     const brief = /^(shrink-1|grow-1|resize-settled)$/.test(phase);
     if (!full && !brief) return null;
     try {
@@ -280,6 +287,23 @@ class ScenarioRun {
     setInterval(() => void run(), valve.everyS * 1000);
   }
 
+  /**
+   * Samples `tick-N` every `tickS` seconds for `durationS` (against the clock, so the time a
+   * sample takes does not stretch the schedule); without ticks just waits.
+   */
+  async ticks(durationS: number, tickS: number | undefined): Promise<void> {
+    const start = performance.now();
+    if (!tickS || tickS <= 0) {
+      await pause(durationS * 1000);
+      return;
+    }
+    for (let n = 1; n * tickS < durationS; n++) {
+      await pause(Math.max(0, start + n * tickS * 1000 - performance.now()));
+      await this.sync(`tick-${n}`, { elapsedMs: performance.now() - start });
+    }
+    await pause(Math.max(0, start + durationS * 1000 - performance.now()));
+  }
+
   /** Idle settle samples shared by the cycling scenarios. */
   async settle(): Promise<void> {
     await pause(10_000);
@@ -361,6 +385,100 @@ async function tabsScenario(run: ScenarioRun): Promise<void> {
   await run.settle();
 }
 
+/**
+ * Records the smoothness of one gesture: starts the probe, runs it, lets the last frames land and
+ * returns the summary.
+ */
+async function smoothly<T>(
+  gesture: () => Promise<T>,
+): Promise<{ result: T; smooth: SmoothSummary }> {
+  const probe = installSmoothProbe();
+  probe.start();
+  const result = await gesture();
+  // The final size lands when the gesture is over: wait for every grid to have it.
+  const ended = performance.now();
+  let settleMs = 0;
+  while (probe.pending() > 0) {
+    await pause(4);
+    settleMs = performance.now() - ended;
+    if (settleMs > 1500) {
+      settleMs = -1;
+      break;
+    }
+  }
+  await pause(200);
+  return { result, smooth: probe.stop(Math.round(settleMs)) };
+}
+
+type SplitLayout = {
+  tabId: number;
+  leaves: number[];
+  dir: "row" | "col";
+  /** Marker every prompt of the shell pane starts with (to count copies of it in scrollback). */
+  promptMarker: string;
+};
+
+/**
+ * Shell pane (10k lines of scrollback, then its prompt) next to an agent (`a`) or another shell
+ * (`s`). Variants: `sa` zsh (the app's shell integration, OSC 133) + agent, `ba` bash without
+ * any integration + agent, `ss` two zsh; `-col` stacks the panes instead of putting them side by
+ * side. A shell at its prompt is what a resize erases and redraws.
+ */
+async function splitLayout(
+  run: ScenarioRun,
+  variant: string | undefined,
+): Promise<SplitLayout> {
+  const name = variant ?? "sa";
+  const kinds = name.replace("-col", "");
+  const dir = name.endsWith("-col") ? "col" : "row";
+  const first = await run.booted();
+  const promptMarker = kinds[0] === "b" ? "BPR> " : "ZPR> ";
+  const fill = async (leafId: number, bash: boolean) => {
+    // No shell integration for bash: it keeps its own prompt and Ghostty never erases it.
+    if (bash) {
+      writeToSession(leafId, "exec bash --noprofile --norc\r");
+      await pause(1500);
+    }
+    writeToSession(leafId, "seq 1 10000\r");
+    await run.waitFor(
+      () => (run.app().readBuffer(leafId, 40) ?? "").includes("10000"),
+      `scrollback in terminal ${leafId}`,
+    );
+    await pause(500);
+    // The marked prompt comes after the bulk output so none of its lines scroll away.
+    writeToSession(leafId, bash ? "PS1='BPR> '\r" : "PROMPT='ZPR> '\r");
+    await pause(500);
+    writeToSession(leafId, "echo ready\r");
+    await pause(500);
+    writeToSession(leafId, "echo ready again\r");
+    await pause(800);
+  };
+  await fill(first.leafId, kinds[0] === "b");
+  const second = run.app().splitActivePane(first.tabId, dir);
+  if (second === null) throw new Error("split refused");
+  await pause(800);
+  await run.sessionReady(second);
+  if (kinds[1] === "s") await fill(second, false);
+  else await run.startAgent(second, "--history 3000");
+  await pause(2000);
+  return { tabId: first.tabId, leaves: [first.leafId, second], dir, promptMarker };
+}
+
+/** Copies of the shell prompt and of the agent's live region in the scrollback of both panes. */
+function duplicates(run: ScenarioRun, layout: SplitLayout) {
+  const count = (leafId: number, needle: string) =>
+    (run.app().readBuffer(leafId, 100_000) ?? "")
+      .split("\n")
+      .filter((line) => line.includes(needle)).length;
+  const [shell, other] = layout.leaves;
+  return {
+    prompts: count(shell, layout.promptMarker),
+    // The agent's region exists once; a second copy is left over from a repaint that missed.
+    agentRegions: count(other, "esc to interrupt"),
+    agentInputBoxes: count(other, 'Try "fix the failing test"'),
+  };
+}
+
 async function resizeScenario(run: ScenarioRun): Promise<void> {
   const { scenario } = run;
   const cycles = scenario.cycles ?? 3;
@@ -368,39 +486,185 @@ async function resizeScenario(run: ScenarioRun): Promise<void> {
   const stepPoints = scenario.stepPoints ?? 4;
   const intervalMs = scenario.stepIntervalMs ?? 16;
   const live = scenario.live ?? true;
-  const first = await run.booted();
-  await run.startAgent(first.leafId, "--history 3000");
+  let layout: SplitLayout | null = null;
+  if (scenario.variant) {
+    layout = await splitLayout(run, scenario.variant);
+  } else {
+    const first = await run.booted();
+    await run.startAgent(first.leafId, "--history 3000");
+  }
   await pause(3000);
-  await run.sync("setup", { cycles, steps, stepPoints, intervalMs, live });
+  await run.sync("setup", {
+    cycles,
+    steps,
+    stepPoints,
+    intervalMs,
+    live,
+    leaves: layout?.leaves,
+  });
   await pause(2000);
-  await run.sync("baseline", { cycle: 0 });
+  await run.sync("baseline", {
+    cycle: 0,
+    dupes: layout ? duplicates(run, layout) : undefined,
+  });
+  const drag = async (cycle: number, step: "shrink" | "grow") => {
+    const sign = step === "shrink" ? -1 : 1;
+    const { result, smooth } = await smoothly(() =>
+      run.native({
+        cmd: "resizeSteps",
+        dw: sign * stepPoints,
+        dh: (sign * stepPoints) / 2,
+        count: steps,
+        intervalMs,
+        live,
+        layersMid: cycle === 1 && step === "shrink",
+      }),
+    );
+    await run.sync(`${step}-${cycle}`, { cycle, step, resize: result, smooth });
+  };
   for (let cycle = 1; cycle <= cycles; cycle++) {
-    const shrink = await run.native({
-      cmd: "resizeSteps",
-      dw: -stepPoints,
-      dh: -stepPoints / 2,
-      count: steps,
-      intervalMs,
-      live,
-      layersMid: cycle === 1,
-    });
-    await run.sync(`shrink-${cycle}`, {
-      cycle,
-      step: "shrink",
-      resize: shrink,
-    });
-    const grow = await run.native({
-      cmd: "resizeSteps",
-      dw: stepPoints,
-      dh: stepPoints / 2,
-      count: steps,
-      intervalMs,
-      live,
-    });
-    await run.sync(`grow-${cycle}`, { cycle, step: "grow", resize: grow });
+    // Growing first takes the window past the size the canvas was allocated for.
+    const order = scenario.growFirst
+      ? (["grow", "shrink"] as const)
+      : (["shrink", "grow"] as const);
+    for (const step of order) await drag(cycle, step);
   }
   await pause(1500);
-  await run.sync("resize-settled");
+  await run.sync("resize-settled", {
+    dupes: layout ? duplicates(run, layout) : undefined,
+  });
+  await run.settle();
+}
+
+/**
+ * Drives a divider with DOM pointer events at `hz` samples a second along `position`. WebKit
+ * reports `buttons` from the physical mouse, so a synthetic NSEvent drag looks released to the
+ * divider library; pointer events dispatched here go through the library's own document
+ * listeners and everything after them (layout, React, observers, the renderer) is the real path.
+ * A late timer skips ahead to the sample for the time it woke at, like a mouse that coalesces.
+ */
+async function dragWithPointer(
+  handle: HTMLElement,
+  position: (index: number) => { x: number; y: number },
+  events: number,
+  hz: number,
+): Promise<{ events: number; sent: number; lateMaxMs: number; ms: number }> {
+  const capture = HTMLElement.prototype.setPointerCapture;
+  // The synthetic pointer is not an active pointer to WebKit; capture would throw.
+  HTMLElement.prototype.setPointerCapture = () => undefined;
+  const fire = (
+    type: string,
+    target: EventTarget,
+    point: { x: number; y: number },
+    buttons: number,
+  ) =>
+    target.dispatchEvent(
+      new PointerEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        pointerId: 1,
+        pointerType: "mouse",
+        isPrimary: true,
+        clientX: point.x,
+        clientY: point.y,
+        button: type === "pointermove" ? -1 : 0,
+        buttons,
+        view: window,
+      }),
+    );
+  try {
+    const start = position(0);
+    fire("pointerdown", handle, start, 1);
+    const began = performance.now();
+    let sent = 0;
+    let lateMax = 0;
+    let index = 0;
+    while (index < events) {
+      const due = began + ((index + 1) * 1000) / hz;
+      const wait = due - performance.now();
+      if (wait > 0) await pause(wait);
+      const now = performance.now();
+      lateMax = Math.max(lateMax, now - due);
+      index = Math.min(events, Math.max(index + 1, Math.floor(((now - began) * hz) / 1000)));
+      fire("pointermove", document, position(index), 1);
+      sent += 1;
+    }
+    fire("pointerup", document, position(events), 0);
+    return {
+      events,
+      sent,
+      lateMaxMs: Math.round(lateMax * 10) / 10,
+      ms: Math.round(performance.now() - began),
+    };
+  } finally {
+    HTMLElement.prototype.setPointerCapture = capture;
+  }
+}
+
+/** Divider drags with real mouse events: the divider sweeps back and forth like a hand would. */
+async function splitDragScenario(run: ScenarioRun): Promise<void> {
+  const { scenario } = run;
+  const cycles = scenario.cycles ?? 3;
+  const seconds = scenario.dragS ?? 6;
+  const amplitude = scenario.dragAmplitude ?? 0.2;
+  const hz = scenario.mouseHz ?? 125;
+  const layout = await splitLayout(run, scenario.variant ?? "sa");
+  // The divider between the panes, not the sidebar's (the first handle in the document).
+  const handle = () =>
+    document
+      .querySelector("[data-pane-leaf]")
+      ?.closest('[data-slot="resizable-panel-group"]')
+      ?.querySelector<HTMLElement>(':scope > [data-slot="resizable-handle"]') ??
+    null;
+  await run.waitFor(() => handle() !== null, "pane divider");
+  await pause(1000);
+  await run.sync("setup", {
+    cycles,
+    seconds,
+    amplitude,
+    hz,
+    leaves: layout.leaves,
+    dir: layout.dir,
+  });
+  await pause(2000);
+  await run.sync("baseline", { cycle: 0, dupes: duplicates(run, layout) });
+  for (let cycle = 1; cycle <= cycles; cycle++) {
+    const el = handle();
+    if (!el) throw new Error("pane divider disappeared");
+    const rect = el.getBoundingClientRect();
+    const vertical = layout.dir === "col";
+    const x0 = rect.left + rect.width / 2;
+    const y0 = rect.top + rect.height / 2;
+    const room = vertical ? el.parentElement?.clientHeight ?? 600 : el.parentElement?.clientWidth ?? 1000;
+    const swing = room * amplitude;
+    const events = Math.round(seconds * hz);
+    // Alternating drift: the divider never creeps toward its limit over the cycles.
+    const drift = cycle % 2 === 1 ? 0.5 : -0.5;
+    const position = (index: number) => {
+      // Two full sweeps per drag, easing in and out at both ends, plus a drift that leaves the
+      // divider away from where it started: the gesture has a final size to apply.
+      const ease = Math.min(1, index / 10, (events - index) / 10);
+      const offset =
+        swing * Math.sin((2 * Math.PI * index) / (hz * (seconds / 2))) * ease +
+        drift * swing * (index / events);
+      return vertical
+        ? { x: x0, y: y0 + offset }
+        : { x: x0 + offset, y: y0 };
+    };
+    const { result: drag, smooth } = await smoothly(() =>
+      dragWithPointer(el, position, events, hz),
+    );
+    await run.sync(`drag-${cycle}`, {
+      cycle,
+      step: "drag",
+      drag,
+      smooth,
+    });
+    await pause(1000);
+  }
+  await pause(1500);
+  await run.sync("resize-settled", { dupes: duplicates(run, layout) });
   await run.settle();
 }
 
@@ -499,7 +763,68 @@ async function idleScenario(run: ScenarioRun): Promise<void> {
   await run.sync("setup-complete");
   await run.sync("measure-start", { durationS });
   const start = performance.now();
-  await pause(durationS * 1000);
+  await run.ticks(durationS, run.scenario.tickS);
+  await run.sync("measure-end", { elapsedMs: performance.now() - start });
+  await run.collectGarbage();
+}
+
+/** What a dev server prints: a line every 3 s, a burst of module transforms every 30 s. */
+const DEV_SERVER =
+  'i=0; while true; do i=$((i+1)); echo "[dev] $(date +%T) page reload /src/App.tsx"; if [ $((i%10)) = 0 ]; then for j in $(seq 1 30); do echo "  transform src/modules/m$j.tsx"; done; fi; sleep 3; done';
+
+/** Clicks explorer rows (by path suffix, shortest first) to expand them; absent rows are skipped. */
+async function expandExplorer(run: ScenarioRun, suffixes: string[]) {
+  const expanded: string[] = [];
+  for (const suffix of suffixes) {
+    const find = () =>
+      [
+        ...document.querySelectorAll<HTMLElement>(
+          `[data-fs-path$="/${suffix}"]`,
+        ),
+      ].sort(
+        (a, b) =>
+          (a.dataset.fsPath ?? "").length - (b.dataset.fsPath ?? "").length,
+      )[0];
+    try {
+      await run.waitFor(() => find() !== undefined, suffix, 8000);
+    } catch {
+      continue;
+    }
+    find()?.click();
+    expanded.push(suffix);
+    await pause(400);
+  }
+  return expanded;
+}
+
+/**
+ * The reported condition: the explorer on a workspace directory (git decorations on), a dev
+ * server in the active terminal and two more shells, while `scripts/app-lab/fs-churn.mjs` (started
+ * by the orchestrator after `measure-start`, stopped after `measure-end`) edits files and writes
+ * builds into directories the explorer watches. Sampled every `tickS`, then a full collection.
+ */
+async function fsChurnScenario(run: ScenarioRun): Promise<void> {
+  const { scenario } = run;
+  const durationS = scenario.durationS ?? 600;
+  const warmupS = scenario.warmupS ?? 5;
+  const first = await run.booted();
+  await run.sessionReady(first.leafId);
+  if (!writeToSession(first.leafId, `${DEV_SERVER}\r`))
+    throw new Error("terminal refused the dev server command");
+  for (let i = 0; i < 2; i++) await run.newShellTab();
+  run.select(first.tabId);
+  const expanded = await expandExplorer(run, [
+    "src-tauri",
+    "src-tauri/src",
+    "src",
+    "src/modules",
+    "src/modules/explorer",
+  ]);
+  await pause(warmupS * 1000);
+  await run.sync("setup-complete", { expanded });
+  await run.sync("measure-start", { durationS, churn: true });
+  const start = performance.now();
+  await run.ticks(durationS, scenario.tickS ?? 30);
   await run.sync("measure-end", { elapsedMs: performance.now() - start });
   await run.collectGarbage();
 }
@@ -695,9 +1020,11 @@ const SCENARIOS: Record<
 > = {
   tabs: tabsScenario,
   resize: resizeScenario,
+  "split-drag": splitDragScenario,
   occlusion: occlusionScenario,
   "agents-steady": agentsSteadyScenario,
   idle: idleScenario,
+  "fs-churn": fsChurnScenario,
   input: inputScenario,
 };
 

@@ -13,6 +13,7 @@ Scenarios (`--scenario`):
   tabs           shell tab + agent tab (`--variant 4`: shell, agent, split agent+agent, shell);
                  switch tabs `--cycles` times with `--dwell-ms` dwell, sample after each switch
   resize         window drag-resize cycles with live-resize semantics (shrink/grow in steps)
+  split-drag     pane divider dragged back and forth with real mouse events (shell|agent split)
   occlusion      order the window out/front `--cycles` times
   agents-steady  1 visible + `--hidden-agents` hidden agent tabs for `--duration` s (CPU/energy)
   idle           one idle shell for `--duration` s
@@ -88,6 +89,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--window", default="1280x820", help="window size in points, WxH")
     p.add_argument("--instrument", action="store_true", help="patch WebGPU/DOM prototypes with lifecycle counters (calls, wrappers created/finalized, canvas re-parenting); compare with an uninstrumented run")
     p.add_argument("--gc", nargs="?", const="private", choices=["private", "alloc"], help="after the idle tail, request a full garbage collection and sample +2 s/+10 s: 'private' (default) is WebKit's testing SPI, 'alloc' is allocation pressure from the page (what an in-app valve could do)")
+    p.add_argument("--tick", type=float, help="idle, fs-churn: take a full sample (with the layer tree and the page event log) every this many seconds (fs-churn default 30)")
+    p.add_argument("--unfocused", action="store_true", help="fs-churn: after measure-start move Finder to the front, so the window stays visible but is not key (an app left behind another one)")
+    p.add_argument("--no-churn", action="store_true", help="fs-churn: do not start the file-system churn (dev server and explorer only)")
+    p.add_argument("--churn-args", default="", help="fs-churn: extra arguments for scripts/app-lab/fs-churn.mjs run (--build-every S, --build-files N, --build-seconds S, --seed N)")
     p.add_argument("--hold-tab", type=int, help="tabs: index of the tab shown at baseline (and for the whole run with --no-switch), in creation order")
     p.add_argument("--valve", metavar="EVERY_S:CHUNKS:MB", help="mitigation probe: every EVERY_S seconds the page allocates CHUNKS zero-filled ArrayBuffers of MB MiB to push JavaScriptCore into a full GC (tabs scenario)")
     p.add_argument("--probe", choices=["blur", "readonly", "caret-transparent", "caret-animation-manual", "zero-size", "clip", "display-contents", "selection", "selection-nofocus-div"], help="idle: remove one suspected source of idle display refreshes before measuring")
@@ -106,13 +111,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=120)
     p.add_argument("--step-points", type=float, default=4)
     p.add_argument("--step-interval-ms", type=float, default=16)
+    p.add_argument("--drag-seconds", type=float, help="split-drag: seconds of divider motion per drag (default 6)")
+    p.add_argument("--drag-amplitude", type=float, help="split-drag: sweep amplitude as a share of the split axis (default 0.2)")
+    p.add_argument("--mouse-hz", type=float, help="split-drag: mouse sample rate (default 125)")
+    p.add_argument("--grow-first", action="store_true", help="resize: grow the window before shrinking it (past the size the canvas was allocated for)")
     p.add_argument("--resize-mode", choices=["live", "plain"], default="live")
     p.add_argument("--vmmap", action=argparse.BooleanOptionalAction, default=None, help="`vmmap -summary` of WebContent and GPU per sample (default: on for tabs/resize/occlusion; it briefly suspends the target)")
     p.add_argument("--iosurfaces", action="store_true", help="list the IOSurface regions of WebContent and GPU (`vmmap -v`: count, sizes, volatile) in every full sample")
     p.add_argument("--categories", action=argparse.BooleanOptionalAction, default=True, help="keep footprint's per-category breakdown (default on)")
     p.add_argument("--poll-interval", type=float, default=1.0, help="seconds between timeline counter samples (phys_footprint, CPU, energy per process)")
     p.add_argument("--sampling", choices=["full", "light"], default="full", help="full: footprint+vmmap after every event (they briefly suspend the target and perturb it); light: only every --full-every-th cycle and the non-cycle phases are sampled with them, the rest rely on the cheap timeline (use a small --poll-interval)")
-    p.add_argument("--light-phases", default=r"^(switch-\d+|cycle-\d+-(hidden|visible)|shrink-\d+|grow-\d+)$", help="light sampling: regular expression of the phases that get only the cheap counters (every other phase, setup, the tail and GC samples, is sampled in full)")
+    p.add_argument("--light-phases", default=r"^(switch-\d+|cycle-\d+-(hidden|visible)|shrink-\d+|grow-\d+|drag-\d+)$", help="light sampling: regular expression of the phases that get only the cheap counters (every other phase, setup, the tail and GC samples, is sampled in full)")
     p.add_argument("--full-every", type=int, default=10, help="light sampling: still take a full sample every N cycles")
     p.add_argument("--wait-unlocked", type=float, default=0, metavar="SECONDS")
     p.add_argument("--wait-exclusive", type=float, default=1800, metavar="SECONDS", help="wait this long while another benchmark window (renderer-lab, app-lab) is running")
@@ -179,7 +188,7 @@ def build(args, source: Path, output: Path, target_dir: Path) -> Path:
         "build": {"beforeBuildCommand": "", "frontendDist": str(dist)},
         "bundle": {"createUpdaterArtifacts": False},
     }))
-    env = {**os.environ, "TERAX_BENCH": "1", "CARGO_TARGET_DIR": str(target_dir)}
+    env = {**os.environ, "TERAX_BENCH": "1", "TERAX_BENCH_IDENTIFIER": IDENTIFIER, "CARGO_TARGET_DIR": str(target_dir)}
     started = time.monotonic()
     with (output / "build.log").open("w") as log:
         print("Building the frontend (TERAX_BENCH=1)...", flush=True)
@@ -369,10 +378,14 @@ def scenario_json(args) -> dict:
         "probe": args.probe,
         "valve": dict(zip(("everyS", "chunks", "chunkMb"), (float(v) for v in args.valve.split(":")))) if args.valve else None,
         "holdTab": args.hold_tab,
+        "growFirst": True if args.grow_first else None,
+        "dragS": args.drag_seconds, "dragAmplitude": args.drag_amplitude, "mouseHz": args.mouse_hz,
         "instrument": True if args.instrument else None,
+        "tickS": args.tick if args.tick is not None else (30 if args.scenario == "fs-churn" else None),
+        "unfocused": True if args.unfocused else None,
         "prefs": {"windowVibrancy": args.vibrancy == "on"} if args.vibrancy else None,
     }
-    defaults = {"tabs": 40, "occlusion": 20, "resize": 3}
+    defaults = {"tabs": 40, "occlusion": 20, "resize": 3, "split-drag": 3}
     if args.cycles is not None or args.scenario in defaults:
         scenario["cycles"] = args.cycles if args.cycles is not None else defaults[args.scenario]
     if args.duration is not None:
@@ -390,6 +403,8 @@ def host_timeout(args, scenario: dict) -> float:
         return scenario["cycles"] * ((scenario["hiddenMs"] + scenario["visibleMs"]) / 1000 + 12) + 240
     if name == "resize":
         return scenario["cycles"] * 40 + 300
+    if name == "split-drag":
+        return scenario["cycles"] * (scenario.get("dragS", 6) + 30) + 360
     return (scenario.get("durationS") or 60) + args.warmup + 240
 
 
@@ -400,7 +415,7 @@ def run(args, app: Path, source: Path, output: Path) -> int:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     scenario = scenario_json(args)
     timeout = host_timeout(args, scenario)
-    vmmap_enabled = args.vmmap if args.vmmap is not None else args.scenario in ("tabs", "resize", "occlusion")
+    vmmap_enabled = args.vmmap if args.vmmap is not None else args.scenario in ("tabs", "resize", "split-drag", "occlusion")
     import plistlib
 
     executable = app / "Contents/MacOS" / plistlib.loads((app / "Contents/Info.plist").read_bytes())["CFBundleExecutable"]
@@ -449,6 +464,13 @@ def run(args, app: Path, source: Path, output: Path) -> int:
     }
     env.pop("ZDOTDIR", None)
     log = (output / "app.log").open("w")
+    churn = None
+    if args.scenario == "fs-churn":
+        if not args.cwd_shell:
+            args.cwd_shell = output / "workspace"
+            subprocess.run([shutil.which("node"), str(HERE / "fs-churn.mjs"), "prepare", str(args.cwd_shell), str(REPO)], check=True)
+        scenario["cwds"] = {"shell": str(args.cwd_shell.resolve())}
+        env["TERAX_BENCH_SCENARIO"] = json.dumps(scenario)
     launch_args = [str(args.cwd_shell.resolve())] if args.cwd_shell else []
     process = subprocess.Popen([str(executable), *launch_args], cwd=home, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     manifest["hostPid"] = process.pid
@@ -461,6 +483,28 @@ def run(args, app: Path, source: Path, output: Path) -> int:
     final_phase = None
 
     light_phases = re.compile(args.light_phases)
+
+    def after_sample(phase: str) -> None:
+        """Scenario side effects that must start right after a phase was sampled."""
+        nonlocal churn
+        if args.scenario != "fs-churn":
+            return
+        if phase == "measure-start" and churn is None and not args.no_churn:
+            churn = subprocess.Popen([shutil.which("node"), str(HERE / "fs-churn.mjs"), "run", str(args.cwd_shell.resolve()), *args.churn_args.split()], stdout=(output / "churn.log").open("w"), stderr=subprocess.STDOUT, start_new_session=True)
+        if phase == "measure-start" and args.unfocused:
+            subprocess.run(["open", "-a", "Finder"], check=False)
+        if phase == "measure-end" and churn is not None:
+            stop_churn()
+
+    def stop_churn() -> None:
+        nonlocal churn
+        if churn is not None and churn.poll() is None:
+            try:
+                os.killpg(churn.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            churn.wait(timeout=10)
+        churn = None
 
     def take_sample(event: dict) -> dict:
         native = event.get("native") or {}
@@ -557,6 +601,7 @@ def run(args, app: Path, source: Path, output: Path) -> int:
                 else:
                     consecutive_failures = 0
                 manifest["samples"].append(sample)
+                after_sample(phase)
                 print(json.dumps({"phase": phase, "footprintMiB": round(sample["footprintTotal"] / 1048576, 1), **({"unqualified": reasons} if reasons else {})}), flush=True)
             finally:
                 done.set()
@@ -565,6 +610,7 @@ def run(args, app: Path, source: Path, output: Path) -> int:
         manifest["incomplete"] = True
         manifest["error"] = repr(error)
     finally:
+        stop_churn()
         poller.stop()
         for kill in (signal.SIGTERM, signal.SIGKILL):
             if process.poll() is not None:
