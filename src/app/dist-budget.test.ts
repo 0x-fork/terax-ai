@@ -155,7 +155,8 @@ describe("built startup graph", () => {
       ],
       {
         cwd: root,
-        env: { ...process.env, NODE_ENV: "production" },
+        // TERAX_BENCH is explicitly off: a shipped build must not contain the app-lab driver.
+        env: { ...process.env, NODE_ENV: "production", TERAX_BENCH: "" },
         stdio: "pipe",
         timeout: 240_000,
       },
@@ -209,5 +210,41 @@ describe("built startup graph", () => {
         true,
       );
     }
+  });
+
+  it("contains none of the app-lab benchmark driver (TERAX_BENCH is off)", () => {
+    // The driver (src/bench) and its Tauri commands exist only in builds made with
+    // TERAX_BENCH=1: `__TERAX_BENCH__` is the literal `false` otherwise, so its lazy import, the
+    // chunks behind it and every bench-only string are removed before bundling.
+    const markers = [
+      "bench_config",
+      "bench_window",
+      "bench_exit",
+      "__teraxBenchConfig",
+      "terax:bench:",
+      "TERAX_BENCH",
+      "__TERAX_BENCH__",
+    ];
+    const files = (dir: string): string[] =>
+      readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
+        entry.isDirectory()
+          ? files(join(dir, entry.name))
+          : [join(dir, entry.name)],
+      );
+    const emitted = files(outDir).filter((file) => !file.endsWith(".map"));
+    expect(
+      emitted
+        .map((file) => file.slice(outDir.length))
+        .filter((file) => /bench/i.test(file)),
+    ).toEqual([]);
+    const offenders = emitted
+      .filter((file) => /\.(js|html|css)$/.test(file))
+      .flatMap((file) => {
+        const code = readFileSync(file, "utf8");
+        return markers
+          .filter((marker) => code.includes(marker))
+          .map((marker) => `${file.slice(outDir.length)}: ${marker}`);
+      });
+    expect(offenders).toEqual([]);
   });
 });

@@ -2,6 +2,8 @@ pub mod agent;
 pub mod ai_sessions;
 #[cfg(target_os = "macos")]
 pub mod app_menu;
+#[cfg(feature = "bench")]
+pub mod bench;
 pub mod control;
 pub mod fs;
 pub mod git;

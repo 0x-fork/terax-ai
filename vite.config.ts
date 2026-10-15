@@ -182,6 +182,12 @@ export default defineConfig(async ({ mode }): Promise<UserConfig> => ({
       },
     },
   },
+  // Real-application benchmark driver (src/bench, scripts/app-lab). `TERAX_BENCH=1` compiles
+  // it in; otherwise this is the literal `false` and every `if (__TERAX_BENCH__)` branch,
+  // including its dynamic imports, is removed, so no bench code or chunk is emitted.
+  define: {
+    __TERAX_BENCH__: JSON.stringify(process.env.TERAX_BENCH === "1"),
+  },
   clearScreen: false,
   server: {
     port: 1420,

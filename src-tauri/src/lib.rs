@@ -227,6 +227,8 @@ pub fn run() {
             }
         })
         .setup(move |_app| {
+            #[cfg(feature = "bench")]
+            modules::bench::guard(_app.handle())?;
             #[cfg(target_os = "macos")]
             modules::window_presentation::macos::install(_app.handle());
             if let Err(error) = control::start(_app.handle().clone(), control_for_setup.clone()) {
@@ -366,6 +368,12 @@ pub fn run() {
             vibrancy::window_backdrop_kind,
             vibrancy::window_set_backdrop,
             modules::window_presentation::window_presentation_state,
+            #[cfg(feature = "bench")]
+            modules::bench::bench_config,
+            #[cfg(feature = "bench")]
+            modules::bench::bench_window,
+            #[cfg(feature = "bench")]
+            modules::bench::bench_exit,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

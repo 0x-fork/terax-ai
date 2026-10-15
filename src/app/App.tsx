@@ -117,6 +117,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -138,6 +140,12 @@ import {
 } from "./hooks/tabCloseGuards";
 import { useTabCloseGuards } from "./hooks/useTabCloseGuards";
 import { useWorkspaceSwitcher } from "./hooks/useWorkspaceSwitcher";
+
+// Real-application benchmark driver (scripts/app-lab). `__TERAX_BENCH__` is the literal `false`
+// in a normal build, so this is `null` and neither the import nor its chunk is emitted.
+const BenchBridge = __TERAX_BENCH__
+  ? lazy(() => import("@/bench/BenchBridge"))
+  : null;
 
 export default function App() {
   const {
@@ -1383,6 +1391,24 @@ export default function App() {
   const shell = (
     <ThemeProvider>
       <TooltipProvider>
+        {BenchBridge && (
+          <Suspense fallback={null}>
+            <BenchBridge
+              tabs={tabs}
+              activeId={activeId}
+              booted={booted}
+              setActiveId={setActiveId}
+              newTab={newTab}
+              newBlockTab={newBlockTab}
+              newAgentGroupTab={newAgentGroupTab}
+              splitActivePane={splitActivePane}
+              closeTab={closeTab}
+              readBuffer={(leafId, maxLines) =>
+                terminalRefs.current.get(leafId)?.getBuffer(maxLines) ?? null
+              }
+            />
+          </Suspense>
+        )}
         <div className="relative flex h-screen flex-col overflow-hidden bg-frame text-foreground">
           {!zenMode && (
             <Header
