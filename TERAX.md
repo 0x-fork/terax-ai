@@ -40,11 +40,26 @@ Scrollback summed over all leaves is capped by a budget (192 MiB, scaled fairly
 between leaves, never pruning history already held). Presentation resources are
 shared, bounded, and released for hidden leaves.
 WebGPU canvases are leased from a shared pool rather than owned by persistent
-models. Up to eight unused targets share a 32 MiB color-storage budget and
-individual two-second deadlines; driver/compositor costs are separate. Reused
-targets stay hidden until the new owner's frame is encoded. Nearby backing sizes
-reuse storage; the canvas is always styled backing/ratio and drawn through an
-exact viewport, so text is never scaled.
+models. A presented WebGPU canvas is never destroyed, unconfigured, shrunk or
+dropped while the runtime lives: WebKit (macOS 26) keeps the swapchain of such a
+canvas in the WebContent process for good (three buffers, about 30 MiB for a
+2000x1300 canvas, whatever the teardown order and garbage collection), so every
+teardown leaks. A hidden pane returns its canvas to the pool still configured
+and sized; the next visible pane takes the idle canvas whose backing size
+already fits (`CanvasBackingStore.surplusFor`, zero reallocation), else the
+closest one. A canvas is created only when none is idle, so the pool never holds
+more than the peak number of simultaneously visible panes. Idle canvases keep
+their size for ten seconds (`localStorage["terax:terminal-canvas-park-ms"]`,
+`off` disables), then park at 1x1 while staying configured; a shrink and regrow
+is a transient (+2.3 MiB while cycling, returned once quiet), unlike a destroy.
+Parking exists because tab switches can show the incoming panes before the
+outgoing ones release (React runs effects in tree order), which briefly holds
+one canvas more than is visible. A replaced or recovered GPU device
+reconfigures the same elements (`lease.reconfigure`, measured flat). Only
+disposing the runtime itself tears canvases down. Reused targets stay hidden
+until the new owner's frame is encoded. Nearby backing sizes reuse storage; the
+canvas is always styled backing/ratio and drawn through an exact viewport, so
+text is never scaled.
 
 The WebGPU path (renderer v2, `docs/architecture/terminal-renderer-v2.md`) runs
 no per-cell JavaScript. Ghostty encodes 16-byte cell records natively and
@@ -79,8 +94,9 @@ font, with Ghostty's sprite geometry (`gpu/BuiltinGlyphs.ts`, pure, shared by
 the WebGPU and WebGL atlases), so borders and bars join seamlessly at every size
 and ratio. They ignore bold and italic and skip the text contrast curve.
 Native cell, grapheme and hyperlink presentation buffers allocate on first use
-and return to the WASM allocator when presentation is reclaimed. Hidden parsing
-does not rebuild them. Short visibility pauses retain uploaded cell data.
+and return to the WASM allocator when a pane is hidden. Hidden parsing does not
+rebuild them. Window pauses (occlusion, sleep) retain them and the uploaded cell
+data.
 Unchanged frames do not acquire presentation textures or draw; cursor-only
 updates upload only the uniform. WebGL background and decoration geometry uses
 row range uploads while rectangle counts are stable; structural changes rebuild
@@ -164,9 +180,17 @@ focused 4 ms (16 ms sustained), visible 16 ms, hidden 100 ms, window occluded or
 256 KiB pending is always due, and terminals due within 4 ms ride in the same response (one
 terminal contributes at most 512 KiB per response, so floods pipeline and share). The
 frontend reports classes only on change (`pty_set_presentation`, from `lib/ptyPresentation.ts`);
-macOS occlusion and sleep reach the hub natively from `window_presentation.rs`. The stream token
-from `pty_stream_open` is the credential: any frame can reach the scheme but only the page can
-invoke. A terminal's output is held until its receiver announces itself, and reload or window
+each report carries a growing sequence number and a terminal keeps the newest one that named it,
+because async commands can be applied out of order. macOS occlusion and sleep reach the hub natively
+from `window_presentation.rs`. The stream token from `pty_stream_open` is the credential: any frame
+can reach the scheme but only the page can invoke, so every request is admitted (`pty/gate.rs`) on
+the handler's thread before it may wake the hub: the `Origin` must be the app's own
+(`tauri://localhost`, `http(s)://tauri.localhost` on Windows, the dev server in dev builds; a request
+without `Origin` is token-only), the body at most 3084 bytes (413) and well framed (400), and the
+token the live one for the requesting webview (403; the hub publishes label to token, compared in
+constant time). Responses echo the allowed origin with `Vary: Origin`, never `*`. Tokens come from OS
+entropy only: if it fails, `pty_stream_open` fails instead of falling back to the clock. A terminal's
+output is held until its receiver announces itself, and reload or window
 destruction drops the held responder, kills the token and detaches that window's terminals.
 Frontend `PtyOutputHub` owns the loop: it re-polls on a response before parsing and demultiplexes
 to the `PtyOutputReceiver`s, whose cumulative parsed offsets ride on the next poll. An ack-only
@@ -201,15 +225,31 @@ labeled host RSS. Host RSS
 excludes WebContent and GPU processes and is not total application memory.
 
 Ghostty presentation uses shared native macOS occlusion/sleep and DOM visibility
-tracking. It pauses immediately, retains presentation for two seconds during
-short desktop transitions, and then reclaims hidden-window GPU resources.
-Sleep requests immediate reclamation; hidden tabs still release their leases
-immediately. Per-pane pacing prevents focused output from raising background
-pane cadence. WebGPU permits at most two outstanding frame submissions.
+tracking. Every renderer pauses immediately. The WebGPU renderer does nothing
+more: frames and timers stop, while canvases (configured, at full size), cell
+buffers, glyph maps and atlas textures stay resident, so coming back from a
+Space switch, minimize or sleep costs one redraw and no allocation. Releasing
+them is worse than keeping them (see the canvas pool above). The WebGL fallback
+still reclaims its renderer after two seconds of continuous occlusion, and at
+once on sleep, because its dropped canvases are garbage collected (measured:
+transient, no growth). Hidden tabs release their leases immediately (a WebGPU
+canvas goes back to the pool). Per-pane pacing prevents focused output from
+raising background pane cadence. Panes that are neither focused nor being
+interacted with snap to one shared tick (30 Hz, 15 Hz in an unfocused window):
+a pane that turns dirty waits for the end of its tick and presents with every
+other pane of that tick in one encoder, submission and commit, at most once per
+tick. The planner asks for an animation frame only for the vsync that can serve
+the next deadline (the refresh interval and phase are learned from callback
+timestamps), sleeping on a timer otherwise, so a 120 Hz display does not pay a
+callback per vsync. A timer sleeping for a later tick is re-planned when a pane
+that is due sooner turns dirty, so the focused pane never waits behind it.
+WebGPU permits at most two outstanding frame submissions and keeps one
+`onSubmittedWorkDone` wait outstanding at a time: frames submitted while it is
+pending ride the next wait, which starts when it resolves (waiting only every
+second frame was tried and cut a 32 Hz producer to 23 presented frames a second).
 User wheel, drag, and keyboard interaction gives only its pane 150 ms of focused
 cadence, including in an unfocused visible window. It starts no idle timer or
-frame loop. Reclaimed WebGPU canvases shrink to 1x1 while retaining their target
-geometry for the next presentation transaction.
+frame loop.
 `window.__teraxTermTrace()` explicitly starts a bounded ten-minute resource trace;
 it is never started automatically. `pnpm soak:ghostty` exercises real WASM models
 without launching the application. `pnpm profile:ghostty` compares allocation
@@ -243,13 +283,13 @@ establish production readiness, platform parity, or multi-day resource stability
 
 - `pty::pty_*` - long-lived interactive PTY sessions (portable-pty ↔ Ghostty), managed by `PtyState` (`RwLock<HashMap<id, Session>>`). Output streams over the `terax-pty` multiplexed pull stream (hub thread, `pty_stream_open`, `pty_set_presentation`); input goes through a per-session writer thread.
 - `fs::tree::*` (`fs_read_dir`, `list_subdirs`), `fs::file::*` (`fs_read_file`, `fs_write_file`, `fs_stat`, `fs_canonicalize`), `fs::mutate::*` (`fs_create_file`, `fs_create_dir`, `fs_rename`, `fs_move`, `fs_delete`, `fs_delete_batch`): file explorer + editor IO.
-- `fs::search::*` (`fs_search`, `fs_list_files`), `fs::grep::*` (`fs_grep`, `fs_grep_interactive`, `fs_glob`): fuzzy file finder + content search (powered by `ignore` + `grep-*` crates). File lists are cached per root in `fs::index` (packed buffer, at most two roots, 45 s TTL) and dropped by watcher events and our own mutations, so a keystroke ranks the cached list instead of re-walking the tree. Interactive searches bump a `fs::supersede` generation when the command is dispatched, so the walk of an older query stops while a newer one starts. Every command that touches the disk is `async` and runs on the blocking pool (`fs::blocking`): Tauri runs a plain command on the main thread, and the async runtime has two workers (`modules/runtime.rs`), so nothing blocking may run inline in an `async fn` either.
+- `fs::search::*` (`fs_search`, `fs_list_files`), `fs::grep::*` (`fs_grep`, `fs_grep_interactive`, `fs_glob`): fuzzy file finder + content search (powered by `ignore` + `grep-*` crates). File lists are cached per root in `fs::index` (packed buffer, at most two roots, 45 s TTL) and dropped by watcher events and our own mutations, so a keystroke ranks the cached list instead of re-walking the tree (a change reported during a cold walk marks that walk stale: its result is returned but not cached). Interactive searches bump a `fs::supersede` generation when the command is dispatched, so the walk of an older query stops while a newer one starts. Every command that touches the disk is `async` and runs on the blocking pool (`fs::blocking`): Tauri runs a plain command on the main thread, and the async runtime has two workers (`modules/runtime.rs`), so nothing blocking may run inline in an `async fn` either.
 - `git::commands::*`: full source-control surface (`git_status`, `git_diff`, `git_diff_content`, `git_stage`, `git_unstage`, `git_discard`, `git_commit`, `git_fetch`, `git_pull_ff_only`, `git_push`, `git_log`, `git_show_commit`, `git_commit_files`, `git_commit_file_diff`, `git_panel_snapshot`, `git_resolve_repo`, `git_remote_url`). All gated through the workspace authorization registry. `git_status` asks git for `--untracked-files=normal` (one `dir/` entry per untracked directory) and expands small untracked directories back into files with a bounded `git ls-files --others` (500 files and 16 directories per refresh, listing abandoned at a 256 KiB cap); a directory over budget stays collapsed as `dir/`, which stage and discard handle natively.
 - `shell::shell_run_command`: one-shot subshell exec used by AI tools (bounded `proc::capture`: two short reader threads, no wait on pipes a backgrounded grandchild keeps open). Distinct from PTY sessions; not the user's interactive terminal. On Windows via PowerShell (`-NoProfile -Command`), on Unix via `$SHELL -lc`. Shared helper `build_oneshot_command`.
 - `shell::shell_session_*`: persistent agent shell with state across calls. `shell::shell_bg_*` (`spawn`, `logs`, `kill`, `list`): long-running background processes (dev servers etc.) with bounded ring-buffer log capture.
 - `workspace::*`: `workspace_authorize` / `workspace_current_dir` (the spawn/git/AI cwd authorization registry) plus the WSL bridge (`wsl_list_distros`, `wsl_default_distro`, `wsl_home`).
 - `lsp::*` (`lsp_detect`, `lsp_host_pid`, `lsp_resolve_root`, `lsp_spawn`, `lsp_send`, `lsp_kill`): language server process host. Dumb JSON-RPC pipe: Content-Length framing + process lifecycle in Rust (`lsp/framing.rs`, pure + tested), protocol intelligence on the frontend. Spawn cwd gated through the workspace registry; binaries resolve via the captured login-shell env (`lsp/env.rs`, GUI apps get a bare PATH on macOS); root detection walks up to markers but never to or above `$HOME`. Servers run in their own process group on Unix and are group-killed (cargo check / proc-macro children die with the server); Windows children get a `proc::job::ProcessJob` (kill-on-close, shared with pty). All sessions killed on `RunEvent::Exit`.
-- `net::*` (`ai_http_stream`, `ai_http_cancel`, `ai_http_ack`, `lm_ping`): AI HTTP proxy with SSRF guard; keeps provider calls and local-model pings off the webview. Clients are cached per `(profile, host, pinned IPs, allow_private)` with a 90 s idle TTL and at most eight entries, so connections and HTTP/2 sessions are reused while DNS-rebinding protection stays per request.
+- `net::*` (`ai_http_stream`, `ai_http_cancel`, `ai_http_ack`, `lm_ping`): AI HTTP proxy with SSRF guard; keeps provider calls and local-model pings off the webview. Clients are cached per `(profile, host, pinned IPs, allow_private)` with a 90 s idle TTL and at most eight entries, so connections and HTTP/2 sessions are reused while DNS-rebinding protection stays per request. Classification (`net/ip.rs`) looks through IPv6 forms that carry an IPv4 destination (mapped, compatible, NAT64, 6to4, Teredo) and treats everything outside global unicast as non-public.
 - `secrets::secrets_*`: OS keychain via the `keyring` crate. Service constant `terax-ai`. Linux uses a file-based fallback gated behind `#[cfg(target_os = "linux")]`.
 - `open_settings_window`: separate webview window for Settings (optional `tab` arg deep-links a section).
 - `vibrancy::window_*`: native window backdrop (`window_backdrop_kind`, `window_set_backdrop`). macOS gets `NSVisualEffectMaterial::UnderWindowBackground`, Windows 11 gets Mica (gated on build >= 22000 via `RtlGetVersion`, since `apply_mica` fails on Windows 10), Linux reports `none` because blur there belongs to the compositor. The `window-vibrancy` crate is a macOS/Windows-only dependency so Linux builds never pull it.
@@ -263,7 +303,7 @@ PTY shells are bootstrapped via injected init scripts in `src-tauri/src/modules/
 
 `pty/shell_init.rs` is split into `#[cfg(unix)]` / `#[cfg(windows)]` modules - keep new platform-specific code in the right cfg arm.
 
-ConPTY on Windows requires `CONPTY_LIFECYCLE_LOCK` (Mutex) around `openpty + spawn_command` in `session.rs`. Concurrent spawns leave one of the resulting PTYs with a stalled output pipe. Don't remove the lock without verifying first-tab stability under fast tab spam.
+ConPTY on Windows requires `CONPTY_LIFECYCLE_LOCK` (Mutex) around `openpty + spawn_command` in `session.rs`. Concurrent spawns leave one of the resulting PTYs with a stalled output pipe. Don't remove the lock without verifying first-tab stability under fast tab spam. The lock must never be held across anything that waits on the frontend: the waiter lets the reader overdraft the output queue (`close_pseudoconsole`) before taking the lock for `ClosePseudoConsole`, so a backlog the page has not acknowledged cannot stall other `pty_open` calls.
 
 Each ConPTY child is also assigned to a per-session **Job Object** with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (`pty/job.rs`). When the Job HANDLE drops - clean shutdown, panic, or even SIGKILL'd Terax process - the kernel kills every descendant of the shell (e.g. `npm run dev` spawned from inside pwsh). Without this Windows orphans the entire process subtree because `TerminateProcess` only kills the immediate child. macOS/Linux rely on `Drop for Session → killer.kill()`; on dev-`Ctrl-C` of `cargo run` destructors don't fire and orphans are possible there too - acceptable for now since dev only.
 
@@ -309,7 +349,7 @@ BYOK. Cloud providers via `@ai-sdk/*`: **OpenAI, Anthropic, Google, xAI, Cerebra
 - **Key storage**: OS keychain via `keyring` (Rust). Frontend reads/writes through `secrets_*` commands. Service `KEYRING_SERVICE = "terax-ai"`. Never persist keys to disk, settings store, or `localStorage`.
 - **Agent** (`lib/agent.ts`): `Experimental_Agent` with `stopWhen: stepCountIs(MAX_AGENT_STEPS)` and the system prompt from `config.ts`. Provider branching happens here - keep the `Agent` / `DirectChatTransport` shape; the rest of the system depends on AI SDK v6 chat semantics.
 - **Sub-agents** (`agents/registry.ts`, `agents/runSubagent.ts`): named sub-agents with their own system prompts and tool subsets, invoked by the main agent via `run_subagent` tool.
-- **Sessions** (`lib/sessions.ts` + `store/chatStore.ts`): conversations are organized into named sessions. `terax-ai-sessions.json` retains only metadata and `activeId`; message arrays live in atomically replaced `conversations/session-<id>.json` files owned by Rust. Messages cross IPC as raw JSON bytes (validated by a streaming pass, never rebuilt as a document tree); mid-stream saves are plain atomic replaces scheduled at most every 2 s and at least every 4 s, while turn end, session switch and window close save durably (file sync, plus a directory sync for a new file). A queued write for a session is replaced by a newer one, and a damaged file is set aside as `session-<id>.json.corrupt` and reads as empty, so one bad conversation never breaks the rest. Legacy migration is per session: it removes a legacy key only after its message file is safe, never overwrites a newer file on retry, skips and reports a failing key, and deletes `terax-ai-sessions.before-message-files.json` once every migrated file reads back (a leftover copy older than seven days with nothing to migrate is pruned at startup, and deleting a session scrubs it from the copy). Window close flushes with a timeout and never traps: a failed flush shows a "Close anyway" error once. Per-session queues and a native I/O gate serialize storage operations across page reloads; failed latest writes remain retryable, and window close flushes pending storage. `chatStore.ts` keeps a module-scoped `Map<sessionId, Chat<UIMessage>>`; `getOrCreateChat(sessionId)` lazily constructs a `Chat`, seeded with messages from a hydration map populated by `hydrateSessions()` (called once from `App.tsx`). `AgentRunBridge` mirrors active-session messages to disk on every change and auto-derives titles from the first user message. Switching the API key wipes the chat map; sessions persist.
+- **Sessions** (`lib/sessions.ts` + `store/chatStore.ts`): conversations are organized into named sessions. `terax-ai-sessions.json` retains only metadata and `activeId`; message arrays live in atomically replaced `conversations/session-<id>.json` files owned by Rust. Messages cross IPC as raw JSON bytes (validated by a streaming pass, never rebuilt as a document tree); every save flushes the new file (plain `fsync`) before the rename and keeps the replaced version as `session-<id>.json.bak`; mid-stream saves are scheduled at most every 2 s and at least every 4 s, while turn end, session switch and window close save durably (full flush, `F_FULLFSYNC` on Apple, plus a directory sync). A queued write for a session is replaced by a newer one, and a damaged file is set aside as `session-<id>.json.corrupt` and the load falls back to the `.bak` before the conversation reads as empty, so one bad conversation never breaks the rest. Legacy migration is per session: it removes a legacy key only after its message file is safe, never overwrites a newer file on retry, skips and reports a failing key, and deletes `terax-ai-sessions.before-message-files.json` once every conversation that copy holds, not only the ids the caller lists, reads back as a valid file (a leftover copy older than seven days with nothing to migrate is pruned at startup, and deleting a session scrubs it from the copy). Window close flushes with a timeout and never traps: a failed flush shows a "Close anyway" error once. Per-session queues and a native I/O gate serialize storage operations across page reloads; failed latest writes remain retryable, and window close flushes pending storage. `chatStore.ts` keeps a module-scoped `Map<sessionId, Chat<UIMessage>>`; `getOrCreateChat(sessionId)` lazily constructs a `Chat`, seeded with messages from a hydration map populated by `hydrateSessions()` (called once from `App.tsx`). `AgentRunBridge` mirrors active-session messages to disk on every change and auto-derives titles from the first user message. Switching the API key wipes the chat map; sessions persist.
 - **Composer** (`lib/composer.tsx`): React context providing shared input state (text, attachments, voice) for both the docked `AiInputBar` and any other surface. Attachments include image, text-file, and `selection` kinds - selections come from `useChatStore.attachSelection(text, source)` (drained into chips, not pasted into the textarea) and are wrapped as `<selection source="terminal|editor">…</selection>` blocks at submit. Composer derives `isBusy` from `agentMeta.status` so it can mount safely before sessions hydrate.
 - **AI HTTP transport**: binary request bodies and response packets avoid JSON byte arrays. Native requests are owned by their calling window, explicitly cancelled on abort, page reload, or window destruction, and bounded to 16 concurrent requests. A 128 KiB byte window (at most 256 packets) carries at most 64 KiB per packet and coalesces ready network chunks; the webview acknowledges validated cumulative byte boundaries once half a window has arrived, so small SSE chunks cost no per-chunk IPC, and a consumer that grants no credit for two minutes is abandoned and its request cancelled. The frontend consumer queue is capped at 192 KiB, request bodies at 64 MiB, and request metadata at 64 KiB. Consumer cancellation during startup is repeated after native registration completes. SSRF validation and DNS pinning remain in Rust.
 - **Voice input**: streamed transcription pipeline. Toggled from the composer.

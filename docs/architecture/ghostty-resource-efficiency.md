@@ -42,16 +42,19 @@ multi-pane smoke test, not a comparison against the one-pane baseline.
 The implementation:
 
 - Pools configured WebGPU canvas targets independently of terminal models.
-  At most eight unused targets share a 32 MiB color-storage budget and individual
-  two-second deadlines. Actual driver/compositor allocations are additional.
-  Hidden panes release their lease; a reused canvas stays invisible until its
-  new owner's frame is encoded. Occlusion reclamation, sleep, and device loss
-  release the relevant targets immediately. Reusing another target does not
-  extend an older target's deadline.
+  A presented canvas is never destroyed, unconfigured or shrunk (WebKit retains
+  the swapchain of one that is: see
+  [renderer v2](terminal-renderer-v2.md#canvas-lifecycle)). Hidden panes return
+  their canvas still configured and sized; the next visible pane takes the idle
+  canvas whose backing already fits, so tab switches reallocate nothing, and a
+  canvas is created only when none is idle (the pool never exceeds the peak
+  number of simultaneously visible panes). A reused canvas stays invisible until
+  its new owner's frame is encoded. Occlusion, sleep and device loss keep the
+  elements; device loss reconfigures them for the new device.
 - Reuses nearby backing sizes with bounded slack while preserving CSS pixel
-  scale and clipping. First presentation uses exact dimensions; large reductions
-  reclaim excess storage. This avoids allocating a new presentation buffer for
-  every adjacent resize step.
+  scale and clipping. First presentation uses exact dimensions; a reduction of
+  more than twice the slack reallocates. This avoids allocating a new
+  presentation buffer for every adjacent resize step.
 - Ghostty compares every re-encoded cell record word by word and reports only
   rows that changed; the WebGPU surface uploads those rows and nothing else.
   Unchanged rows neither upload nor trigger presentation. There are no hashes

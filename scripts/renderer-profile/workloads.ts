@@ -461,6 +461,25 @@ async function buildAgents(
   return panes;
 }
 
+/** Tab 0: one full-size pane. Tab 1: four panes in a 2x2 grid. Switching reshapes every canvas. */
+async function buildMixedTabs(
+  context: LabContext,
+  cursorBlink: boolean,
+  fail: (e: unknown) => void,
+) {
+  const panes: Pane[] = [];
+  const single = createGroup(context.host, 1);
+  const grid = createGroup(context.host, 2);
+  panes.push(
+    await createPane(context, createCell(single), 1, 0, true, true, cursorBlink, fail),
+  );
+  for (let index = 0; index < 4; index++)
+    panes.push(
+      await createPane(context, createCell(grid), index + 2, 1, false, index === 0, cursorBlink, fail),
+    );
+  return panes;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Event payload
 // ---------------------------------------------------------------------------------------------
@@ -607,25 +626,33 @@ async function canvasProbe(run: Run) {
   const cycles = number(params, "cycles", 20);
   const hiddenMs = number(params, "hiddenMs", 3000);
   const visibleMs = number(params, "visibleMs", 2000);
+  const resizeSteps = number(params, "resizeSteps", 8);
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) throw new Error("WebGPU adapter unavailable");
-  const device = await adapter.requestDevice();
+  let device = await adapter.requestDevice();
   const format = navigator.gpu.getPreferredCanvasFormat();
   const width = Math.round(host.clientWidth * devicePixelRatio);
   const height = Math.round(host.clientHeight * devicePixelRatio);
+  const webgl = variant.startsWith("webgl-");
   // Assigned from several closures; the casts stop control-flow narrowing to `null`.
   let canvas = null as HTMLCanvasElement | null;
   let context = null as GPUCanvasContext | null;
+  let gl = null as WebGL2RenderingContext | null;
   let configured = false;
   let lastTexture = null as GPUTexture | null;
   let frame = 0;
   let timer = null as ReturnType<typeof setInterval> | null;
   const mount = () => {
-    if (!canvas || !context) {
+    if (!canvas || !(webgl ? gl : context)) {
       canvas = document.createElement("canvas");
       canvas.style.cssText = "position:absolute;inset:0;width:100%;height:100%";
-      context = canvas.getContext("webgpu");
-      if (!context) throw new Error("WebGPU canvas context unavailable");
+      if (webgl) {
+        gl = canvas.getContext("webgl2", { alpha: false, antialias: false });
+        if (!gl) throw new Error("WebGL2 context unavailable");
+      } else {
+        context = canvas.getContext("webgpu");
+        if (!context) throw new Error("WebGPU canvas context unavailable");
+      }
       configured = false;
     }
     if (canvas.width !== width || canvas.height !== height) {
@@ -633,12 +660,19 @@ async function canvasProbe(run: Run) {
       canvas.height = height;
     }
     if (!canvas.isConnected) host.append(canvas);
-    if (!configured) {
+    if (!webgl && context && !configured) {
       context.configure({ device, format, alphaMode: "opaque" });
       configured = true;
     }
   };
   const draw = () => {
+    if (webgl) {
+      if (!gl) return;
+      gl.clearColor((frame++ % 255) / 255, 0.2, 0.3, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.flush();
+      return;
+    }
     if (!context) return;
     lastTexture = context.getCurrentTexture();
     const encoder = device.createCommandEncoder();
@@ -664,11 +698,11 @@ async function canvasProbe(run: Run) {
     if (timer !== null) clearInterval(timer);
     timer = null;
   };
-  const release = () => {
-    if (!canvas || !context) return;
+  const release = async () => {
+    if (!canvas || !(webgl ? gl : context)) return;
     switch (variant) {
       case "destroy": // WebGpuCanvasPool.destroy: unconfigure, shrink to 1x1, remove, drop.
-        context.unconfigure();
+        context?.unconfigure();
         canvas.width = 1;
         canvas.height = 1;
         canvas.remove();
@@ -678,7 +712,7 @@ async function canvasProbe(run: Run) {
         break;
       case "destroy-texture": // as destroy, but also destroys the last canvas texture first
         lastTexture?.destroy();
-        context.unconfigure();
+        context?.unconfigure();
         canvas.width = 1;
         canvas.height = 1;
         canvas.remove();
@@ -693,7 +727,7 @@ async function canvasProbe(run: Run) {
         configured = false;
         break;
       case "unconfigure-only": // drop the element without shrinking it
-        context.unconfigure();
+        context?.unconfigure();
         canvas.remove();
         canvas = null;
         context = null;
@@ -704,16 +738,59 @@ async function canvasProbe(run: Run) {
         canvas.height = 1;
         break;
       case "unconfigure-keep": // keep the element, drop its configuration
-        context.unconfigure();
+        context?.unconfigure();
         configured = false;
         break;
       case "hide-keep": // keep everything configured at full size, just hide
+        canvas.style.visibility = "hidden";
+        break;
+      case "detach-keep": // WebGpuCanvasPool idle state: out of the DOM, still configured and sized
+        canvas.style.visibility = "hidden";
+        canvas.remove();
+        break;
+      case "resize-live": // nothing on release; resizes happen while visible (see resizeLive)
+        break;
+      case "reconfigure": {
+        // Device change: keep the element, point its context at a new device, retire the old one.
+        const previous = device;
+        device = await adapter.requestDevice();
+        configured = false;
+        lastTexture = null;
+        previous.destroy();
+        canvas.style.visibility = "hidden";
+        break;
+      }
+      case "webgl-destroy": // WebGlCellRenderer.dispose: remove, lose the context, shrink, drop.
+        canvas.remove();
+        gl?.getExtension("WEBGL_lose_context")?.loseContext();
+        canvas.width = 1;
+        canvas.height = 1;
+        canvas = null;
+        gl = null;
+        break;
+      case "webgl-keep":
         canvas.style.visibility = "hidden";
         break;
       default:
         throw new Error(`Unknown canvas variant ${variant}`);
     }
     lastTexture = null;
+  };
+  // Live backing-store resizes with frames running (a drag resize / pane relayout), ending at the
+  // original size. Every step differs from its predecessor by more than the pool's slack.
+  const resizeLive = async () => {
+    if (variant !== "resize-live" || !canvas) return;
+    const widths = [width - 160, width - 40, width - 300, width - 90, width - 220, width - 10, width - 130, width];
+    const heights = [height - 100, height - 20, height - 190, height - 60, height - 140, height - 5, height - 80, height];
+    for (let step = 0; step < resizeSteps && canvas; step++) {
+      canvas.width = widths[step % widths.length];
+      canvas.height = heights[step % heights.length];
+      await pause(100);
+    }
+    if (canvas) {
+      canvas.width = width;
+      canvas.height = height;
+    }
   };
   await native("show", { mode: "orderout" }); // ensure the window is key and active
   mount();
@@ -729,7 +806,7 @@ async function canvasProbe(run: Run) {
       ? { ok: true, occluded: false, mode, focus: await native("show", { mode: "orderout" }) }
       : await native("hide", { mode });
     stopFrames();
-    release();
+    await release();
     await native("sleep", { ms: hiddenMs });
     await sync(run, `cycle-${cycle}-hidden`, { cycle, step: "hidden", hide, variant });
     const show = visibleWindow
@@ -738,6 +815,7 @@ async function canvasProbe(run: Run) {
     if (canvas) canvas.style.visibility = "visible";
     mount();
     startFrames();
+    await resizeLive();
     await pause(visibleMs);
     await sync(run, `cycle-${cycle}-visible`, { cycle, step: "visible", show, variant });
   }
@@ -754,6 +832,54 @@ async function canvasProbe(run: Run) {
     await pause(8000);
     await sync(run, "post-gc+10s");
   }
+}
+
+/**
+ * Alternates between a one-pane tab and a four-pane tab, dwelling on each longer than the old
+ * two second idle-canvas deadline, so every return needs canvases that an expiring pool would
+ * have destroyed. Footprint is sampled after each full round trip.
+ */
+async function tabs(run: Run) {
+  const { params } = run.context;
+  const cycles = number(params, "cycles", 20);
+  const dwellMs = number(params, "dwellMs", 3000);
+  // "hide-first": the outgoing tab releases before the incoming one asks for canvases.
+  // "show-first": the other way round, which the app hits whenever the tab it switches to comes
+  // earlier in the React tree than the one it leaves (effects run in tree order).
+  const showFirst = params.get("order") === "show-first";
+  const show = (group: number) => {
+    const hide = () => {
+      for (const pane of run.panes) if (pane.group !== group) pane.surface.setVisible(false);
+    };
+    const reveal = () => {
+      for (const pane of run.panes) if (pane.group === group) pane.surface.setVisible(true);
+    };
+    if (showFirst) {
+      reveal();
+      hide();
+    } else {
+      hide();
+      reveal();
+    }
+  };
+  await native("show", { mode: "orderout" }); // ensure the window is key and active
+  startAgents(run, 250, 500);
+  await pause(3000);
+  await sync(run, "setup", { cycles, dwellMs, order: showFirst ? "show-first" : "hide-first" });
+  await pause(2000);
+  await sync(run, "baseline", { cycle: 0 });
+  for (let cycle = 1; cycle <= cycles; cycle++) {
+    show(1);
+    await pause(dwellMs);
+    show(0);
+    await pause(dwellMs);
+    await sync(run, `cycle-${cycle}-visible`, { cycle, step: "visible" });
+  }
+  await sync(run, "cycles-complete");
+  await pause(10_000);
+  await sync(run, "end+10s");
+  await pause(20_000);
+  await sync(run, "end+30s");
 }
 
 async function move(run: Run) {
@@ -840,9 +966,12 @@ export async function runNamedWorkload(name: string, context: LabContext): Promi
     context.report("error", { error: String(error), stack: (error as Error)?.stack });
   // Instrumentation patches DOM/WebGPU prototypes; run with instrument=0 to confirm it does not
   // change the measured memory behaviour. Off by default for the CPU/energy workloads.
+  // Renderer tuning knob (renderers that predate it ignore it): idle canvas parking delay.
+  const parkMs = context.params.get("parkMs");
+  if (parkMs !== null) localStorage.setItem("terax:terminal-canvas-park-ms", parkMs);
   const instrument =
     context.params.get("instrument") ??
-    (["occlusion", "move", "canvas"].includes(name) ? "1" : "0");
+    (["occlusion", "move", "canvas", "tabs"].includes(name) ? "1" : "0");
   if (instrument === "1") installCanvasInstrumentation();
   context.report("blank");
   await pause(3000);
@@ -852,6 +981,9 @@ export async function runNamedWorkload(name: string, context: LabContext): Promi
     case "occlusion":
     case "move":
       run.panes = await buildTabs(context, blink, failure);
+      break;
+    case "tabs":
+      run.panes = await buildMixedTabs(context, blink, failure);
       break;
     case "agents":
     case "idle":
@@ -865,6 +997,7 @@ export async function runNamedWorkload(name: string, context: LabContext): Promi
   if (name === "occlusion") await occlusion(run);
   else if (name === "canvas") await canvasProbe(run);
   else if (name === "move") await move(run);
+  else if (name === "tabs") await tabs(run);
   else await agentsOrIdle(run, name === "idle");
   stopAgents(run);
   context.report("done");

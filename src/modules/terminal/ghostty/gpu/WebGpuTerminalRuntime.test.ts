@@ -3,7 +3,10 @@ import type {
   WebGpuRuntimeSurface,
   WebGpuSharedResources,
 } from "./WebGpuTerminalRuntime";
-import { WebGpuTerminalRuntime } from "./WebGpuTerminalRuntime";
+import {
+  canvasParkDelayMs,
+  WebGpuTerminalRuntime,
+} from "./WebGpuTerminalRuntime";
 
 const runtimes: WebGpuTerminalRuntime[] = [];
 async function createRuntime() {
@@ -48,11 +51,13 @@ describe("WebGpuTerminalRuntime", () => {
     expect(first.renderFrame).toHaveBeenCalledOnce();
     expect(second.renderFrame).toHaveBeenCalledOnce();
     expect(harness.submit).toHaveBeenCalledOnce();
+    // One frame, one wait; both surfaces rode the same submission.
     expect(harness.onSubmittedWorkDone).toHaveBeenCalledOnce();
     expect(runtime.diagnostics()).toMatchObject({
       surfaceCount: 2,
       pendingSurfaces: 0,
       submittedFrames: 1,
+      inFlightFrames: 1,
     });
     runtime.dispose();
   });
@@ -86,7 +91,7 @@ describe("WebGpuTerminalRuntime", () => {
 
     harness.setVisible(true);
     harness.notifyVisibility();
-    expect(surface.handleVisibilityChange).toHaveBeenCalledWith(true, false);
+    expect(surface.handleVisibilityChange).toHaveBeenCalledWith(true);
     expect(harness.frames.size).toBe(1);
     harness.flushFrame();
     expect(surface.renderFrame).toHaveBeenCalledOnce();
@@ -103,7 +108,7 @@ describe("WebGpuTerminalRuntime", () => {
     harness.setVisible(false);
     harness.notifyVisibility();
 
-    expect(surface.handleVisibilityChange).toHaveBeenCalledWith(false, false);
+    expect(surface.handleVisibilityChange).toHaveBeenCalledWith(false);
     expect(harness.cancelledFrames).toEqual([1]);
     expect(runtime.diagnostics().pendingSurfaces).toBe(1);
     runtime.dispose();
@@ -145,16 +150,24 @@ describe("WebGpuTerminalRuntime", () => {
     vi.advanceTimersByTime(60_000);
     expect(harness.submit).toHaveBeenCalledTimes(2);
     expect(harness.frames.size).toBe(0);
+    // One wait at a time: the second frame is covered by the next wait, not a second one.
+    expect(completions).toHaveLength(1);
     expect(runtime.diagnostics()).toMatchObject({
       inFlightFrames: 2,
       peakInFlightFrames: 2,
       pendingSurfaces: 1,
+      workDoneWaits: 1,
     });
+    expect(runtime.diagnostics().stalledFrameRequests).toBeGreaterThan(0);
     completions[0]();
     await Promise.resolve();
+    // The first frame is confirmed, so a third may go while the second is still being waited on.
+    expect(runtime.diagnostics().inFlightFrames).toBe(1);
+    expect(completions).toHaveLength(2);
     expect(harness.frames.size).toBe(1);
     harness.flushFrame();
     expect(harness.submit).toHaveBeenCalledTimes(3);
+    expect(runtime.diagnostics().inFlightFrames).toBe(2);
     runtime.dispose();
     for (const complete of completions) complete();
     await Promise.resolve();
@@ -172,17 +185,14 @@ describe("WebGpuTerminalRuntime", () => {
     await Promise.resolve();
     expect(harness.requestDevice).toHaveBeenCalledOnce();
     expect(harness.destroyDevice).toHaveBeenCalledOnce();
-    expect(surface.handleVisibilityChange).toHaveBeenCalledWith(false, true);
+    expect(surface.handleDeviceLoss).toHaveBeenCalledOnce();
     harness.setVisible(true);
     harness.notifyVisibility();
     await vi.waitFor(() =>
       expect(runtime.diagnostics().deviceRecoveries).toBe(1),
     );
     expect(harness.requestDevice).toHaveBeenCalledTimes(2);
-    expect(surface.handleVisibilityChange).toHaveBeenLastCalledWith(
-      true,
-      false,
-    );
+    expect(surface.handleVisibilityChange).toHaveBeenLastCalledWith(true);
     expect(harness.frames.size).toBe(1);
   });
 
@@ -278,31 +288,99 @@ describe("WebGpuTerminalRuntime", () => {
     expect(runtime.diagnostics().atlasCount).toBe(0);
   });
 
-  it("releases every atlas byte while hidden and rebuilds on resume", async () => {
+  it("pauses through a long occlusion and releases no canvas, atlas texture or device", async () => {
     vi.useFakeTimers();
     const harness = createHarness();
     const runtime = await createRuntime();
-    const lease = runtime.acquireGlyphAtlas(METRICS);
-    const epoch = lease.atlas.epoch;
-    lease.release();
+    const surface = createSurface();
+    runtime.register(surface);
+    const canvas = runtime.acquireCanvas();
+    canvas.backingStore.stage(2000, 1300, 2);
+    canvas.backingStore.commit();
+    canvas.present();
+    const atlas = runtime.acquireGlyphAtlas(METRICS, surface);
+    const atlasBytes = runtime.diagnostics().atlasBytes;
+    expect(atlasBytes).toBeGreaterThan(1_048_576);
 
     harness.setVisible(false);
     harness.notifyVisibility();
+    runtime.schedule(surface);
+    // Far past the old two second reclaim delay and the 30 second idle atlas lifetime.
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
 
-    await vi.advanceTimersByTimeAsync(2_000);
+    expect(surface.handleVisibilityChange).toHaveBeenLastCalledWith(false);
+    expect(surface.handleDeviceLoss).not.toHaveBeenCalled();
+    expect(harness.frames.size).toBe(0);
+    expect(harness.destroyDevice).not.toHaveBeenCalled();
     expect(runtime.diagnostics()).toMatchObject({
       atlasCount: 1,
-      atlasBytes: 0,
-      atlasCpuBytes: 0,
+      atlasBytes,
+      canvases: { active: 1, idle: 0, destroyed: 0, colorBytes: 10_400_000 },
     });
+    expect(canvas.canvas.width).toBe(2000);
+
     harness.setVisible(true);
     harness.notifyVisibility();
-    const restored = runtime.acquireGlyphAtlas(METRICS);
-    expect(restored.atlas).toBe(lease.atlas);
-    expect(restored.atlas.epoch).toBeGreaterThan(epoch);
-    expect(runtime.diagnostics().atlasBytes).toBeGreaterThan(1_048_576);
-    restored.release();
+    expect(surface.handleVisibilityChange).toHaveBeenLastCalledWith(true);
+    expect(runtime.diagnostics().canvases).toMatchObject({ destroyed: 0 });
+    expect(harness.frames.size).toBe(1);
+    atlas.release();
+    canvas.release();
     runtime.dispose();
+  });
+
+  it("keeps canvases through device recovery and points them at the new device", async () => {
+    const harness = createHarness();
+    const runtime = await createRuntime();
+    const surface = createSurface();
+    runtime.register(surface);
+    const leased = runtime.acquireCanvas();
+    leased.backingStore.stage(1600, 900, 2);
+    leased.backingStore.commit();
+    leased.present();
+    const parked = runtime.acquireCanvas();
+    parked.release();
+    expect(leased.generation).toBe(1);
+
+    harness.loseDevice();
+    await vi.waitFor(() =>
+      expect(runtime.diagnostics().deviceRecoveries).toBe(1),
+    );
+    expect(surface.handleDeviceLoss).toHaveBeenCalledOnce();
+    expect(runtime.diagnostics().canvases).toMatchObject({
+      active: 1,
+      idle: 1,
+      destroyed: 0,
+    });
+    expect(harness.gpuContext.unconfigure).not.toHaveBeenCalled();
+
+    // The leased one is reconfigured in place; the parked one when it is next handed out.
+    leased.reconfigure(runtime.resources());
+    expect(leased.generation).toBe(runtime.resources().generation);
+    expect(leased.canvas.width).toBe(1600);
+    const next = runtime.acquireCanvas();
+    expect(next.canvas).toBe(parked.canvas);
+    expect(next.generation).toBe(runtime.resources().generation);
+    expect(runtime.diagnostics().canvases).toMatchObject({
+      created: 2,
+      reconfigured: 2,
+      destroyed: 0,
+    });
+    expect(harness.gpuContext.unconfigure).not.toHaveBeenCalled();
+    leased.release();
+    next.release();
+  });
+
+  it("tears its canvases down only when the runtime is disposed", async () => {
+    const harness = createHarness();
+    const runtime = await createRuntime();
+    const lease = runtime.acquireCanvas();
+    lease.present();
+    const parked = runtime.acquireCanvas();
+    parked.release();
+    expect(harness.gpuContext.unconfigure).not.toHaveBeenCalled();
+    runtime.dispose();
+    expect(harness.gpuContext.unconfigure).toHaveBeenCalledTimes(2);
   });
 
   it("releases replaced atlas resources after the frame's submission completes, or at once without one", async () => {
@@ -318,19 +396,29 @@ describe("WebGpuTerminalRuntime", () => {
     const runtime = await createRuntime();
     const lease = runtime.acquireGlyphAtlas(METRICS);
     const release = vi.spyOn(lease.atlas, "releaseRetired");
+    const retired = vi
+      .spyOn(lease.atlas, "hasRetired", "get")
+      .mockReturnValue(true);
     const surface = createSurface();
     runtime.register(surface);
     runtime.schedule(surface);
     h.flushFrame();
     expect(h.submit).toHaveBeenCalledOnce();
     expect(release).toHaveBeenLastCalledWith(expect.any(Promise));
+    // The wait that frees the atlas resources is the same one that confirms the frame.
+    expect(h.onSubmittedWorkDone).toHaveBeenCalledOnce();
+    expect(runtime.diagnostics().inFlightFrames).toBe(1);
     complete();
     await Promise.resolve();
+    await Promise.resolve();
+    expect(runtime.diagnostics().inFlightFrames).toBe(0);
 
     surface.renderFrame.mockReturnValue(false);
     runtime.schedule(surface);
+    vi.advanceTimersByTime(20);
     h.flushFrame();
     expect(release).toHaveBeenLastCalledWith(null);
+    retired.mockRestore();
     lease.release();
     runtime.dispose();
   });
@@ -426,6 +514,171 @@ describe("WebGpuTerminalRuntime", () => {
     runtime.dispose();
   });
 
+  it("keeps one GPU wait outstanding and covers the frames submitted meanwhile with the next", async () => {
+    vi.useFakeTimers();
+    const h = createHarness();
+    const completions: Array<() => void> = [];
+    h.onSubmittedWorkDone.mockImplementation(
+      () =>
+        new Promise<undefined>((resolve) =>
+          completions.push(() => resolve(undefined)),
+        ),
+    );
+    const runtime = await createRuntime();
+    const surface = createSurface();
+    runtime.register(surface);
+    // Frames arrive faster than the GPU confirms them, but never two at a time unconfirmed.
+    runtime.schedule(surface);
+    vi.advanceTimersByTime(17);
+    h.flushFrame();
+    runtime.schedule(surface);
+    vi.advanceTimersByTime(17);
+    h.flushFrame();
+    expect(h.submit).toHaveBeenCalledTimes(2);
+    expect(completions).toHaveLength(1);
+    // Confirming frame one starts the wait for frame two at once.
+    completions[0]();
+    await Promise.resolve();
+    expect(completions).toHaveLength(2);
+    completions[1]();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(runtime.diagnostics()).toMatchObject({
+      submittedFrames: 2,
+      workDoneWaits: 2,
+      peakInFlightFrames: 2,
+      inFlightFrames: 0,
+    });
+    expect(runtime.diagnostics().workDoneLatency.count).toBe(2);
+    // Quiet again: the next frame needs a wait of its own.
+    runtime.schedule(surface);
+    vi.advanceTimersByTime(17);
+    h.flushFrame();
+    expect(completions).toHaveLength(3);
+  });
+
+  it("does not hold the focused pane back while the page sleeps for a background tick", async () => {
+    vi.useFakeTimers();
+    const h = createHarness();
+    const runtime = await createRuntime();
+    const background = createSurface();
+    const focused = createSurface();
+    background.isFocused.mockReturnValue(false);
+    runtime.register(background);
+    runtime.register(focused);
+    runtime.schedule(background);
+    runtime.schedule(focused);
+    h.flushFrame(0);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    vi.advanceTimersByTime(100);
+    runtime.schedule(background);
+    // Asleep until the tick ending at 133 ms.
+    expect(h.frames.size).toBe(0);
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    vi.advanceTimersByTime(5);
+    runtime.schedule(focused);
+    // The focused pane is due now: its frame is requested at once, not after the sleep.
+    expect(h.frames.size).toBe(1);
+    h.flushFrame(108);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(focused.renderFrame).toHaveBeenCalledTimes(2);
+    expect(background.renderFrame).toHaveBeenCalledTimes(1);
+    // The background pane still presents at its tick, in a frame of its own.
+    vi.advanceTimersByTime(30);
+    expect(h.frames.size).toBe(1);
+    h.flushFrame(134);
+    expect(background.renderFrame).toHaveBeenCalledTimes(2);
+  });
+
+  it("records how long panes wait for a frame, separately for the focused one", async () => {
+    vi.useFakeTimers();
+    const h = createHarness();
+    const runtime = await createRuntime();
+    const focused = createSurface();
+    const other = createSurface();
+    other.isFocused.mockReturnValue(false);
+    runtime.register(focused);
+    runtime.register(other);
+    runtime.schedule(focused);
+    runtime.schedule(other);
+    h.flushFrame();
+    await Promise.resolve();
+    vi.advanceTimersByTime(100);
+    runtime.schedule(focused);
+    runtime.schedule(other);
+    // The focused pane draws at the next vsync; the other waits for the end of its tick (133 ms).
+    h.flushFrame(103);
+    expect(focused.renderFrame).toHaveBeenCalledTimes(2);
+    expect(other.renderFrame).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(30);
+    expect(h.frames.size).toBe(1);
+    h.flushFrame(134);
+    expect(other.renderFrame).toHaveBeenCalledTimes(2);
+    const { frameLatency } = runtime.diagnostics();
+    expect(frameLatency.focused).toMatchObject({ count: 2, maxMs: 3 });
+    expect(frameLatency.background.count).toBe(2);
+    expect(frameLatency.background.maxMs).toBeCloseTo(34, 0);
+  });
+
+  it("presents background surfaces that turn dirty within one tick in a single frame", async () => {
+    vi.useFakeTimers();
+    const h = createHarness();
+    const runtime = await createRuntime();
+    const first = createSurface();
+    const second = createSurface();
+    first.isFocused.mockReturnValue(false);
+    second.isFocused.mockReturnValue(false);
+    runtime.register(first);
+    runtime.register(second);
+    runtime.schedule(first);
+    runtime.schedule(second);
+    h.flushFrame();
+    expect(h.submit).toHaveBeenCalledOnce();
+
+    // 100 ms later the first agent redraws; the second does 12 ms after it.
+    vi.advanceTimersByTime(100);
+    runtime.schedule(first);
+    vi.advanceTimersByTime(12);
+    runtime.schedule(second);
+    // Nothing asks for an animation frame until the vsync that can serve the tick ending at 133 ms.
+    expect(h.frames.size).toBe(0);
+    vi.advanceTimersByTime(14);
+    expect(h.frames.size).toBe(1);
+    h.flushFrame((1_000 / 30) * 4);
+    expect(first.renderFrame).toHaveBeenCalledTimes(2);
+    expect(second.renderFrame).toHaveBeenCalledTimes(2);
+    expect(h.submit).toHaveBeenCalledTimes(2);
+    expect(runtime.diagnostics()).toMatchObject({
+      animationFrames: 2,
+      idleAnimationFrames: 0,
+      timerWakeups: 1,
+    });
+  });
+
+  it("reads the canvas parking delay override from local storage and ignores bad values", () => {
+    const read = (value: string | null | Error) => {
+      vi.stubGlobal("window", {
+        localStorage: {
+          getItem: () => {
+            if (value instanceof Error) throw value;
+            return value;
+          },
+        },
+      });
+      return canvasParkDelayMs();
+    };
+    expect(read(null)).toBeUndefined();
+    expect(read("2500")).toBe(2500);
+    expect(read("0")).toBe(0);
+    expect(read("off")).toBe(Number.POSITIVE_INFINITY);
+    expect(read("-5")).toBeUndefined();
+    expect(read("soon")).toBeUndefined();
+    expect(read(new Error("storage blocked"))).toBeUndefined();
+  });
+
   it("quarantines a device after an asynchronous validation error", async () => {
     const harness = createHarness();
     const runtime = await createRuntime();
@@ -462,6 +715,7 @@ function createHarness() {
   const submit = vi.fn();
   const onSubmittedWorkDone = vi.fn(async () => undefined);
   const destroyDevice = vi.fn();
+  const gpuContext = { configure: vi.fn(), unconfigure: vi.fn() };
   let loseDevice: (info: GPUDeviceLostInfo) => void = () => {};
   const device = {
     addEventListener: vi.fn(
@@ -535,19 +789,26 @@ function createHarness() {
     createElement: vi.fn(() => ({
       width: 0,
       height: 0,
-      getContext: vi.fn(() => ({
-        clearRect: vi.fn(),
-        measureText: () => ({}),
-        fillText: vi.fn(),
-        getImageData: (
-          _x: number,
-          _y: number,
-          width: number,
-          height: number,
-        ) => ({
-          data: new Uint8ClampedArray(width * height * 4),
-        }),
-      })),
+      style: {},
+      setAttribute: vi.fn(),
+      remove: vi.fn(),
+      getContext: vi.fn((kind: string) =>
+        kind === "webgpu"
+          ? gpuContext
+          : {
+              clearRect: vi.fn(),
+              measureText: () => ({}),
+              fillText: vi.fn(),
+              getImageData: (
+                _x: number,
+                _y: number,
+                width: number,
+                height: number,
+              ) => ({
+                data: new Uint8ClampedArray(width * height * 4),
+              }),
+            },
+      ),
     })),
   });
   vi.stubGlobal(
@@ -569,6 +830,7 @@ function createHarness() {
     submit,
     onSubmittedWorkDone,
     destroyDevice,
+    gpuContext,
     device,
     requestDevice,
     loseDevice() {
@@ -634,6 +896,7 @@ function createSurface() {
     handleRuntimeReset: vi.fn(),
     handleRuntimeError: vi.fn(),
     handleVisibilityChange: vi.fn<(visible: boolean) => void>(),
+    handleDeviceLoss: vi.fn(),
     isFocused: vi.fn(() => true),
   } satisfies WebGpuRuntimeSurface;
 }

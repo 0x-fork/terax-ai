@@ -174,6 +174,8 @@ export class WebGpuTerminalSurface
   private disposed = false;
   private appliedTransform = "";
   private snapOrigin: { left: number; top: number } | null = null;
+  /** Last backing size this pane fitted to; lets the pool hand back a canvas that already has it. */
+  private lastBackingSize: { width: number; height: number } | null = null;
 
   private constructor(
     private readonly runtime: WebGpuTerminalRuntime,
@@ -370,8 +372,9 @@ export class WebGpuTerminalSurface
     if (metricsEqual(this.metrics, next)) return;
     this.metrics = next;
     if (this.documentSuspended) {
+      // Paused: the canvas stays configured and sized. The buffers and the atlas lease are tied to
+      // the old metrics, so they are rebuilt when presentation resumes.
       this.releaseGpuResources();
-      this.releaseCanvas(true);
       return;
     }
     if (this.host && this.uniformBuffer) {
@@ -568,18 +571,18 @@ export class WebGpuTerminalSurface
     this.options.onError(error);
   }
 
-  handleVisibilityChange(visible: boolean, reclaim = !visible): void {
+  /**
+   * Window occlusion, sleep and a lost GPU device all stop here. Pausing cancels timers and
+   * rendering and releases nothing: the canvas keeps its configuration and size, because
+   * destroying or shrinking a presented WebGPU canvas makes WebKit retain its swapchain.
+   */
+  handleVisibilityChange(visible: boolean): void {
     if (!visible) {
       this.documentSuspended = true;
       this.clearCursorTimer();
       this.clearTextBlinkTimer();
       this.search.suspend();
       this.selection.suspend();
-      if (reclaim) {
-        this.options.model.releasePresentationResources();
-        this.releaseGpuResources();
-        this.releaseCanvas(true);
-      }
       return;
     }
     if (!this.documentSuspended) return;
@@ -601,6 +604,15 @@ export class WebGpuTerminalSurface
     this.armCursorBlink();
     this.syncTextBlink();
     this.runtime.schedule(this);
+  }
+
+  /**
+   * The GPU device is gone: buffers and the atlas lease belong to it and are dropped now, the
+   * canvas is kept and pointed at the replacement device when presentation resumes.
+   */
+  handleDeviceLoss(): void {
+    this.handleVisibilityChange(false);
+    this.releaseGpuResources();
   }
 
   diagnostics(): WebGpuTerminalSurfaceStats {
@@ -755,10 +767,11 @@ export class WebGpuTerminalSurface
   private initializeGpuResources(resources: WebGpuSharedResources): void {
     if (!this.host) return;
     try {
+      // Same element, new device: reconfiguring it keeps the swapchain WebKit already holds.
       if (this.target && this.target.generation !== resources.generation)
-        this.releaseCanvas(true);
+        this.target.reconfigure(resources);
       if (!this.target) {
-        this.target = this.runtime.acquireCanvas();
+        this.target = this.runtime.acquireCanvas(this.lastBackingSize);
         this.target.canvas.style.transform = "";
         this.appliedTransform = "";
         this.root.append(this.target.canvas);
@@ -788,7 +801,7 @@ export class WebGpuTerminalSurface
       this.runtimeGeneration = resources.generation;
     } catch (error) {
       this.releaseGpuResources();
-      this.releaseCanvas(true);
+      this.releaseCanvas();
       throw error;
     }
   }
@@ -806,7 +819,7 @@ export class WebGpuTerminalSurface
       this.runtime.unregister(this);
       this.runtimeRegistered = false;
       this.releaseGpuResources();
-      this.releaseCanvas(true);
+      this.releaseCanvas();
       throw error;
     }
   }
@@ -817,11 +830,12 @@ export class WebGpuTerminalSurface
       this.runtimeRegistered = false;
     }
     this.releaseGpuResources();
-    this.releaseCanvas(this.documentSuspended);
+    this.releaseCanvas();
   }
 
-  private releaseCanvas(reclaim = false): void {
-    this.target?.release(reclaim);
+  /** Back to the pool, still configured and sized for the next visible pane. */
+  private releaseCanvas(): void {
+    this.target?.release();
     this.target = null;
   }
 
@@ -951,6 +965,7 @@ export class WebGpuTerminalSurface
       pixelHeight,
       this.metrics.scale,
     );
+    this.lastBackingSize = { width: pixelWidth, height: pixelHeight };
     const snapped = this.applySnap(bounds);
     if (changed || backingStoreChanged) {
       this.options.model.setPixelSize(pixelWidth, pixelHeight);

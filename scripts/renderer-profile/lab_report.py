@@ -62,6 +62,21 @@ def graphics_mib(sample: dict, role: str) -> float | None:
     return max(row["resident"], row["dirty"] + row["swapped"]) / MIB
 
 
+def pool_of(event: dict) -> dict:
+    """WebGPU canvas pool counters of a page event (empty for renderers that predate them)."""
+    return ((event.get("gpu") or {}).get("canvases")) or {}
+
+
+def _pool_metrics(metrics: dict, event: dict) -> None:
+    pool = pool_of(event)
+    for key in ("created", "reused", "reconfigured", "destroyed"):
+        if key in pool:
+            metrics[f"pool.{key}"] = pool[key]
+    surfaces = event.get("surfaces") or []
+    if surfaces and "backingStoreResizes" in surfaces[0]:
+        metrics["renderer.backing_store_resizes"] = sum(s.get("backingStoreResizes", 0) for s in surfaces)
+
+
 def roles_present(samples: list[dict]) -> list[str]:
     seen = {role for sample in samples for role in footprint_by_role(sample)}
     ordered = [role for role in ROLE_ORDER if role in seen]
@@ -239,9 +254,11 @@ def compute_metrics(report: dict) -> dict[str, float]:
     if workload == "default":
         for sample in samples:
             metrics[f"footprint.{phase_of(sample)}.total_mib"] = total_bytes(sample) / MIB
+        if "repainted" in by_phase:
+            _pool_metrics(metrics, by_phase["repainted"]["event"])
         return metrics
 
-    if workload in ("occlusion", "canvas"):
+    if workload in ("occlusion", "canvas", "tabs"):
         hidden = _cycle_samples(report, "hidden")
         visible = _cycle_samples(report, "visible")
         base = by_phase.get("baseline")
@@ -284,6 +301,7 @@ def compute_metrics(report: dict) -> dict[str, float]:
         presentation = last.get("presentation") or {}
         metrics["js.reclamations"] = presentation.get("reclamations", 0)
         metrics["js.presentation_transitions"] = presentation.get("transitions", 0)
+        _pool_metrics(metrics, last)
         per_cycle = {}  # cycle -> (occluded, reclaimed); control runs carry these on the visible sample
         for _, s in hidden + visible:
             event = s["event"]
@@ -326,6 +344,7 @@ def compute_metrics(report: dict) -> dict[str, float]:
             if key in canvases:
                 metrics[f"js.{key}"] = canvases[key]
         metrics["js.reclamations"] = (last.get("presentation") or {}).get("reclamations", 0)
+        _pool_metrics(metrics, last)
         for key, value in ((last.get("native") or {}).get("counters") or {}).items():
             metrics[f"native.{key}"] = value
         steps = [s for s in samples if phase_of(s).startswith("steps-") and phase_of(s) != "steps-settled"]
@@ -372,6 +391,33 @@ def compute_metrics(report: dict) -> dict[str, float]:
     if gpu_a and gpu_b:
         metrics["renderer.gpu_submissions_per_s"] = (gpu_b["submittedFrames"] - gpu_a["submittedFrames"]) / seconds
         metrics["renderer.atlas_uploads"] = gpu_b["atlasUploads"] - gpu_a["atlasUploads"]
+        # Wakeup accounting (renderers that predate these counters leave the metrics out).
+        for key, name in (("animationFrames", "animation_frames"), ("idleAnimationFrames", "idle_animation_frames"), ("timerWakeups", "timer_wakeups"), ("workDoneWaits", "work_done_waits")):
+            if key in gpu_a and key in gpu_b:
+                metrics[f"renderer.{name}_per_s"] = (gpu_b[key] - gpu_a[key]) / seconds
+        if "animationFrames" in gpu_a and "animationFrames" in gpu_b:
+            metrics["renderer.page_wakeups_per_s"] = metrics["renderer.animation_frames_per_s"] + metrics["renderer.timer_wakeups_per_s"] + metrics["renderer.work_done_waits_per_s"]
+        if "stalledFrameRequests" in gpu_a and "stalledFrameRequests" in gpu_b:
+            metrics["renderer.stalled_frame_requests_per_s"] = (gpu_b["stalledFrameRequests"] - gpu_a["stalledFrameRequests"]) / seconds
+
+        def mean_delta(path: tuple[str, ...], name: str) -> None:
+            def pick(gpu: dict) -> dict | None:
+                node = gpu
+                for key in path:
+                    node = (node or {}).get(key)
+                return node
+
+            before, after = pick(gpu_a), pick(gpu_b)
+            if before and after and after["count"] > before["count"]:
+                metrics[f"renderer.{name}_mean_ms"] = (after["sumMs"] - before["sumMs"]) / (after["count"] - before["count"])
+                metrics[f"renderer.{name}_max_ms"] = after["maxMs"]
+
+        mean_delta(("workDoneLatency",), "workdone_latency")
+        mean_delta(("frameLatency", "focused"), "frame_latency_focused")
+        mean_delta(("frameLatency", "background"), "frame_latency_background")
+        submissions = gpu_b["submittedFrames"] - gpu_a["submittedFrames"]
+        if submissions:
+            metrics["renderer.panes_per_submission"] = visible_frames / submissions
     beats = b.get("heartbeats") or []
     metrics["qualification.heartbeats_unfocused"] = sum(1 for h in beats if not h.get("hasFocus") or h.get("visibility") != "visible")
     return metrics
@@ -441,11 +487,14 @@ def summarize(report: dict) -> str:
     headers = ["phase"] + [label(r) for r in roles] + ["TOTAL MiB", "delta"]
     by_phase = sample_by_phase(report)
 
-    if workload in ("occlusion", "canvas"):
+    if workload in ("occlusion", "canvas", "tabs"):
         mode = config.get("occlusionMode", "orderout")
         if workload == "canvas":
             out.append(f"  raw WebGPU canvas probe, variant '{config.get('variant')}' (no Terax renderer)")
-        out.append(f"  mode {mode}; panes/tab {config.get('panes')}; cycles {config.get('cycles')}; hidden {config.get('hiddenMs')} ms; visible {config.get('visibleMs')} ms"
+        if workload == "tabs":
+            out.append(f"  one-pane tab <-> four-pane tab; cycles {config.get('cycles')}; dwell {config.get('dwellMs')} ms on each tab per switch; {config.get('order') or 'hide-first'}" + (f"; park {config.get('parkMs')}" if config.get('parkMs') else ""))
+        else:
+            out.append(f"  mode {mode}; panes/tab {config.get('panes')}; cycles {config.get('cycles')}; hidden {config.get('hiddenMs')} ms; visible {config.get('visibleMs')} ms"
                    + ("; CONTROL (no reclaim expected)" if config.get("controlNoReclaim") else "")
                    + (f"; forced GC {config.get('forceGc')} ({config.get('gcWhen')})" if config.get("forceGc") not in (None, "none") else ""))
         rows = []
@@ -477,6 +526,9 @@ def summarize(report: dict) -> str:
         out.append("\nCycles occluded / reclaimed by the presentation policy: {} / {} of {}".format(int(metrics.get("cycles.occluded", 0)), int(metrics.get("cycles.reclaimed", 0)), config.get("cycles")))
         if "footprint.growth_mib_per_cycle" in metrics:
             out.append("Visible-footprint trend: {:+.2f} MiB/cycle; first->last visible {:+.1f} MiB".format(metrics["footprint.growth_mib_per_cycle"], metrics.get("footprint.growth_total_mib", float("nan"))))
+        if "pool.created" in metrics:
+            out.append("Renderer canvas pool: created {}, reused {}, reconfigured {}, destroyed {}; backing-store resizes {}".format(
+                metrics.get("pool.created"), metrics.get("pool.reused"), metrics.get("pool.reconfigured"), metrics.get("pool.destroyed"), metrics.get("renderer.backing_store_resizes", "-")))
         pairs = [("hidden holds", None), ("visible streams", None)]
         pairs = []
         for name in ("hidden", "visible", "cycles"):
@@ -515,6 +567,9 @@ def summarize(report: dict) -> str:
         metrics = compute_metrics(report)
         out.append("\nJS: WebGPU contexts created {} / finalized {}; reclamations {}; native didMove {}, occlusion changes {}".format(
             metrics.get("js.contextCreated", "-"), metrics.get("js.contextFinalized", "-"), metrics.get("js.reclamations", "-"), metrics.get("native.didMove", "-"), metrics.get("native.occlusionChanges", 0)))
+        if "pool.created" in metrics:
+            out.append("Renderer canvas pool: created {}, reused {}, reconfigured {}, destroyed {}; backing-store resizes {}".format(
+                metrics.get("pool.created"), metrics.get("pool.reused"), metrics.get("pool.reconfigured"), metrics.get("pool.destroyed"), metrics.get("renderer.backing_store_resizes", "-")))
     elif workload in ("agents", "idle"):
         out.append(f"  visible panes {config.get('panes')}; hidden models {config.get('hidden')}; measured {config.get('duration')} s after {config.get('warmup')} s warm-up; cursor blink {config.get('blink')}")
         rows, previous = [], None
@@ -530,7 +585,7 @@ def summarize(report: dict) -> str:
         out.append("\nCPU% (of one core) and energy over the measured window:")
         out.append(_interval_table(pairs, roles))
         metrics = compute_metrics(report)
-        for key in ("window.power_mw.total", "window.wakeups_per_s.total", "driver.renders_per_s", "driver.kib_per_s", "driver.timer_lag_mean_ms", "renderer.visible_frames_per_s", "renderer.gpu_submissions_per_s", "renderer.render_callback_ms_per_s"):
+        for key in ("window.power_mw.total", "window.wakeups_per_s.total", "driver.renders_per_s", "driver.kib_per_s", "driver.timer_lag_mean_ms", "renderer.visible_frames_per_s", "renderer.gpu_submissions_per_s", "renderer.panes_per_submission", "renderer.animation_frames_per_s", "renderer.idle_animation_frames_per_s", "renderer.timer_wakeups_per_s", "renderer.work_done_waits_per_s", "renderer.page_wakeups_per_s", "renderer.stalled_frame_requests_per_s", "renderer.workdone_latency_mean_ms", "renderer.frame_latency_focused_mean_ms", "renderer.frame_latency_background_mean_ms", "renderer.render_callback_ms_per_s"):
             if key in metrics:
                 out.append(f"  {key}: {metrics[key]:.2f}")
     else:

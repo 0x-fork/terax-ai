@@ -240,9 +240,10 @@ process attribution, and long-duration energy/resource testing remain open.
   restarting the PTY or disposing the model.
 - Shared cwd and grid-selection APIs route to the owning Ghostty session.
 - Native macOS occlusion/sleep joins DOM visibility in a shared presentation
-  policy. Frames stop immediately; a two-second grace avoids resource churn
-  during short desktop transitions. Sustained invisibility and sleep reclaim
-  presentation without losing model state.
+  policy. Frames stop immediately. WebGPU releases nothing on occlusion or sleep
+  (its canvases stay configured and sized; WebKit would otherwise keep their
+  swapchains for good). The WebGL fallback reclaims its renderer after two
+  seconds of occlusion, and at once on sleep, without losing model state.
 - Per-pane deadlines use RAF timestamps, avoiding callback jitter and focused
   panes pulling background panes to 60 fps. WebGPU bounds outstanding frames
   to two, defers hidden device recovery, and owns staging and replaced textures

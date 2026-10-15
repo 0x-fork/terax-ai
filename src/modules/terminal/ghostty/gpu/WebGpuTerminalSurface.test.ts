@@ -30,7 +30,7 @@ const surfaces: WebGpuTerminalSurface[] = [];
 const canvasPools: WebGpuCanvasPool[] = [];
 afterEach(() => {
   for (const surface of surfaces.splice(0)) surface.dispose();
-  for (const pool of canvasPools.splice(0)) pool.clear();
+  for (const pool of canvasPools.splice(0)) pool.dispose();
   vi.unstubAllGlobals();
   vi.useRealTimers();
 });
@@ -132,8 +132,14 @@ describe("WebGPU surface data path", () => {
     expect(h.model.consumeGpuFrame).toHaveBeenLastCalledWith({ resync: true });
     h.render();
     expect(h.model.consumeGpuFrame).toHaveBeenLastCalledWith({ resync: false });
-    h.visibility(false, true);
-    h.visibility(true, false);
+    // A pause keeps the uploaded cells, so nothing needs to be sent again.
+    h.visibility(false);
+    h.visibility(true);
+    h.render();
+    expect(h.model.consumeGpuFrame).toHaveBeenLastCalledWith({ resync: false });
+    // Buffers rebuilt for a replacement device do.
+    h.surface.handleDeviceLoss();
+    h.visibility(true);
     h.render();
     expect(h.model.consumeGpuFrame).toHaveBeenLastCalledWith({ resync: true });
   });
@@ -476,8 +482,8 @@ describe("WebGPU surface resource lifecycle", () => {
     h.render();
     h.model.consumeGpuFrame.mockClear();
     h.writeBuffer.mockClear();
-    h.visibility(false, false);
-    h.visibility(true, false);
+    h.visibility(false);
+    h.visibility(true);
     expect(h.render()).toBe(true);
     expect(h.model.consumeGpuFrame).toHaveBeenLastCalledWith({ resync: false });
     expect(
@@ -515,7 +521,7 @@ describe("WebGPU surface resource lifecycle", () => {
     h.surface.eventTarget().dispatchEvent(new Event("wheel"));
     expect(h.interact).toHaveBeenCalledWith(h.surface);
     expect(h.schedule).not.toHaveBeenCalled();
-    h.visibility(false, false);
+    h.visibility(false);
     h.interact.mockClear();
     h.surface.eventTarget().dispatchEvent(new Event("wheel"));
     expect(h.interact).not.toHaveBeenCalled();
@@ -534,8 +540,8 @@ describe("WebGPU surface resource lifecycle", () => {
     const h = await harness();
     h.position.history = 100;
     h.position.offset = 50;
-    h.visibility(false, false);
-    h.visibility(true, false);
+    h.visibility(false);
+    h.visibility(true);
     const scrollbar = h.elements.find(
       (element) => element.getAttribute("role") === "scrollbar",
     );
@@ -549,14 +555,14 @@ describe("WebGPU surface resource lifecycle", () => {
     scrollbar.dispatchEvent(new Event("scroll"));
     expect(h.model.scrollTo).not.toHaveBeenCalled();
     // Resuming synchronizes geometry but must not fight a native fractional scroll.
-    h.visibility(false, false);
-    h.visibility(true, false);
+    h.visibility(false);
+    h.visibility(true);
     h.render();
     expect(scrollbar.scrollTop).toBe(50 * line + 0.25);
     scrollbar.scrollTop = 51 * line;
     scrollbar.dispatchEvent(new Event("scroll"));
     expect(h.model.scrollTo).toHaveBeenLastCalledWith(49);
-    h.visibility(false, false);
+    h.visibility(false);
     h.domWork.mockClear();
     h.schedule.mockClear();
     for (let index = 0; index < 1000; index++) h.damage();
@@ -580,32 +586,106 @@ describe("WebGPU surface resource lifecycle", () => {
     expect(h.rectReads).not.toHaveBeenCalled();
   });
 
-  it("reuses presentation through rapid desktop switches and retains selection after reclamation", async () => {
+  it("pauses through rapid desktop switches and long occlusion without releasing anything", async () => {
     const h = await harness();
     h.render();
     const allocated = h.createBuffer.mock.calls.length;
+    const canvas = h.canvas();
+    const backing = { width: canvas.width, height: canvas.height };
+    const resources = h.surface.diagnostics();
     for (let transition = 0; transition < 1_000; transition++) {
-      h.visibility(false, false);
-      h.visibility(true, false);
+      h.visibility(false);
+      h.visibility(true);
     }
+    // A long occlusion is the same pause: nothing is destroyed, shrunk or unconfigured.
+    h.visibility(false);
     expect(h.createBuffer).toHaveBeenCalledTimes(allocated);
     expect(h.destroy).not.toHaveBeenCalled();
     expect(h.model.releasePresentationResources).not.toHaveBeenCalled();
-    h.visibility(false, true);
-    expect(h.surface.diagnostics().gpuBufferBytes).toBe(0);
-    expect(h.surface.diagnostics().estimatedSwapchainBytes).toBe(0);
-    expect(h.model.releasePresentationResources).toHaveBeenCalledOnce();
+    expect(h.context.unconfigure).not.toHaveBeenCalled();
+    expect(h.acquireCanvas).toHaveBeenCalledOnce();
+    expect(h.canvasPool.diagnostics()).toMatchObject({
+      active: 1,
+      destroyed: 0,
+    });
+    expect(h.canvas().width).toBe(backing.width);
+    expect(h.canvas().height).toBe(backing.height);
+    expect(h.surface.diagnostics()).toMatchObject({
+      gpuBufferBytes: resources.gpuBufferBytes,
+      estimatedSwapchainBytes: resources.estimatedSwapchainBytes,
+      documentSuspended: true,
+    });
+    expect(h.render()).toBe(false);
     expect(h.surface.getSelection()).toBe("selected output");
-    h.visibility(true, false);
-    expect(h.createBuffer.mock.calls.length).toBeGreaterThan(allocated);
+    h.visibility(true);
+    expect(h.createBuffer).toHaveBeenCalledTimes(allocated);
+    expect(h.render()).toBe(true);
     expect(h.surface.getSelection()).toBe("selected output");
     expect(h.onError).not.toHaveBeenCalled();
+  });
+
+  it("keeps its canvas when the GPU device is lost and reconfigures it for the replacement", async () => {
+    const h = await harness();
+    h.render();
+    const canvas = h.leases[0].canvas;
+    const width = canvas.width;
+    h.surface.handleDeviceLoss();
+    expect(h.surface.diagnostics()).toMatchObject({
+      gpuBufferBytes: 0,
+      documentSuspended: true,
+    });
+    expect(h.destroy).toHaveBeenCalled();
+    expect(h.context.unconfigure).not.toHaveBeenCalled();
+    expect(h.canvasPool.diagnostics()).toMatchObject({
+      active: 1,
+      destroyed: 0,
+    });
+
+    h.resources.generation = 2;
+    h.visibility(true);
+    expect(h.acquireCanvas).toHaveBeenCalledOnce();
+    expect(h.leases[0].generation).toBe(2);
+    expect(h.leases[0].canvas).toBe(canvas);
+    expect(canvas.width).toBe(width);
+    expect(h.canvasPool.diagnostics()).toMatchObject({
+      active: 1,
+      reconfigured: 1,
+      destroyed: 0,
+    });
+    expect(h.surface.diagnostics().gpuBufferBytes).toBeGreaterThan(0);
+    expect(h.render()).toBe(true);
+    expect(h.onError).not.toHaveBeenCalled();
+  });
+
+  it("returns its canvas to the pool configured when hidden and takes back one of the right size", async () => {
+    const h = await harness();
+    h.render();
+    const canvas = h.leases[0].canvas;
+    const { width, height } = canvas;
+    h.surface.setVisible(false);
+    expect(h.canvasPool.diagnostics()).toMatchObject({
+      active: 0,
+      idle: 1,
+      destroyed: 0,
+    });
+    expect(h.context.unconfigure).not.toHaveBeenCalled();
+    expect(canvas.width).toBe(width);
+    h.surface.setVisible(true);
+    expect(h.acquireCanvas).toHaveBeenCalledTimes(2);
+    // The pane tells the pool which backing size it needs, so the matching canvas comes back.
+    expect(h.acquireCanvas).toHaveBeenLastCalledWith(
+      expect.objectContaining({ width: expect.any(Number) }),
+    );
+    expect(h.leases[1].canvas).toBe(canvas);
+    expect(canvas.width).toBe(width);
+    expect(canvas.height).toBe(height);
   });
 
   it("defers font changes during occlusion and acquires the current font and DPR on resume", async () => {
     const h = await harness();
     const allocated = h.createBuffer.mock.calls.length;
-    h.visibility(false, false);
+    const swapchain = h.surface.diagnostics().estimatedSwapchainBytes;
+    h.visibility(false);
     h.surface.setFontMetrics({
       ...METRICS,
       deviceCellWidth: 10,
@@ -614,8 +694,11 @@ describe("WebGPU surface resource lifecycle", () => {
     });
     expect(h.createBuffer).toHaveBeenCalledTimes(allocated);
     expect(h.surface.diagnostics().gpuBufferBytes).toBe(0);
+    // The paused canvas is left as it is.
+    expect(h.surface.diagnostics().estimatedSwapchainBytes).toBe(swapchain);
+    expect(h.context.unconfigure).not.toHaveBeenCalled();
     h.setScale(2);
-    h.visibility(true, false);
+    h.visibility(true);
     expect(h.acquireGlyphAtlas).toHaveBeenLastCalledWith(
       expect.objectContaining({
         scale: 2,
@@ -827,12 +910,18 @@ async function harness(options: { scale?: number } = {}) {
   const canvasPool = new WebGpuCanvasPool();
   canvasPools.push(canvasPool);
   const leases: Array<ReturnType<WebGpuCanvasPool["acquire"]>> = [];
-  bridge.runtime = {
-    acquireCanvas: () => {
-      const lease = canvasPool.acquire(resources as never);
+  const acquireCanvas = vi.fn(
+    (preferred?: { width: number; height: number } | null) => {
+      const lease = canvasPool.acquire(
+        resources as never,
+        preferred ?? undefined,
+      );
       leases.push(lease);
       return lease;
     },
+  );
+  bridge.runtime = {
+    acquireCanvas: acquireCanvas,
     register: vi.fn(),
     unregister: vi.fn(),
     schedule,
@@ -1038,10 +1127,15 @@ async function harness(options: { scale?: number } = {}) {
     dprChange() {
       dprListener?.();
     },
-    visibility(visible: boolean, reclaim: boolean) {
+    visibility(visible: boolean) {
       bridge.visible = visible;
-      surface.handleVisibilityChange(visible, reclaim);
+      surface.handleVisibilityChange(visible);
     },
+    context,
+    resources,
+    canvasPool,
+    acquireCanvas,
+    leases,
   };
 }
 

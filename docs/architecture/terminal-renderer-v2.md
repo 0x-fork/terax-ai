@@ -284,6 +284,58 @@ axis after a shrink, aligned to 128) is cleared to the background and clipped by
 A test drags a pane across 400 device pixels in 3 pixel steps and requires fewer
 than a tenth as many swapchain reallocations as steps.
 
+### Canvas lifecycle
+
+WebKit (macOS 26.6.2, WebKit 21624.5.1.11.3) keeps the swapchain of a WebGPU
+canvas that was presented and then destroyed, in the WebContent process, for good:
+three buffers, 30 MiB for a 2000x1300 canvas ("owned unmapped (graphics)" in
+`vmmap`, GPU process flat, unaffected by forced garbage collection). Window
+occlusion longer than the old two-second reclaim delay destroyed every canvas, so
+each Space switch, minimize or `orderOut` added 30 MiB. `scripts/renderer-profile`
+reproduced it without any Terax code (`--workload canvas`, 15-20 cycles of
+occlude, tear down, restore):
+
+| Teardown on occlusion (raw WebGPU canvas) | MiB per cycle |
+| --- | --- |
+| unconfigure + 1x1 + remove + drop (the old pool reclaim); also with `texture.destroy()`, remove only, unconfigure only | +29.8 to +30.9 |
+| keep the element, unconfigure | +1.5, stays |
+| keep the element, shrink to 1x1 and back | +2.3 while cycling, back to baseline once quiet |
+| keep the element, hide it (`hide-keep`) | -0.0 |
+| keep the element, remove it from the DOM and re-append (`detach-keep`) | -0.0 |
+| keep the element, give it a new GPU device each cycle (`reconfigure`) | -0.4 |
+| 8 backing-store resizes per cycle with frames running (`resize-live`) | -0.3, transient peaks of one swapchain, all returned once quiet |
+| raw WebGL2 canvas: lose context, 1x1, remove, drop (`webgl-destroy`) | +1.0, sawtooth: garbage collection returns it, settles below baseline |
+| raw WebGL2 canvas: hide only (`webgl-keep`) | +0.2 |
+
+So a presented WebGPU canvas is never destroyed (`WebGpuCanvasPool`):
+
+- Occlusion, sleep and a hidden window only pause. Nothing is released: canvases
+  keep their configuration and size, and cell buffers, glyph maps and atlas
+  textures stay resident (together a few MiB; WASM linear memory never shrinks,
+  so returning the native presentation buffers on occlusion gained nothing).
+- A hidden pane returns its canvas to the pool configured and sized. The pool
+  creates a canvas only when none is idle, so it never holds more than the peak
+  number of simultaneously leased canvases. A returning pane passes the backing
+  size it last fitted (`lastBackingSize`) and gets the idle canvas whose backing
+  store already serves it (`CanvasBackingStore.surplusFor`, smallest surplus
+  first), else a parked canvas, else the closest area. A tab switch reallocates
+  nothing.
+- An idle canvas keeps its size for ten seconds (`terax:terminal-canvas-park-ms`,
+  `off` to disable) and is then parked at 1x1, still configured; canvases under
+  2 MiB of color are never parked. The rule exists because tab switches are not
+  ordered: React runs effects in tree order, so switching to a tab earlier in the
+  tree shows its panes before the outgoing tab releases its own, and the pool
+  holds one more canvas than the visible set until they are parked.
+- A lost or replaced GPU device keeps every element: `lease.reconfigure` (leased)
+  or reconfiguration on `acquire` (idle) calls `configure()` on the same canvas
+  with the new device. Surfaces drop their buffers and atlas lease on
+  `handleDeviceLoss`, nothing else.
+- Only `WebGpuTerminalRuntime.dispose()` (HMR, or a fatal error that switches the
+  session to WebGL) destroys canvases; the WebGPU runtime never presents again.
+
+The WebGL fallback is unaffected: its canvases are garbage collected, so its
+two-second occlusion reclaim stays.
+
 ### Glyph atlas
 
 Pixels are written with `queue.writeTexture` and no CPU copy is retained, so a

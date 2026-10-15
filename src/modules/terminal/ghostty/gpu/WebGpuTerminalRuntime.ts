@@ -11,7 +11,10 @@ import {
 } from "../renderScheduling";
 import { GlyphAtlas } from "./GlyphAtlas";
 import type { RasterBudget } from "./GlyphMap";
-import { WebGpuCanvasPool } from "@/modules/terminal/ghostty/gpu/WebGpuCanvasPool";
+import {
+  type PreferredCanvasSize,
+  WebGpuCanvasPool,
+} from "@/modules/terminal/ghostty/gpu/WebGpuCanvasPool";
 import { BACKGROUND_SHADER, GLYPH_SHADER } from "./shaders";
 import type { TerminalFontMetrics } from "./terminalVisuals";
 
@@ -45,7 +48,10 @@ export interface WebGpuRuntimeSurface {
   ): boolean;
   handleRuntimeReset(resources: WebGpuSharedResources): void;
   handleRuntimeError(error: Error): void;
-  handleVisibilityChange(visible: boolean, reclaim?: boolean): void;
+  /** Pause or resume. Pausing stops rendering and timers and releases no GPU resource. */
+  handleVisibilityChange(visible: boolean): void;
+  /** The device is gone: drop what belongs to it, keep the canvas for the replacement. */
+  handleDeviceLoss(): void;
   isFocused(): boolean;
 }
 
@@ -96,10 +102,47 @@ export type WebGpuRuntimeStats = {
   readonly inFlightFrames: number;
   readonly peakInFlightFrames: number;
   readonly stagingBytes: number;
+  /** Animation-frame callbacks run, and how many of them found no pane due. */
+  readonly animationFrames: number;
+  readonly idleAnimationFrames: number;
+  /** Timer wakeups used to sleep until a frame is due. */
+  readonly timerWakeups: number;
+  /** `onSubmittedWorkDone` waits issued, and how long they took to resolve. */
+  readonly workDoneWaits: number;
+  readonly workDoneLatency: LatencyStats;
+  /** Frame requests that found the in-flight bound reached and had to wait for a confirmation. */
+  readonly stalledFrameRequests: number;
+  /** Time from a pane turning dirty to the start of the frame that draws it. */
+  readonly frameLatency: {
+    readonly focused: LatencyStats;
+    readonly background: LatencyStats;
+  };
 };
 
+export type LatencyStats = {
+  readonly count: number;
+  readonly sumMs: number;
+  readonly maxMs: number;
+};
+
+class LatencyTracker {
+  count = 0;
+  sumMs = 0;
+  maxMs = 0;
+  record(ms: number): void {
+    this.count += 1;
+    this.sumMs += ms;
+    if (ms > this.maxMs) this.maxMs = ms;
+  }
+  snapshot(): LatencyStats {
+    return { count: this.count, sumMs: this.sumMs, maxMs: this.maxMs };
+  }
+}
+
 export class WebGpuTerminalRuntime {
-  private readonly canvasPool = new WebGpuCanvasPool();
+  private readonly canvasPool = new WebGpuCanvasPool({
+    parkAfterMs: canvasParkDelayMs(),
+  });
   private readonly surfaces = new Set<WebGpuRuntimeSurface>();
   private dirtySurfaces = new Set<WebGpuRuntimeSurface>();
   private renderSurfaces = new Set<WebGpuRuntimeSurface>();
@@ -112,14 +155,28 @@ export class WebGpuTerminalRuntime {
   private emptyStorage: GPUBuffer | null = null;
   private animationFrame: number | null = null;
   private frameTimer: ReturnType<typeof setTimeout> | null = null;
+  private frameTimerDueAt = 0;
   private atlasReapDeferred = false;
   private atlasReapTimer: ReturnType<typeof setTimeout> | null = null;
   private recovering: Promise<void> | null = null;
   private pendingRecoveryReason: string | null = null;
   private generation = 0;
   private submittedFrames = 0;
+  /** Frames the GPU is not yet known to have finished: submitted minus confirmed. */
   private inFlightFrames = 0;
+  private confirmedFrames = 0;
   private peakInFlightFrames = 0;
+  private animationFrames = 0;
+  private idleAnimationFrames = 0;
+  private timerWakeups = 0;
+  private workDoneWaits = 0;
+  private pendingWaits = 0;
+  private stalledFrameRequests = 0;
+  private readonly workDoneLatency = new LatencyTracker();
+  private readonly focusedLatency = new LatencyTracker();
+  private readonly backgroundLatency = new LatencyTracker();
+  private latestWait: { through: number; completion: Promise<unknown> } | null =
+    null;
   private deviceRecoveries = 0;
   private fatalError: Error | null = null;
   private windowFocused = terminalWindowFocused();
@@ -155,7 +212,6 @@ export class WebGpuTerminalRuntime {
     const state = terminalWindowPresentation();
     surface.handleVisibilityChange(
       state.visible && !this.pendingRecoveryReason && !this.recovering,
-      state.reclaim,
     );
   }
 
@@ -166,8 +222,8 @@ export class WebGpuTerminalRuntime {
     if (this.dirtySurfaces.size === 0) this.cancelScheduledFrame();
   }
 
-  acquireCanvas() {
-    return this.canvasPool.acquire(this.resources());
+  acquireCanvas(preferred?: PreferredCanvasSize | null) {
+    return this.canvasPool.acquire(this.resources(), preferred ?? undefined);
   }
 
   interact(surface: WebGpuRuntimeSurface): void {
@@ -183,6 +239,7 @@ export class WebGpuTerminalRuntime {
   schedule(surface: WebGpuRuntimeSurface): void {
     if (this.disposed || this.fatalError || !this.surfaces.has(surface)) return;
     this.dirtySurfaces.add(surface);
+    this.pacer.dirty(surface, performance.now());
     this.requestFrame();
   }
 
@@ -309,6 +366,16 @@ export class WebGpuTerminalRuntime {
       submittedFrames: this.submittedFrames,
       inFlightFrames: this.inFlightFrames,
       peakInFlightFrames: this.peakInFlightFrames,
+      animationFrames: this.animationFrames,
+      idleAnimationFrames: this.idleAnimationFrames,
+      timerWakeups: this.timerWakeups,
+      workDoneWaits: this.workDoneWaits,
+      workDoneLatency: this.workDoneLatency.snapshot(),
+      stalledFrameRequests: this.stalledFrameRequests,
+      frameLatency: {
+        focused: this.focusedLatency.snapshot(),
+        background: this.backgroundLatency.snapshot(),
+      },
       stagingBytes,
       deviceRecoveries: this.deviceRecoveries,
       recoveryPending:
@@ -338,12 +405,16 @@ export class WebGpuTerminalRuntime {
     this.surfaces.clear();
     for (const entry of this.atlases.values()) entry.atlas.dispose();
     this.atlases.clear();
+    this.canvasPool.dispose();
     this.releaseDevice();
   }
 
+  /**
+   * Occlusion and sleep pause: no frame is scheduled and surfaces cancel their timers, but every
+   * canvas, buffer and atlas texture stays exactly as it is (see WebGpuCanvasPool for why).
+   */
   private readonly handleVisibility = ({
     visible,
-    reclaim,
   }: WindowPresentation): void => {
     if (visible && (this.pendingRecoveryReason || this.recovering)) {
       if (this.pendingRecoveryReason)
@@ -352,16 +423,11 @@ export class WebGpuTerminalRuntime {
     }
     if (!visible) this.cancelScheduledFrame();
     for (const surface of this.surfaces) {
-      surface.handleVisibilityChange(visible, reclaim);
+      surface.handleVisibilityChange(visible);
     }
     if (visible) {
       this.pacer.reset();
       this.requestFrame();
-    } else if (reclaim) {
-      this.canvasPool.reclaimIdle();
-      for (const entry of this.atlases.values()) {
-        if (entry.references === 0) entry.atlas.suspend();
-      }
     }
   };
 
@@ -375,9 +441,13 @@ export class WebGpuTerminalRuntime {
 
   private requestFrame(): void {
     if (
+      this.inFlightFrames >= MAX_IN_FLIGHT_FRAMES &&
+      this.dirtySurfaces.size > 0
+    )
+      this.stalledFrameRequests += 1;
+    if (
       this.disposed ||
       this.animationFrame !== null ||
-      this.frameTimer !== null ||
       this.recovering ||
       this.pendingRecoveryReason ||
       this.inFlightFrames >= MAX_IN_FLIGHT_FRAMES ||
@@ -387,16 +457,32 @@ export class WebGpuTerminalRuntime {
     ) {
       return;
     }
-    const delay = this.pacer.delay(
+    const plan = this.pacer.plan(
       this.dirtySurfaces,
       this.windowFocused,
       performance.now(),
     );
-    if (delay > 1) {
+    if (plan.kind === "idle") return;
+    const now = performance.now();
+    if (this.frameTimer !== null) {
+      // A pane that turns dirty while the page sleeps for a later deadline (a background tick)
+      // must not wait for that sleep: keep it only if it already ends in time.
+      if (
+        plan.kind === "wait" &&
+        now + plan.delayMs >= this.frameTimerDueAt - 0.5
+      )
+        return;
+      clearTimeout(this.frameTimer);
+      this.frameTimer = null;
+    }
+    if (plan.kind === "wait") {
+      // Sleep until a callback requested then lands on a vsync that can serve the deadline.
+      this.frameTimerDueAt = now + plan.delayMs;
       this.frameTimer = setTimeout(() => {
         this.frameTimer = null;
+        this.timerWakeups += 1;
         this.requestFrame();
-      }, delay);
+      }, plan.delayMs);
       return;
     }
     this.animationFrame = requestAnimationFrame((frameAt) =>
@@ -406,6 +492,8 @@ export class WebGpuTerminalRuntime {
 
   private flushFrame(frameAt = performance.now()): void {
     this.animationFrame = null;
+    this.pacer.frameStarted(frameAt);
+    this.animationFrames += 1;
     if (
       this.disposed ||
       this.recovering ||
@@ -426,6 +514,7 @@ export class WebGpuTerminalRuntime {
           label: "Terax terminal window frame",
         }));
       let rendered = false;
+      let due = 0;
       // Flushes happen before any surface encodes, so no draw in this frame
       // can read indices that a later flush would invalidate.
       this.applyAtlasFlushes();
@@ -437,6 +526,15 @@ export class WebGpuTerminalRuntime {
           this.dirtySurfaces.add(surface);
           continue;
         }
+        due += 1;
+        const waited = this.pacer.waited(surface, frameAt);
+        if (waited !== undefined)
+          (surface.isFocused()
+            ? this.focusedLatency
+            : this.backgroundLatency
+          ).record(waited);
+        // Before drawing: a change the draw itself schedules (a glyph backlog) is a new wait.
+        this.pacer.settled(surface);
         try {
           if (surface.renderFrame(getEncoder, resources, budget)) {
             this.pacer.presented(surface, frameAt);
@@ -447,37 +545,28 @@ export class WebGpuTerminalRuntime {
         }
       }
 
-      let completion: Promise<unknown> | null = null;
+      if (due === 0) this.idleAnimationFrames += 1;
+      let submitted = false;
       if (frame.encoder && rendered) {
         resources.device.queue.submit([frame.encoder.finish()]);
+        this.submittedFrames += 1;
         this.inFlightFrames += 1;
+        submitted = true;
         this.peakInFlightFrames = Math.max(
           this.peakInFlightFrames,
           this.inFlightFrames,
         );
-        const generation = this.generation;
-        completion = resources.device.queue.onSubmittedWorkDone();
-        void completion.then(
-          () => {
-            if (this.disposed || generation !== this.generation) return;
-            this.inFlightFrames = Math.max(0, this.inFlightFrames - 1);
-            this.requestFrame();
-          },
-          (error: unknown) => {
-            if (
-              this.disposed ||
-              generation !== this.generation ||
-              this.fatalError
-            )
-              return;
-            void this.recoverDevice(toError(error).message);
-          },
-        );
-        this.submittedFrames += 1;
+        // One wait at a time: frames submitted while it is pending are covered by the next one,
+        // which starts as soon as this one resolves. A burst therefore costs a wait per GPU round
+        // trip instead of one per frame, and a frame is held back only while two are unconfirmed.
+        if (this.pendingWaits === 0) this.confirmFrames();
       }
       // Anything an atlas replaced this frame may still be named by commands
       // just submitted; without a submission nothing can reference it.
+      let completion: Promise<unknown> | null = null;
       for (const entry of this.atlases.values()) {
+        if (!entry.atlas.hasRetired) continue;
+        if (submitted) completion ??= this.confirmFrames();
         entry.atlas.releaseRetired(completion);
       }
     } catch (error) {
@@ -489,6 +578,43 @@ export class WebGpuTerminalRuntime {
       this.scheduleAtlasReap();
     }
     this.requestFrame();
+  }
+
+  /**
+   * Waits for everything submitted so far. Frames submitted afterwards are not covered, so the
+   * bookkeeping is by count: a wait confirms the frames that existed when it was issued.
+   */
+  private confirmFrames(): Promise<unknown> {
+    const through = this.submittedFrames;
+    if (this.latestWait?.through === through) return this.latestWait.completion;
+    const generation = this.generation;
+    const completion = this.device?.queue.onSubmittedWorkDone();
+    if (!completion) return Promise.resolve();
+    this.workDoneWaits += 1;
+    this.pendingWaits += 1;
+    this.latestWait = { through, completion };
+    const issuedAt = performance.now();
+    void completion.then(
+      () => {
+        if (this.disposed || generation !== this.generation) return;
+        this.pendingWaits = Math.max(0, this.pendingWaits - 1);
+        this.workDoneLatency.record(performance.now() - issuedAt);
+        this.confirmedFrames = Math.max(this.confirmedFrames, through);
+        this.inFlightFrames = Math.max(
+          0,
+          this.submittedFrames - this.confirmedFrames,
+        );
+        if (this.inFlightFrames > 0 && this.pendingWaits === 0)
+          this.confirmFrames();
+        this.requestFrame();
+      },
+      (error: unknown) => {
+        if (this.disposed || generation !== this.generation || this.fatalError)
+          return;
+        void this.recoverDevice(toError(error).message);
+      },
+    );
+    return completion;
   }
 
   private applyAtlasFlushes(): void {
@@ -543,6 +669,8 @@ export class WebGpuTerminalRuntime {
 
     this.device = device;
     this.inFlightFrames = 0;
+    this.pendingWaits = 0;
+    this.confirmedFrames = this.submittedFrames;
     this.generation += 1;
     this.format = navigator.gpu.getPreferredCanvasFormat();
     let initialized = false;
@@ -663,8 +791,7 @@ export class WebGpuTerminalRuntime {
     this.cancelScheduledFrame();
     if (!this.pendingRecoveryReason) {
       this.pendingRecoveryReason = reason;
-      for (const surface of this.surfaces)
-        surface.handleVisibilityChange(false, true);
+      for (const surface of this.surfaces) surface.handleDeviceLoss();
       for (const entry of this.atlases.values()) entry.atlas.suspend();
       this.releaseDevice();
     }
@@ -676,7 +803,7 @@ export class WebGpuTerminalRuntime {
         this.deviceRecoveries += 1;
         const state = terminalWindowPresentation();
         for (const surface of this.surfaces) {
-          surface.handleVisibilityChange(state.visible, state.reclaim);
+          surface.handleVisibilityChange(state.visible);
           this.dirtySurfaces.add(surface);
         }
       } catch (error) {
@@ -768,13 +895,20 @@ export class WebGpuTerminalRuntime {
     this.atlasReapTimer = null;
     for (const entry of this.atlases.values()) entry.atlas.dispose();
     this.atlases.clear();
+    // The runtime never presents again, so its canvases have no further use.
+    this.canvasPool.dispose();
     this.releaseDevice();
   }
 
+  /**
+   * Drops the device. Canvases stay in the pool and are reconfigured for the next generation
+   * (`WebGpuCanvasPool`), because destroying a presented one would leave its swapchain behind.
+   */
   private releaseDevice(): void {
-    this.canvasPool.clear();
     this.generation += 1;
     this.inFlightFrames = 0;
+    this.pendingWaits = 0;
+    this.confirmedFrames = this.submittedFrames;
     this.device?.destroy();
     this.device = null;
     this.backgroundPipeline = null;
@@ -840,6 +974,26 @@ function fontAtlasKey(metrics: TerminalFontMetrics): string {
     metrics.deviceCellHeight,
     metrics.deviceBaseline,
   ].join("|");
+}
+
+/**
+ * `localStorage["terax:terminal-canvas-park-ms"]` tunes how long an idle canvas keeps its size
+ * before it is parked at 1x1 (`off` never parks); unset means the pool's default.
+ */
+const CANVAS_PARK_STORAGE_KEY = "terax:terminal-canvas-park-ms";
+export function canvasParkDelayMs(): number | undefined {
+  try {
+    const value =
+      typeof window === "undefined"
+        ? null
+        : (window.localStorage?.getItem(CANVAS_PARK_STORAGE_KEY) ?? null);
+    if (value === null) return undefined;
+    if (value === "off") return Number.POSITIVE_INFINITY;
+    const delay = Number(value);
+    return Number.isFinite(delay) && delay >= 0 ? delay : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** A per-frame wall-clock allowance for glyph rasterization. */

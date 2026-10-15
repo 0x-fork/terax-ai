@@ -11,6 +11,8 @@ Workloads (`--workload`):
   canvas     the same occlusion cycles on a raw WebGPU canvas (no Terax renderer) to compare
              canvas teardown strategies with --variant
   move       small-step and jump window moves while terminals trickle output
+  tabs       alternate between a one-pane and a four-pane tab, dwelling longer than the old
+             two second idle-canvas deadline on each (tab-switch footprint trend)
   agents     Ink-like redraw + token streaming into K visible panes and H hidden models
   idle       the same panes with no output
 
@@ -48,7 +50,7 @@ SCOPE = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False)
-    parser.add_argument("--workload", choices=["default", "occlusion", "canvas", "move", "agents", "idle"], default="default")
+    parser.add_argument("--workload", choices=["default", "occlusion", "canvas", "tabs", "move", "agents", "idle"], default="default")
     parser.add_argument("--output", type=Path, help="Scratch directory for build products (default: a temp directory)")
     parser.add_argument("--report", type=Path, help="Where to write the JSON report (default: <output>/report.json)")
     parser.add_argument("--source", type=Path, help="Optional baseline checkout; its node_modules must be installed")
@@ -63,7 +65,11 @@ def parse_args() -> argparse.Namespace:
     # occlusion
     parser.add_argument("--occlusion-mode", choices=["orderout", "cover", "miniaturize", "none"], default="orderout", help="How the window is occluded (none: canvas workload only, leaves the window visible)")
     parser.add_argument("--cycles", type=int, default=40)
-    parser.add_argument("--variant", default="destroy", help="canvas workload: destroy, destroy-texture, remove-only, unconfigure-only, shrink-keep, unconfigure-keep, hide-keep")
+    parser.add_argument("--dwell-ms", type=int, default=3000, help="tabs workload: time spent on each tab per switch")
+    parser.add_argument("--order", choices=["hide-first", "show-first"], default="hide-first", help="tabs workload: whether the outgoing tab releases its canvases before the incoming tab asks for them")
+    parser.add_argument("--park-ms", help="Renderer tuning: idle WebGPU canvas parking delay in ms, or 'off' (renderers without the knob ignore it)")
+    parser.add_argument("--variant", default="destroy", help="canvas workload: destroy, destroy-texture, remove-only, unconfigure-only, shrink-keep, unconfigure-keep, hide-keep, detach-keep (out of the DOM, still configured), resize-live (backing-store resizes with frames running), reconfigure (same canvas, new GPU device), webgl-destroy / webgl-keep (raw WebGL2 canvas)")
+    parser.add_argument("--resize-steps", type=int, default=8, help="canvas workload, variant resize-live: backing-store resizes per cycle")
     parser.add_argument("--hidden-ms", type=int, help="Hold while occluded (default 3000; must exceed the 2 s reclaim delay)")
     parser.add_argument("--control-no-reclaim", action="store_true", help="Control experiment: hold only 1200 ms so the policy never reclaims, then expect no reclaim")
     parser.add_argument("--visible-ms", type=int, default=2000, help="Visible streaming time per cycle")
@@ -123,8 +129,8 @@ dist = output / "dist"
 bundle = output / "Terax Renderer Lab.app"
 executable = bundle / "Contents/MacOS/renderer-lab"
 executable.parent.mkdir(parents=True, exist_ok=True)
-vmmap_enabled = args.vmmap if args.vmmap is not None else args.workload in ("occlusion", "canvas", "move")
-cycling = args.workload in ("occlusion", "canvas")
+vmmap_enabled = args.vmmap if args.vmmap is not None else args.workload in ("occlusion", "canvas", "move", "tabs")
+cycling = args.workload in ("occlusion", "canvas", "tabs")
 report_path = (args.report or output / "report.json").resolve()
 report_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -133,6 +139,8 @@ if args.timeout is not None:
     host_timeout = args.timeout
 elif args.workload == "default":
     host_timeout = 600 if args.inspect else 120
+elif args.workload == "tabs":
+    host_timeout = args.cycles * (2 * args.dwell_ms + 4000) / 1000 + 240
 elif cycling:
     host_timeout = args.cycles * (hidden_ms + args.visible_ms + 4000) / 1000 + 240 + (240 if args.force_gc != "none" else 0)
 elif args.workload == "move":
@@ -223,12 +231,15 @@ config = {
     "workload": args.workload,
     "label": args.label,
     "panes": args.panes,
-    "occlusionMode": args.occlusion_mode if cycling else None,
+    "occlusionMode": args.occlusion_mode if args.workload in ("occlusion", "canvas") else None,
     "variant": args.variant if args.workload == "canvas" else None,
     "cycles": args.cycles if cycling else None,
-    "hiddenMs": hidden_ms if cycling else None,
+    "hiddenMs": hidden_ms if args.workload in ("occlusion", "canvas") else None,
+    "dwellMs": args.dwell_ms if args.workload == "tabs" else None,
+    "order": args.order if args.workload == "tabs" else None,
+    "parkMs": args.park_ms,
     "controlNoReclaim": args.control_no_reclaim if args.workload == "occlusion" else None,
-    "visibleMs": args.visible_ms if cycling else None,
+    "visibleMs": args.visible_ms if args.workload in ("occlusion", "canvas") else None,
     "forceGc": args.force_gc if cycling else None,
     "gcWhen": args.gc_when if cycling and args.force_gc != "none" else None,
     "steps": args.steps if args.workload == "move" else None,
@@ -265,12 +276,14 @@ manifest = {
 }
 
 query: dict[str, object] = {"panes": args.panes}
+if args.park_ms is not None:
+    query["parkMs"] = args.park_ms
 if args.instrument is not None:
     query["instrument"] = args.instrument
 if args.workload != "default":
     query.update({
         "workload": args.workload, "blink": args.blink,
-        "mode": args.occlusion_mode, "variant": args.variant, "cycles": args.cycles, "hiddenMs": hidden_ms, "visibleMs": args.visible_ms,
+        "mode": args.occlusion_mode, "variant": args.variant, "resizeSteps": args.resize_steps, "dwellMs": args.dwell_ms, "order": args.order, "cycles": args.cycles, "hiddenMs": hidden_ms, "visibleMs": args.visible_ms,
         "gc": args.force_gc, "gcWhen": args.gc_when, "sampleHidden": 0 if args.control_no_reclaim else 1,
         "steps": args.steps, "jumps": args.jumps, "stepPoints": args.step_points,
         "hidden": args.hidden, "duration": duration, "warmup": args.warmup, "tick": args.tick,

@@ -79,6 +79,37 @@ export class CanvasBackingStore {
     return true;
   }
 
+  /**
+   * Device pixels of unused backing this store would carry if asked for the given size, or null when
+   * serving it means reallocating the swapchain. Pure: nothing is staged. The pool uses it to hand
+   * a returning pane the canvas that already fits.
+   */
+  surplusFor(pixelWidth: number, pixelHeight: number): number | null {
+    if (!this.presented) return null;
+    const requiredWidth = positivePixelSize(pixelWidth);
+    const requiredHeight = positivePixelSize(pixelHeight);
+    if (
+      reusableDimension(this.targetWidth, requiredWidth) !== this.targetWidth ||
+      reusableDimension(this.targetHeight, requiredHeight) !== this.targetHeight
+    ) {
+      return null;
+    }
+    return (
+      this.targetWidth * this.targetHeight - requiredWidth * requiredHeight
+    );
+  }
+
+  /** The backing size (device pixels) the canvas holds right now. */
+  get size(): { readonly width: number; readonly height: number } {
+    return { width: this.canvas.width, height: this.canvas.height };
+  }
+
+  /**
+   * Shrinks the swapchain to a single pixel; the next stage() sizes it exactly again. Every
+   * resize allocates a replacement swapchain and WebKit frees the previous one lazily (a
+   * 1x1-and-back round trip measured +2.3 MiB per cycle while it ran, recovered afterwards),
+   * so this is for canvases that will not be needed for a while.
+   */
   release(): void {
     this.presented = false;
     if (this.canvas.width !== 1) this.canvas.width = 1;
