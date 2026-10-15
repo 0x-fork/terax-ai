@@ -99,7 +99,9 @@ Fish 4.0 writes its own OSC 133 prompt markers. To avoid doubling, Terax sets `f
 
 ### `CONPTY_LIFECYCLE_LOCK`
 
-`openpty + spawn_command` and the corresponding close are serialized by a static mutex in `session.rs:71`. Concurrent ConPTY lifecycle calls corrupt the new console so its shell never pumps output.
+`openpty + spawn_command` and the corresponding close are serialized by a static mutex in `session.rs`. Concurrent ConPTY lifecycle calls corrupt the new console so its shell never pumps output.
+
+`ClosePseudoConsole` blocks until the reader has taken everything conhost still holds, and the reader can be waiting for output credit the frontend has not granted yet. Holding the lock through that wait would stall every other `pty_open` for up to the 30 s drain deadline. `close_pseudoconsole` therefore lets the reader overdraft its queue by 1 MiB first, outside the lock, and only then takes the lock around the close itself.
 
 ### Job Object
 
@@ -124,6 +126,7 @@ Terminal input sends `\r` (CR), not `\n` (LF). PowerShell on Windows requires CR
 ## Invariants
 
 - Do not remove `CONPTY_LIFECYCLE_LOCK` without verifying first-tab stability under fast tab spam.
+- Never hold `CONPTY_LIFECYCLE_LOCK` across a wait that depends on the frontend (credit, acknowledgements).
 - Do not disable the Job Object without a replacement orphan guard on Windows.
 - Keep platform-specific shell logic in the matching `#[cfg(unix)]` or `#[cfg(windows)]` arm of `shell_init.rs`.
 - cwd passed to ConPTY must use backslashes; OSC 7 cwd arriving at the frontend is forward-slash canonical.

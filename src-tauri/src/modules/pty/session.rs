@@ -87,7 +87,7 @@ impl Session {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn queue_closed(&self) -> bool {
         self.output.is_closed()
     }
@@ -126,13 +126,43 @@ impl Session {
 
 // Serializes ConPTY create and close: overlapping pseudoconsole lifecycle
 // calls corrupt the new console so its shell never pumps output (issue #356).
+// Holders must not wait on anything that depends on the frontend: every
+// terminal opened or closed meanwhile waits behind them.
 #[cfg(windows)]
 static CONPTY_LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
 
+/// A panic inside a lifecycle call must not make every later terminal panic.
+#[cfg(any(windows, test))]
+fn lock_lifecycle(lock: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    lock.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub(super) fn drop_session(session: Arc<Session>) {
     #[cfg(windows)]
-    let _guard = CONPTY_LIFECYCLE_LOCK.lock().unwrap();
+    let _guard = lock_lifecycle(&CONPTY_LIFECYCLE_LOCK);
     drop(session);
+}
+
+/// What conhost can still hold when its console is closed is a final frame or
+/// two; a megabyte of headroom is far more than that.
+#[cfg(any(windows, test))]
+const CLOSE_OVERDRAFT: usize = 1024 * 1024;
+
+/// Runs `close`, the drop of the ConPTY handle, under the lifecycle lock.
+///
+/// Closing a pseudoconsole blocks until conhost has written everything it
+/// holds into the output pipe and the reader has taken it. A reader that is
+/// waiting for credit (the frontend has not caught up on a backlog) would keep
+/// `close`, and with it the lock that every `pty_open` needs, waiting for the
+/// frontend for as long as the 30 second drain deadline. So the reader is made
+/// unable to block on credit first, outside the lock; the lock then covers
+/// only the close, which was its purpose.
+#[cfg(any(windows, test))]
+fn close_pseudoconsole(output: &OutputQueue, lifecycle: &Mutex<()>, close: impl FnOnce()) {
+    output.allow_overdraft(CLOSE_OVERDRAFT);
+    let _guard = lock_lifecycle(lifecycle);
+    close();
 }
 
 struct ChildKillGuard {
@@ -220,7 +250,7 @@ pub(super) fn spawn_with(
     build_command: impl FnOnce() -> Result<CommandBuilder, String>,
 ) -> Result<Arc<Session>, String> {
     #[cfg(windows)]
-    let _spawn_guard = CONPTY_LIFECYCLE_LOCK.lock().unwrap();
+    let _spawn_guard = lock_lifecycle(&CONPTY_LIFECYCLE_LOCK);
 
     let Host {
         id,
@@ -415,8 +445,7 @@ pub(super) fn spawn_with(
             {
                 // Closing ConPTY can emit a final frame. Keep the reader alive until EOF.
                 let master = master_e.lock().unwrap().take();
-                let _guard = CONPTY_LIFECYCLE_LOCK.lock().unwrap();
-                drop(master);
+                close_pseudoconsole(&output_e, &CONPTY_LIFECYCLE_LOCK, move || drop(master));
             }
             if let Err(e) = reader_thread.join() {
                 log::error!("pty reader thread panicked: {e:?}");
@@ -496,7 +525,7 @@ mod tests {
             Self {
                 hub: hub.clone(),
                 label,
-                token: rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                token: rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(),
                 received: Vec::new(),
                 acked: 0,
                 exit: None,
@@ -746,5 +775,108 @@ mod tests {
         assert_eq!(frontend.exit, Some(0));
         reaped.recv_timeout(Duration::from_secs(5)).unwrap();
         drop_session(session);
+    }
+
+    /// A reader parked in `push` because the frontend has not caught up.
+    fn blocked_reader(
+        output: &Arc<OutputQueue>,
+    ) -> (thread::JoinHandle<()>, std_mpsc::Receiver<bool>) {
+        use crate::modules::pty::output::MAX_IN_FLIGHT_BYTES;
+        assert!(output.push(&vec![0; MAX_IN_FLIGHT_BYTES]));
+        let mut sent = Vec::new();
+        output
+            .take_into(&mut sent, usize::MAX, Instant::now())
+            .unwrap();
+        assert!(output.push(&vec![0; MAX_IN_FLIGHT_BYTES]));
+        let (done, pushed) = std_mpsc::channel();
+        let output = output.clone();
+        let reader = thread::spawn(move || {
+            done.send(output.push(&[1; 4096])).unwrap();
+        });
+        assert!(
+            pushed.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the reader must be waiting for credit"
+        );
+        (reader, pushed)
+    }
+
+    #[test]
+    fn closing_the_console_does_not_wait_for_the_frontend_while_holding_the_lifecycle_lock() {
+        let output = Arc::new(OutputQueue::new(None));
+        let (reader, pushed) = blocked_reader(&output);
+        let lifecycle = Arc::new(Mutex::new(()));
+        // Stands in for ClosePseudoConsole: it returns only once the reader has
+        // taken what conhost still holds. No acknowledgement ever arrives.
+        let (closed, closed_rx) = std_mpsc::channel();
+        let closer = {
+            let (output, lifecycle) = (output.clone(), lifecycle.clone());
+            thread::spawn(move || {
+                close_pseudoconsole(&output, &lifecycle, || {
+                    let drained = pushed.recv_timeout(Duration::from_secs(5)).is_ok();
+                    closed.send(drained).unwrap();
+                });
+            })
+        };
+        assert_eq!(
+            closed_rx.recv_timeout(Duration::from_secs(10)),
+            Ok(true),
+            "the close waited on a reader that was blocked on credit"
+        );
+        closer.join().unwrap();
+        reader.join().unwrap();
+        // The lock is free again right away for the next terminal.
+        let started = Instant::now();
+        drop(lock_lifecycle(&lifecycle));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_reader_is_released_before_the_lifecycle_lock_is_taken() {
+        let output = Arc::new(OutputQueue::new(None));
+        let (reader, pushed) = blocked_reader(&output);
+        let lifecycle = Arc::new(Mutex::new(()));
+        // Another terminal is mid-spawn and holds the lock.
+        let spawning = lock_lifecycle(&lifecycle);
+        let closer = {
+            let (output, lifecycle) = (output.clone(), lifecycle.clone());
+            thread::spawn(move || close_pseudoconsole(&output, &lifecycle, || {}))
+        };
+        assert_eq!(
+            pushed.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "the reader stays blocked while the closer queues for the lock"
+        );
+        assert!(!closer.is_finished(), "the close still waits its turn");
+        drop(spawning);
+        closer.join().unwrap();
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn the_close_runs_exactly_once_and_under_the_lock() {
+        let output = OutputQueue::new(None);
+        let lifecycle = Mutex::new(());
+        let mut ran = 0;
+        close_pseudoconsole(&output, &lifecycle, || {
+            ran += 1;
+            assert!(lifecycle.try_lock().is_err(), "the close holds the lock");
+        });
+        assert_eq!(ran, 1);
+        assert!(lifecycle.try_lock().is_ok(), "released afterwards");
+    }
+
+    #[test]
+    fn a_panic_during_a_close_does_not_poison_later_terminals() {
+        let output = OutputQueue::new(None);
+        let lifecycle = Mutex::new(());
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            close_pseudoconsole(&output, &lifecycle, || panic!("conhost vanished"));
+        }));
+        assert!(panicked.is_err());
+        assert!(lifecycle.is_poisoned());
+        let mut ran = false;
+        close_pseudoconsole(&output, &lifecycle, || ran = true);
+        assert!(ran);
+        drop(lock_lifecycle(&lifecycle));
     }
 }

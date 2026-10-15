@@ -33,6 +33,8 @@ export type Driver = {
     sessions: unknown[];
   }>;
   jsHub: () => unknown;
+  /** Admission checks of the stream scheme; the multiplexed transport only. */
+  probeGate?: () => Promise<Record<string, unknown>>;
   realFetch: typeof fetch;
 };
 
@@ -288,6 +290,9 @@ export async function run(driver: Driver, resumed: Record<string, unknown> | nul
   // page, the new page reaps the orphan and streams again.
   const orphan = await terminal(driver, 9);
   await until(() => orphan.bytes() > 0, 20_000, "orphan shell");
+  // 7. Requests the scheme must refuse without waking the hub. Last, because
+  // it reopens the stream and so ends this page's own.
+  if (driver.probeGate) out.gate = await driver.probeGate();
   out.totalSeconds = Number(((performance.now() - started) / 1000).toFixed(1));
   sessionStorage.setItem("pty-smoke", JSON.stringify(out));
   location.reload();

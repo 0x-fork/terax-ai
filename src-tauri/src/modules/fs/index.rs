@@ -5,7 +5,9 @@
 //! each query only ranks it. Entries go stale on watcher events, on our own
 //! mutations, and after a TTL. A changed entry is dropped on the spot and
 //! rebuilt lazily by the next query, so an idle app holds at most two bounded
-//! buffers and runs nothing.
+//! buffers and runs nothing. A change that lands while a cold walk is running
+//! has no entry to drop, so the walk is marked dirty instead: its result is
+//! returned to the query that asked for it but never cached.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -113,11 +115,54 @@ struct Slot {
     last_used: Instant,
 }
 
+/// A cold walk in progress. It is registered before the first directory is
+/// read, so every change reported after that point is seen by `note_change`.
+struct Walk {
+    id: u64,
+    event_prefix: String,
+    /// A change under the root was reported while walking: the listing may
+    /// already be out of date.
+    dirty: bool,
+}
+
+#[derive(Default)]
+struct Table {
+    slots: Vec<Slot>,
+    walks: Vec<Walk>,
+    next_walk: u64,
+}
+
 #[derive(Default)]
 struct Inner {
-    slots: Mutex<Vec<Slot>>,
+    table: Mutex<Table>,
     /// Serializes cold walks so concurrent queries for one root share a build.
     build: Mutex<()>,
+}
+
+/// Unregisters the walk when the build ends, however it ends (a panic in the
+/// walker must not leave a registration behind).
+struct WalkGuard<'a> {
+    inner: &'a Inner,
+    id: u64,
+}
+
+impl WalkGuard<'_> {
+    /// Whether a change was reported since the walk began.
+    fn dirty(&self) -> bool {
+        let table = self.inner.table.lock().unwrap_or_else(|e| e.into_inner());
+        table
+            .walks
+            .iter()
+            .find(|walk| walk.id == self.id)
+            .is_none_or(|walk| walk.dirty)
+    }
+}
+
+impl Drop for WalkGuard<'_> {
+    fn drop(&mut self) {
+        let mut table = self.inner.table.lock().unwrap_or_else(|e| e.into_inner());
+        table.walks.retain(|walk| walk.id != self.id);
+    }
 }
 
 #[derive(Clone, Default)]
@@ -130,6 +175,21 @@ fn event_prefix(root: &Path) -> String {
         prefix.push('/');
     }
     prefix
+}
+
+/// Whether a change at `path` (no trailing separator) can alter the index of
+/// the root behind `event_prefix`.
+fn covers(event_prefix: &str, path: &str) -> bool {
+    let root = event_prefix.trim_end_matches('/');
+    if path == root {
+        true
+    } else if let Some(rest) = path.strip_prefix(event_prefix) {
+        !is_pruned_relative(rest)
+    } else {
+        // A change to an ancestor (rename of a parent) also invalidates.
+        root.strip_prefix(path)
+            .is_some_and(|rest| rest.starts_with('/'))
+    }
 }
 
 /// Changes inside pruned directories never show up in an index, so they must
@@ -160,22 +220,40 @@ impl FileIndexState {
         if let Some(hit) = self.lookup(key, now) {
             return hit;
         }
+        let prefix = event_prefix(&key.root);
+        let walk = self.begin_walk(&prefix);
         let index = Arc::new(build());
-        self.insert(key, index.clone(), now);
+        if !walk.dirty() {
+            self.insert(key, prefix, index.clone(), now);
+        }
         index
     }
 
+    fn begin_walk(&self, event_prefix: &str) -> WalkGuard<'_> {
+        let mut table = self.0.table.lock().unwrap_or_else(|e| e.into_inner());
+        let id = table.next_walk;
+        table.next_walk += 1;
+        table.walks.push(Walk {
+            id,
+            event_prefix: event_prefix.to_string(),
+            dirty: false,
+        });
+        WalkGuard { inner: &self.0, id }
+    }
+
     fn lookup(&self, key: &IndexKey, now: Instant) -> Option<Arc<FileIndex>> {
-        let mut slots = self.0.slots.lock().unwrap_or_else(|e| e.into_inner());
-        slots.retain(|slot| now.saturating_duration_since(slot.built_at) < TTL);
-        let slot = slots.iter_mut().find(|slot| slot.key == *key)?;
+        let mut table = self.0.table.lock().unwrap_or_else(|e| e.into_inner());
+        table
+            .slots
+            .retain(|slot| now.saturating_duration_since(slot.built_at) < TTL);
+        let slot = table.slots.iter_mut().find(|slot| slot.key == *key)?;
         slot.last_used = now;
         Some(slot.index.clone())
     }
 
-    fn insert(&self, key: &IndexKey, index: Arc<FileIndex>, now: Instant) {
-        let prefix = event_prefix(&key.root);
-        let mut slots = self.0.slots.lock().unwrap_or_else(|e| e.into_inner());
+    fn insert(&self, key: &IndexKey, event_prefix: String, index: Arc<FileIndex>, now: Instant) {
+        let mut table = self.0.table.lock().unwrap_or_else(|e| e.into_inner());
+        let slots = &mut table.slots;
         slots.retain(|slot| slot.key != *key);
         while slots.len() >= MAX_SLOTS {
             let oldest = slots
@@ -188,7 +266,7 @@ impl FileIndexState {
         }
         slots.push(Slot {
             key: key.clone(),
-            event_prefix: prefix,
+            event_prefix,
             index,
             built_at: now,
             last_used: now,
@@ -196,39 +274,37 @@ impl FileIndexState {
     }
 
     /// A filesystem change at `path` (an event path or a directory we mutated).
-    /// Frees the matching buffers immediately; the next query rebuilds.
+    /// Frees the matching buffers immediately and marks any walk under way as
+    /// stale; the next query rebuilds. Runs even with nothing cached: a cold
+    /// walk is exactly when a change has no entry to drop.
     pub fn note_change(&self, path: &str) {
         let path = path.trim_end_matches('/');
-        let mut slots = self.0.slots.lock().unwrap_or_else(|e| e.into_inner());
-        if slots.is_empty() {
-            return;
+        let mut table = self.0.table.lock().unwrap_or_else(|e| e.into_inner());
+        for walk in &mut table.walks {
+            if covers(&walk.event_prefix, path) {
+                walk.dirty = true;
+            }
         }
-        slots.retain(|slot| {
-            let root = slot.event_prefix.trim_end_matches('/');
-            let covered = if path == root {
-                true
-            } else if let Some(rest) = path.strip_prefix(&slot.event_prefix) {
-                !is_pruned_relative(rest)
-            } else {
-                // A change to an ancestor (rename of a parent) also invalidates.
-                root.strip_prefix(path)
-                    .is_some_and(|rest| rest.starts_with('/'))
-            };
-            !covered
-        });
+        table.slots.retain(|slot| !covers(&slot.event_prefix, path));
     }
 
     #[cfg(test)]
     fn slot_count(&self) -> usize {
-        self.0.slots.lock().unwrap().len()
+        self.0.table.lock().unwrap().slots.len()
+    }
+
+    #[cfg(test)]
+    fn walks_in_flight(&self) -> usize {
+        self.0.table.lock().unwrap().walks.len()
     }
 
     #[cfg(test)]
     fn cached_bytes(&self) -> usize {
         self.0
-            .slots
+            .table
             .lock()
             .unwrap()
+            .slots
             .iter()
             .map(|slot| slot.index.entries.heap_bytes())
             .sum()
@@ -446,8 +522,85 @@ mod tests {
         }
         assert_eq!(state.slot_count(), MAX_SLOTS);
         assert!(state.cached_bytes() < 64 * 1024);
-        let slots = state.0.slots.lock().unwrap();
-        assert!(slots.iter().all(|slot| slot.key.root != dirs[0].path()));
+        let table = state.0.table.lock().unwrap();
+        assert!(table
+            .slots
+            .iter()
+            .all(|slot| slot.key.root != dirs[0].path()));
+    }
+
+    #[test]
+    fn a_change_during_a_cold_walk_is_returned_but_never_cached() {
+        let dir = tree();
+        let state = FileIndexState::default();
+        let k = key(dir.path());
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let builds = AtomicUsize::new(0);
+        let now = Instant::now();
+        let first = state.get_or_build_with(&k, now, || {
+            builds.fetch_add(1, Ordering::SeqCst);
+            let listing = build_index(&k);
+            // Created after the walker passed this directory, reported before
+            // the walk returns: the listing above does not have it.
+            std::fs::write(dir.path().join("src/late.rs"), "").unwrap();
+            state.note_change(&to_canon(canonical.join("src/late.rs")));
+            listing
+        });
+        assert!(first.entries.iter().all(|(rel, _)| rel != "src/late.rs"));
+        assert_eq!(state.slot_count(), 0, "a stale listing must not be cached");
+        assert_eq!(state.walks_in_flight(), 0);
+
+        let second = state.get_or_build_with(&k, now, || {
+            builds.fetch_add(1, Ordering::SeqCst);
+            build_index(&k)
+        });
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        assert!(second.entries.iter().any(|(rel, _)| rel == "src/late.rs"));
+        assert_eq!(state.slot_count(), 1, "a clean walk is cached");
+    }
+
+    #[test]
+    fn only_changes_that_can_alter_the_walked_root_taint_it() {
+        let dir = tree();
+        let state = FileIndexState::default();
+        let k = key(dir.path());
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let now = Instant::now();
+        state.get_or_build_with(&k, now, || {
+            state.note_change("/somewhere/else");
+            state.note_change(&to_canon(canonical.join("node_modules/pkg")));
+            state.note_change(&to_canon(canonical.join("target/debug")));
+            build_index(&k)
+        });
+        assert_eq!(state.slot_count(), 1);
+
+        for path in [
+            to_canon(&canonical),
+            to_canon(canonical.join("src/new.rs")),
+            to_canon(canonical.parent().unwrap()),
+        ] {
+            let state = FileIndexState::default();
+            state.get_or_build_with(&k, now, || {
+                state.note_change(&path);
+                build_index(&k)
+            });
+            assert_eq!(state.slot_count(), 0, "{path} must taint the walk");
+        }
+    }
+
+    #[test]
+    fn a_walk_that_panics_leaves_no_registration_behind() {
+        let dir = tree();
+        let state = FileIndexState::default();
+        let k = key(dir.path());
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.get_or_build_with(&k, Instant::now(), || panic!("walker failed"));
+        }));
+        assert!(attempt.is_err());
+        assert_eq!(state.walks_in_flight(), 0);
+        assert_eq!(state.slot_count(), 0);
+        state.get_or_build_with(&k, Instant::now(), || build_index(&k));
+        assert_eq!(state.slot_count(), 1);
     }
 
     #[test]

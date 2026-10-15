@@ -350,6 +350,28 @@ fn trim_separator(path: &[u8]) -> &[u8] {
     }
 }
 
+/// Most event ids a rebuilt stream replays. Ids count every change on the
+/// volume, so a stream over a quiet tree can sit on an id from hours ago; the
+/// window that could have lost a change is the last delivery interval (a
+/// fraction of a second), far inside this, while an unbounded replay would
+/// make the system walk its whole history for any root added since.
+const MAX_REPLAY_IDS: u64 = 100_000;
+
+/// The event id a new FSEvents stream starts after. `previous` is the last id
+/// the stream it replaces delivered, if there was one, and `current` is the
+/// system's newest id. A usable previous id is resumed from, within
+/// `MAX_REPLAY_IDS` of `current`, so no change is missed during the swap;
+/// anything else starts at `current`: no predecessor, an id of zero (which
+/// would replay all history), or one the system has not reached (a "since now"
+/// sentinel, or ids that restarted).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn resume_after(previous: Option<u64>, current: u64) -> u64 {
+    match previous {
+        Some(id) if id != 0 && id <= current => id.max(current.saturating_sub(MAX_REPLAY_IDS)),
+        _ => current,
+    }
+}
+
 /// Reduces one FSEvents callback to watched directories. `on_path` sees every
 /// distinct consecutive path (watched or not) without allocation, which is how
 /// the file-list cache learns about changes under non-watched directories.
@@ -571,6 +593,35 @@ mod tests {
             assert_eq!(batch.subtrees, vec!["/w/proj", "/w/proj"], "flag {flag:#x}");
             assert!(batch.dirs.is_empty());
         }
+    }
+
+    #[test]
+    fn a_rebuilt_stream_resumes_after_the_last_delivered_event() {
+        assert_eq!(resume_after(Some(500), 900), 500);
+        assert_eq!(resume_after(Some(900), 900), 900);
+        // Nothing to resume from: start at the present, never at the beginning.
+        assert_eq!(resume_after(None, 900), 900);
+        assert_eq!(resume_after(Some(0), 900), 900);
+        // A "since now" sentinel, or ids the system has not reached.
+        assert_eq!(resume_after(Some(u64::MAX), 900), 900);
+        assert_eq!(resume_after(Some(901), 900), 900);
+    }
+
+    #[test]
+    fn a_stale_resume_point_is_clamped_so_history_is_not_replayed_wholesale() {
+        let current = 5_000_000;
+        assert_eq!(
+            resume_after(Some(current - MAX_REPLAY_IDS), current),
+            current - MAX_REPLAY_IDS
+        );
+        assert_eq!(
+            resume_after(Some(current - MAX_REPLAY_IDS - 1), current),
+            current - MAX_REPLAY_IDS
+        );
+        assert_eq!(resume_after(Some(1), current), current - MAX_REPLAY_IDS);
+        // Near the start of the id space the clamp cannot go below zero.
+        assert_eq!(resume_after(Some(7), 50), 7);
+        assert_eq!(resume_after(Some(7), MAX_REPLAY_IDS + 7), 7);
     }
 
     #[test]

@@ -15,9 +15,15 @@ export type PtyPresentationClass =
 
 type Leaf = { visible: boolean; focused: boolean; pty: number | null };
 
+/**
+ * `seq` grows with every request. Native runs commands on several threads, so
+ * two reports can be applied out of order; a terminal keeps the class of the
+ * highest `seq` that named it.
+ */
 type Send = (
   ids: number[],
   presentation: PtyPresentationClass,
+  seq: number,
 ) => Promise<unknown>;
 
 export class PtyPresentationReporter {
@@ -27,6 +33,7 @@ export class PtyPresentationReporter {
   private scheduled = false;
   private stopWatching: (() => void) | null = null;
   private requests = 0;
+  private seq = 0;
 
   constructor(
     private readonly send: Send,
@@ -125,7 +132,7 @@ export class PtyPresentationReporter {
     }
     for (const [presentation, ids] of batches) {
       this.requests++;
-      this.send(ids, presentation).catch((error: unknown) => {
+      this.send(ids, presentation, ++this.seq).catch((error: unknown) => {
         // The cadence is an optimisation: forget the claim so the next change
         // re-sends, but never surface an error for it.
         for (const id of ids)
@@ -151,8 +158,8 @@ function watchDocument(listener: () => void): () => void {
 let reporter: PtyPresentationReporter | null = null;
 
 function instance(): PtyPresentationReporter {
-  reporter ??= new PtyPresentationReporter((ids, presentation) =>
-    invoke("pty_set_presentation", { ids, class: presentation }),
+  reporter ??= new PtyPresentationReporter((ids, presentation, seq) =>
+    invoke("pty_set_presentation", { ids, class: presentation, seq }),
   );
   return reporter;
 }

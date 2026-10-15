@@ -9,7 +9,9 @@
 //! top-level directories at the source, and filters every event with a single
 //! hash lookup. Callbacks run on a private dispatch queue, so no thread exists
 //! while nothing is watched and the stream is only rebuilt when the covering
-//! roots or exclusions change.
+//! roots or exclusions change. A rebuild resumes from the old stream's last
+//! delivered event id, so changes that landed while it was being replaced are
+//! replayed instead of lost.
 
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::Path;
@@ -27,6 +29,7 @@ extern "C" {
     fn dispatch_queue_create(label: *const c_char, attr: *const c_void) -> *mut c_void;
     fn dispatch_release(object: *mut c_void);
     fn FSEventStreamSetDispatchQueue(stream: fs::FSEventStreamRef, queue: *mut c_void);
+    fn FSEventsGetCurrentEventId() -> fs::FSEventStreamEventId;
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -77,7 +80,23 @@ struct Stream {
 unsafe impl Send for Stream {}
 
 impl Stream {
-    fn start(spec: &StreamSpec, queue: *mut c_void, context: CallbackContext) -> Option<Self> {
+    /// The id of the newest event this stream has delivered, or the id it was
+    /// told to start after if it has delivered none. A stream asked to start
+    /// "since now" reports a sentinel until its first event, which is why
+    /// every stream is given an explicit starting id.
+    fn latest_event_id(&self) -> fs::FSEventStreamEventId {
+        unsafe { fs::FSEventStreamGetLatestEventId(self.raw) }
+    }
+
+    /// Delivers events with an id greater than `since`: live ones, and any
+    /// the system still holds from before this stream existed (followed by a
+    /// history-done marker that the reducer ignores).
+    fn start(
+        spec: &StreamSpec,
+        queue: *mut c_void,
+        context: CallbackContext,
+        since: fs::FSEventStreamEventId,
+    ) -> Option<Self> {
         let context = Box::into_raw(Box::new(context));
         let free_context = || release_context(context as *const c_void);
         unsafe {
@@ -98,7 +117,7 @@ impl Stream {
                 callback,
                 &stream_context,
                 paths,
-                fs::kFSEventStreamEventIdSinceNow,
+                since,
                 LATENCY_SECONDS,
                 // Directory-level events only: no FileEvents, no NoDefer.
                 fs::kFSEventStreamCreateFlagNone,
@@ -170,6 +189,9 @@ pub struct FsEvents {
     sink: Sink,
     spec: Option<StreamSpec>,
     stream: Option<Stream>,
+    /// Last event id the previous stream delivered, kept until a replacement
+    /// starts so a failed start does not widen the gap.
+    resume_from: Option<fs::FSEventStreamEventId>,
 }
 
 // `queue` is an immutable libdispatch handle owned by this backend.
@@ -187,6 +209,7 @@ impl FsEvents {
             sink,
             spec: None,
             stream: None,
+            resume_from: None,
         })
     }
 }
@@ -213,21 +236,35 @@ impl Backend for FsEvents {
             return;
         }
         // Drop the old stream before creating the next so no two streams ever
-        // deliver the same change.
-        self.stream = None;
+        // deliver the same change. Its last delivered id is read first: the
+        // replacement starts after it, so what changed while the swap was in
+        // progress (including events still inside the latency window) is
+        // replayed rather than lost.
+        if let Some(old) = self.stream.take() {
+            self.resume_from = Some(old.latest_event_id());
+        }
+        if wanted.is_none() {
+            self.resume_from = None;
+        }
         self.stream = wanted.as_ref().and_then(|spec| {
+            let since =
+                plan::resume_after(self.resume_from, unsafe { FSEventsGetCurrentEventId() });
             let stream = Stream::start(
                 spec,
                 self.queue,
                 CallbackContext {
                     sink: self.sink.clone(),
                 },
+                since,
             );
             if stream.is_none() {
                 log::warn!("fsevents: could not start a stream for {:?}", spec.roots);
             }
             stream
         });
+        if self.stream.is_some() {
+            self.resume_from = None;
+        }
         // A failed start leaves the spec unset so the next change retries.
         self.spec = wanted.filter(|_| self.stream.is_some());
     }
@@ -266,11 +303,15 @@ mod tests {
             }
         }
 
-        fn watch(&mut self, dir: &Path) {
+        fn watch_unsettled(&mut self, dir: &Path) {
             let canonical = std::fs::canonicalize(dir).unwrap();
             self.set.add_dir(to_canon(&canonical), canonical);
             *self.sink.dirs.write().unwrap() = Arc::new(self.set.snapshot());
             self.backend.sync(&self.set);
+        }
+
+        fn watch(&mut self, dir: &Path) {
+            self.watch_unsettled(dir);
             // FSEvents attaches asynchronously; let the stream become live.
             std::thread::sleep(Duration::from_millis(300));
         }
@@ -383,6 +424,73 @@ mod tests {
             fx.backend.spec.as_ref().map(|s| s.roots.clone()),
             Some(vec![canon(&root.path().join("a"))])
         );
+    }
+
+    #[test]
+    fn a_change_landing_while_the_stream_is_replaced_is_still_reported() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("a")).unwrap();
+        std::fs::create_dir_all(root.path().join("b")).unwrap();
+        let mut fx = Fixture::new();
+        fx.watch(&root.path().join("a"));
+        fx.drain(Duration::from_millis(300));
+
+        // The write is still inside FSEvents' coalescing window when the
+        // stream is torn down for a new root; a stream that started "now"
+        // would never hear of it.
+        std::fs::write(root.path().join("a/during.txt"), "x").unwrap();
+        // Long enough for the system to number the event, far short of the
+        // latency that would deliver it.
+        std::thread::sleep(Duration::from_millis(30));
+        fx.watch_unsettled(&root.path().join("b"));
+        assert_ne!(fx.backend.stream.as_ref().map(|s| s.raw as usize), None);
+        let reported = fx.drain(Duration::from_millis(1500));
+        assert!(
+            reported.contains(&canon(&root.path().join("a"))),
+            "lost the change: {reported:?}"
+        );
+
+        // The replacement is an ordinary live stream afterwards.
+        std::fs::write(root.path().join("b/after.txt"), "x").unwrap();
+        assert!(fx
+            .drain(Duration::from_millis(900))
+            .contains(&canon(&root.path().join("b"))));
+    }
+
+    #[test]
+    fn every_stream_reports_a_usable_resume_point() {
+        let root = tempfile::tempdir().unwrap();
+        let mut fx = Fixture::new();
+        let before = unsafe { FSEventsGetCurrentEventId() };
+        fx.watch(root.path());
+        let latest = fx.backend.stream.as_ref().unwrap().latest_event_id();
+        assert_ne!(latest, fs::kFSEventStreamEventIdSinceNow, "no sentinel");
+        assert!(latest >= before && latest <= unsafe { FSEventsGetCurrentEventId() });
+        std::fs::write(root.path().join("a.txt"), "x").unwrap();
+        fx.drain(Duration::from_millis(600));
+        assert!(fx.backend.stream.as_ref().unwrap().latest_event_id() > latest);
+    }
+
+    #[test]
+    fn a_resume_point_survives_a_failed_start_and_is_dropped_when_nothing_is_watched() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("a")).unwrap();
+        let mut fx = Fixture::new();
+        fx.watch(&root.path().join("a"));
+        let latest = fx.backend.stream.as_ref().unwrap().latest_event_id();
+        // Replacing the stream remembers where the old one stopped...
+        fx.backend.stream = None;
+        fx.backend.resume_from = Some(latest);
+        fx.backend.spec = None;
+        fx.backend.sync(&fx.set);
+        assert!(fx.backend.stream.is_some());
+        assert_eq!(fx.backend.resume_from, None, "consumed by a running stream");
+        // ...and unwatching everything forgets it: there is no gap to cover.
+        fx.set.remove_dir(&canon(&root.path().join("a")));
+        fx.backend.resume_from = Some(latest);
+        fx.backend.sync(&fx.set);
+        assert!(fx.backend.stream.is_none());
+        assert_eq!(fx.backend.resume_from, None);
     }
 
     #[test]

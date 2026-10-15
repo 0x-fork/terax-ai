@@ -11,9 +11,11 @@ use tauri::ipc::{InvokeBody, JavaScriptChannelId, Request, Response};
 use tauri::{State, WebviewWindow};
 
 mod clients;
+mod ip;
 mod stream;
 use super::ipc_body;
 use clients::{client_for, Profile};
+use ip::{ip_kind, IpKind};
 pub use stream::AiStreamState;
 
 const HEADER_BLOCKLIST: &[&str] = &[
@@ -35,58 +37,6 @@ fn is_blocked_host_name(host: &str) -> bool {
         host.as_str(),
         "metadata.google.internal" | "metadata" | "metadata.azure.com"
     )
-}
-
-fn ip_kind(ip: IpAddr) -> IpKind {
-    match ip {
-        IpAddr::V4(v) => {
-            let o = v.octets();
-            // Cloud metadata IPv4: 169.254.169.254
-            if v.is_link_local() {
-                return IpKind::BlockedMetadata;
-            }
-            if v.is_loopback() || v.is_unspecified() || v.is_broadcast() || v.is_multicast() {
-                return IpKind::Loopback;
-            }
-            // RFC1918 + CGNAT + benchmarking + IETF
-            if o[0] == 10
-                || (o[0] == 172 && (16..=31).contains(&o[1]))
-                || (o[0] == 192 && o[1] == 168)
-                || (o[0] == 100 && (64..=127).contains(&o[1]))
-                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
-            {
-                return IpKind::Private;
-            }
-            IpKind::Public
-        }
-        IpAddr::V6(v) => {
-            if v.is_loopback() || v.is_unspecified() || v.is_multicast() {
-                return IpKind::Loopback;
-            }
-            // Cloud metadata IPv6 (AWS): fd00:ec2::254
-            let segs = v.segments();
-            if segs[0] == 0xfd00 && segs[1] == 0xec2 {
-                return IpKind::BlockedMetadata;
-            }
-            // fe80::/10 link-local
-            if segs[0] & 0xffc0 == 0xfe80 {
-                return IpKind::BlockedMetadata;
-            }
-            // fc00::/7 unique-local (private)
-            if segs[0] & 0xfe00 == 0xfc00 {
-                return IpKind::Private;
-            }
-            IpKind::Public
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum IpKind {
-    Public,
-    Private,
-    Loopback,
-    BlockedMetadata,
 }
 
 /// Resolve `host` once and return both its safety classification and the
@@ -642,6 +592,36 @@ mod tests {
         assert_eq!(ips, vec!["::1".parse::<IpAddr>().unwrap()]);
         let (kind, _) = rt
             .block_on(resolve_and_classify("[2606:4700::1111]"))
+            .unwrap();
+        assert_eq!(kind, IpKind::Public);
+    }
+
+    #[test]
+    fn embedded_ipv4_literals_cannot_smuggle_internal_hosts_past_the_guard() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for (host, kind) in [
+            ("[::ffff:127.0.0.1]", IpKind::Loopback),
+            ("[::ffff:169.254.169.254]", IpKind::BlockedMetadata),
+            ("[::ffff:10.0.0.1]", IpKind::Private),
+            ("[64:ff9b::7f00:1]", IpKind::Loopback),
+            ("[2002:7f00:1::]", IpKind::Loopback),
+            ("[::127.0.0.1]", IpKind::Loopback),
+        ] {
+            let (found, _) = rt.block_on(resolve_and_classify(host)).unwrap();
+            assert_eq!(found, kind, "{host}");
+            let refused = rt.block_on(classify_and_collect_safe_ips(host, false));
+            assert!(refused.is_err(), "{host} must need explicit opt-in");
+            let opted_in = rt.block_on(classify_and_collect_safe_ips(host, true));
+            assert_eq!(
+                opted_in.is_err(),
+                kind == IpKind::BlockedMetadata,
+                "{host}: metadata stays blocked even with opt-in"
+            );
+        }
+        let (kind, _) = rt
+            .block_on(resolve_and_classify("[::ffff:8.8.8.8]"))
             .unwrap();
         assert_eq!(kind, IpKind::Public);
     }

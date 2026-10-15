@@ -1,6 +1,7 @@
 mod agent_detect;
 mod da_filter;
 mod foreground;
+mod gate;
 mod hub;
 mod output;
 mod presentation;
@@ -15,7 +16,7 @@ mod wire;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::thread;
 
 use portable_pty::PtySize;
@@ -38,6 +39,8 @@ pub struct PtyState {
     // sometimes treats as "unset". Increments monotonically; never reused.
     next_id: AtomicU32,
     hub: Hub,
+    /// Resolved from the app's config on the first `terax-pty` request.
+    origins: OnceLock<gate::AllowedOrigins>,
 }
 
 impl Default for PtyState {
@@ -46,6 +49,7 @@ impl Default for PtyState {
             sessions: RwLock::new(HashMap::new()),
             next_id: AtomicU32::new(1),
             hub: Hub::new(),
+            origins: OnceLock::new(),
         }
     }
 }
@@ -381,24 +385,38 @@ pub async fn pty_stream_open(
     });
     let token = token
         .await
-        .map_err(|_| "PTY stream is unavailable".to_string())?;
+        .map_err(|_| "PTY stream is unavailable".to_string())?
+        .map_err(|reason| {
+            log::error!("pty_stream_open refused: {reason}");
+            reason.to_string()
+        })?;
     Ok(format!("{token:016x}"))
 }
 
 /// Reports which presentation class terminals are in. Called only when a
 /// class changes; unknown ids are ignored (the terminal may have just closed).
+///
+/// This stays `async`, off the main thread, but async commands run on a
+/// multi-threaded runtime and two reports can be applied in either order.
+/// `seq` is the page's counter of reports (it only grows): a terminal ignores
+/// any report not newer than the last one that named it, so the final class
+/// is always the latest one sent. Making the command synchronous would order
+/// arrivals only if the webview delivered separate requests in order, and
+/// would put every report on the main thread for nothing.
 #[tauri::command]
 pub async fn pty_set_presentation(
     webview: tauri::Webview,
     state: tauri::State<'_, PtyState>,
     ids: Vec<u32>,
     class: PresentationClass,
+    seq: u64,
 ) -> Result<(), String> {
     check_presentation_batch(&ids)?;
     state.hub.submit(Command::SetPresentation {
         label: Arc::from(webview.label()),
         ids,
         class,
+        seq,
     });
     Ok(())
 }

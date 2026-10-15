@@ -409,6 +409,58 @@ mod tests {
     }
 
     #[test]
+    fn redirects_to_internal_addresses_hidden_in_ipv6_are_stopped() {
+        let from = url("https://api.example.com/");
+        for target in [
+            "http://[::ffff:127.0.0.1]/",
+            "http://[::ffff:10.0.0.1]/",
+            "http://[::ffff:192.168.0.1]/",
+            "http://[::ffff:169.254.169.254]/latest/meta-data",
+            "http://[::127.0.0.1]/",
+            "http://[64:ff9b::7f00:1]/",
+            "http://[2002:7f00:1::]/",
+            "http://[fe80::1]/",
+            "http://[fc00::1]/",
+            "http://[fd12:3456::1]/",
+            "http://[fec0::1]/",
+            "http://[ff02::1]/",
+            "http://[::]/",
+        ] {
+            assert_eq!(
+                redirect_decision(&url(target), Some(&from), 1, false),
+                RedirectDecision::Stop,
+                "{target}"
+            );
+        }
+        for target in [
+            "http://[::ffff:169.254.169.254]/",
+            "http://[64:ff9b::a9fe:a9fe]/",
+            "http://[2002:a9fe:a9fe::]/",
+            "http://[fe80::1]/",
+        ] {
+            assert_eq!(
+                redirect_decision(&url(target), Some(&from), 1, true),
+                RedirectDecision::Stop,
+                "{target} is metadata even with private access"
+            );
+        }
+        for target in [
+            "http://[::ffff:127.0.0.1]:11434/",
+            "http://[::ffff:10.0.0.1]/",
+        ] {
+            assert_eq!(
+                redirect_decision(&url(target), Some(&from), 1, true),
+                RedirectDecision::Follow,
+                "{target}"
+            );
+        }
+        assert_eq!(
+            redirect_decision(&url("https://[::ffff:8.8.8.8]/"), Some(&from), 1, false),
+            RedirectDecision::Follow
+        );
+    }
+
+    #[test]
     fn redirect_chains_are_bounded() {
         let u = url("https://api.example.com/");
         assert_eq!(

@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use super::gate::StreamTokens;
 use super::output::MAX_IN_FLIGHT_BYTES;
 #[cfg(test)]
 use super::presentation::IMMEDIATE_BYTES;
@@ -55,10 +56,12 @@ pub(super) enum Endpoint {
 
 pub(super) enum Command {
     /// A page (re)attaches: new token, previous held poll released, and every
-    /// PTY of the webview detached until the new page acknowledges it.
+    /// PTY of the webview detached until the new page acknowledges it. When no
+    /// unguessable token can be made the stream stays closed and the reply
+    /// carries why.
     OpenStream {
         label: Arc<str>,
-        reply: Box<dyn FnOnce(u64) + Send>,
+        reply: Box<dyn FnOnce(Result<u64, &'static str>) + Send>,
     },
     /// The page navigated away. Its token dies with it.
     ResetWebview {
@@ -76,10 +79,14 @@ pub(super) enum Command {
     Unregister {
         id: u32,
     },
+    /// `seq` is the frontend's counter for presentation reports. Commands run
+    /// on a multi-threaded runtime and can arrive out of order, so each
+    /// terminal keeps the class of the newest report that named it.
     SetPresentation {
         label: Arc<str>,
         ids: Vec<u32>,
         class: PresentationClass,
+        seq: u64,
     },
     WindowHidden {
         label: Arc<str>,
@@ -136,18 +143,18 @@ impl HubStats {
 #[derive(Serialize, Clone, Copy, Debug)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct HubDiagnostics {
-    wakeups: u64,
-    polls: u64,
-    ack_requests: u64,
-    rejected_requests: u64,
-    responses: u64,
-    keepalives: u64,
-    data_frames: u64,
-    data_bytes: u64,
-    sync_frames: u64,
-    exit_frames: u64,
-    failed_frames: u64,
-    unknown_acks: u64,
+    pub(super) wakeups: u64,
+    pub(super) polls: u64,
+    pub(super) ack_requests: u64,
+    pub(super) rejected_requests: u64,
+    pub(super) responses: u64,
+    pub(super) keepalives: u64,
+    pub(super) data_frames: u64,
+    pub(super) data_bytes: u64,
+    pub(super) sync_frames: u64,
+    pub(super) exit_frames: u64,
+    pub(super) failed_frames: u64,
+    pub(super) unknown_acks: u64,
 }
 
 struct Held {
@@ -168,6 +175,8 @@ struct Entry {
     label: Arc<str>,
     queue: Arc<OutputQueue>,
     reported: PresentationClass,
+    /// Sequence number of the report behind `reported`; 0 until one arrives.
+    reported_seq: u64,
     /// The frontend registered a receiver for this PTY on the current stream.
     attached: bool,
     /// A protocol violation to report once as a `failed` frame.
@@ -179,19 +188,26 @@ struct Entry {
     nudged: Option<(u64, u64)>,
 }
 
+pub(super) type TokenSource = Box<dyn FnMut() -> Result<u64, &'static str> + Send>;
+
 pub(super) struct HubCore {
     streams: HashMap<Arc<str>, Stream>,
     entries: HashMap<u32, Entry>,
-    next_token: Box<dyn FnMut() -> u64 + Send>,
+    next_token: TokenSource,
+    /// Mirror of every stream's token for the request handler, which rejects
+    /// bad tokens without waking this thread. Updated before the page learns
+    /// a token and as soon as one dies.
+    tokens: Arc<StreamTokens>,
     stats: Arc<HubStats>,
 }
 
 impl HubCore {
-    pub fn new(next_token: Box<dyn FnMut() -> u64 + Send>, stats: Arc<HubStats>) -> Self {
+    pub fn new(next_token: TokenSource, tokens: Arc<StreamTokens>, stats: Arc<HubStats>) -> Self {
         Self {
             streams: HashMap::new(),
             entries: HashMap::new(),
             next_token,
+            tokens,
             stats,
         }
     }
@@ -199,12 +215,19 @@ impl HubCore {
     pub fn apply(&mut self, command: Command, now: Instant) {
         match command {
             Command::OpenStream { label, reply } => {
-                let token = (self.next_token)();
+                let token = match (self.next_token)() {
+                    Ok(token) => token,
+                    Err(reason) => {
+                        reply(Err(reason));
+                        return;
+                    }
+                };
                 let stream = self.streams.entry(label.clone()).or_default();
                 release(stream.held.take(), STATUS_SUPERSEDED);
                 stream.token = Some(token);
+                self.tokens.publish(&label, token);
                 self.detach(&label);
-                reply(token);
+                reply(Ok(token));
             }
             Command::ResetWebview { label } => self.reset(&label),
             Command::RemoveWebview { label } => {
@@ -224,6 +247,7 @@ impl HubCore {
                         label,
                         queue,
                         reported: class,
+                        reported_seq: 0,
                         attached: false,
                         failure: None,
                         failed: false,
@@ -243,10 +267,18 @@ impl HubCore {
                     release(stream.held.take(), STATUS_OK);
                 }
             }
-            Command::SetPresentation { label, ids, class } => {
+            Command::SetPresentation {
+                label,
+                ids,
+                class,
+                seq,
+            } => {
                 for id in ids {
                     if let Some(entry) = self.entries.get_mut(&id).filter(|e| e.label == label) {
-                        entry.reported = class;
+                        if seq > entry.reported_seq {
+                            entry.reported = class;
+                            entry.reported_seq = seq;
+                        }
                     }
                 }
             }
@@ -263,6 +295,7 @@ impl HubCore {
     }
 
     fn reset(&mut self, label: &Arc<str>) {
+        self.tokens.revoke(label);
         if let Some(stream) = self.streams.get_mut(label) {
             stream.token = None;
             release(stream.held.take(), STATUS_GONE);
@@ -542,6 +575,7 @@ struct Shared {
     wake: Arc<Wake>,
     started: Once,
     stats: Arc<HubStats>,
+    tokens: Arc<StreamTokens>,
 }
 
 /// Cheap, cloneable handle to the process-wide hub thread. The thread starts
@@ -565,8 +599,18 @@ impl Hub {
                 wake: Arc::new(Wake::default()),
                 started: Once::new(),
                 stats: Arc::new(HubStats::default()),
+                tokens: Arc::new(StreamTokens::default()),
             }),
         }
+    }
+
+    pub(super) fn tokens(&self) -> &StreamTokens {
+        &self.shared.tokens
+    }
+
+    #[cfg(test)]
+    pub(super) fn started(&self) -> bool {
+        self.shared.started.is_completed()
     }
 
     pub(super) fn wake(&self) -> Arc<Wake> {
@@ -595,27 +639,35 @@ impl Hub {
     }
 }
 
-fn os_token() -> u64 {
-    loop {
+const TOKEN_UNAVAILABLE: &str =
+    "the operating system could not supply random bytes, so the PTY stream cannot be opened securely";
+
+/// An unguessable non-zero token from the given entropy source. There is no
+/// fallback: a token derived from the clock could be predicted by another
+/// frame, so failing to get randomness refuses the stream.
+fn random_token<E>(mut fill: impl FnMut(&mut [u8]) -> Result<(), E>) -> Result<u64, &'static str> {
+    // A zero token is only ever a bug (the wire's "no token"), 2^-64 per draw.
+    for _ in 0..4 {
         let mut bytes = [0u8; 8];
-        if getrandom::fill(&mut bytes).is_err() {
-            // Without OS randomness fall back to time, which still differs
-            // across page loads; the token only has to be unguessable to
-            // other origins, and they cannot read the process clock either.
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(1, |d| d.as_nanos() as u64);
-            bytes = nanos.to_le_bytes();
-        }
+        fill(&mut bytes).map_err(|_| TOKEN_UNAVAILABLE)?;
         let token = u64::from_le_bytes(bytes);
         if token != 0 {
-            return token;
+            return Ok(token);
         }
     }
+    Err(TOKEN_UNAVAILABLE)
+}
+
+fn os_token() -> Result<u64, &'static str> {
+    random_token(getrandom::fill)
 }
 
 fn run(shared: Arc<Shared>) {
-    let mut core = HubCore::new(Box::new(os_token), shared.stats.clone());
+    let mut core = HubCore::new(
+        Box::new(os_token),
+        shared.tokens.clone(),
+        shared.stats.clone(),
+    );
     loop {
         let commands =
             std::mem::take(&mut *shared.inbox.lock().unwrap_or_else(PoisonError::into_inner));
@@ -650,6 +702,7 @@ mod tests {
 
     struct Harness {
         core: HubCore,
+        tokens: Arc<StreamTokens>,
         now: Instant,
         replies: Captured,
     }
@@ -659,15 +712,18 @@ mod tests {
     impl Harness {
         fn new() -> Self {
             let source = Arc::new(Mutex::new(1000u64));
+            Self::with_source(Box::new(move || {
+                let mut next = source.lock().unwrap();
+                *next += 1;
+                Ok(*next)
+            }))
+        }
+
+        fn with_source(source: TokenSource) -> Self {
+            let tokens = Arc::new(StreamTokens::default());
             Self {
-                core: HubCore::new(
-                    Box::new(move || {
-                        let mut next = source.lock().unwrap();
-                        *next += 1;
-                        *next
-                    }),
-                    Arc::new(HubStats::default()),
-                ),
+                core: HubCore::new(source, tokens.clone(), Arc::new(HubStats::default())),
+                tokens,
                 now: Instant::now(),
                 replies: Arc::new(Mutex::new(Vec::new())),
             }
@@ -677,7 +733,7 @@ mod tests {
             Arc::from(LABEL)
         }
 
-        fn open(&mut self) -> u64 {
+        fn try_open(&mut self) -> Result<u64, &'static str> {
             let (tx, rx) = mpsc::channel();
             self.core.apply(
                 Command::OpenStream {
@@ -688,6 +744,10 @@ mod tests {
             );
             self.step();
             rx.recv().unwrap()
+        }
+
+        fn open(&mut self) -> u64 {
+            self.try_open().unwrap()
         }
 
         fn register(&mut self, id: u32, class: PresentationClass) -> Arc<OutputQueue> {
@@ -977,6 +1037,7 @@ mod tests {
                 label: Arc::from("other"),
                 ids: vec![1, 99],
                 class: PresentationClass::Occluded,
+                seq: 1,
             },
             h.now,
         );
@@ -990,6 +1051,7 @@ mod tests {
                 label: h.label(),
                 ids: vec![1, 99],
                 class: PresentationClass::Hidden,
+                seq: 1,
             },
             h.now,
         );
@@ -999,6 +1061,73 @@ mod tests {
         assert!(h.responses().is_empty());
         h.advance(ms(1));
         assert_eq!(h.frames().len(), 1);
+    }
+
+    impl Harness {
+        fn report(&mut self, ids: &[u32], class: PresentationClass, seq: u64) {
+            self.core.apply(
+                Command::SetPresentation {
+                    label: self.label(),
+                    ids: ids.to_vec(),
+                    class,
+                    seq,
+                },
+                self.now,
+            );
+        }
+
+        /// The class a terminal's output is scheduled under, observed as the
+        /// coalescing delay (ms) of one byte pushed now. Leaves the clock a
+        /// second later so probes do not feed each other's cadence.
+        fn delay_ms(&mut self, id: u32, queue: &OutputQueue, token: u64) -> u64 {
+            self.poll(token, &[ack(id, queue.summary().sent)]);
+            self.responses();
+            let start = self.now;
+            self.push(queue, b"x");
+            for waited in 0..=300 {
+                self.now = start + ms(waited);
+                self.step();
+                if !self.responses().is_empty() {
+                    self.now = start + ms(1000);
+                    return waited;
+                }
+            }
+            panic!("never delivered");
+        }
+    }
+
+    #[test]
+    fn a_late_presentation_report_cannot_undo_a_newer_one() {
+        let mut h = Harness::new();
+        let token = h.open();
+        let queue = h.register(1, PresentationClass::Focused);
+        h.attach(token, &[1]);
+        // Reports 2 (focused) and 1 (hidden) arrive in the wrong order.
+        h.report(&[1], PresentationClass::Focused, 2);
+        h.report(&[1], PresentationClass::Hidden, 1);
+        assert_eq!(h.delay_ms(1, &queue, token), 4, "newest report wins");
+        h.report(&[1], PresentationClass::Hidden, 3);
+        assert_eq!(h.delay_ms(1, &queue, token), 100);
+        // A replayed report with the same number is not newer either.
+        h.report(&[1], PresentationClass::Focused, 3);
+        assert_eq!(h.delay_ms(1, &queue, token), 100);
+        h.report(&[1], PresentationClass::Visible, 4);
+        assert_eq!(h.delay_ms(1, &queue, token), 16);
+    }
+
+    #[test]
+    fn presentation_order_is_tracked_per_terminal_so_overlapping_batches_compose() {
+        let mut h = Harness::new();
+        let token = h.open();
+        let first = h.register(1, PresentationClass::Focused);
+        let second = h.register(2, PresentationClass::Focused);
+        h.attach(token, &[1, 2]);
+        // Batch 6 names only terminal 2; the older batch 5 names both and
+        // arrives afterwards: it still applies to terminal 1, not to terminal 2.
+        h.report(&[2], PresentationClass::Focused, 6);
+        h.report(&[1, 2], PresentationClass::Hidden, 5);
+        assert_eq!(h.delay_ms(1, &first, token), 100);
+        assert_eq!(h.delay_ms(2, &second, token), 4);
     }
 
     #[test]
@@ -1082,6 +1211,94 @@ mod tests {
         assert_eq!(
             h.request(Endpoint::Poll, token, &[]),
             Some(STATUS_FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn issued_tokens_are_published_to_the_request_handler_and_revoked_with_the_stream() {
+        let mut h = Harness::new();
+        assert!(!h.tokens.authorizes(LABEL, 1001));
+        let first = h.open();
+        assert!(h.tokens.authorizes(LABEL, first));
+        let second = h.open();
+        assert!(!h.tokens.authorizes(LABEL, first), "reopening supersedes");
+        assert!(h.tokens.authorizes(LABEL, second));
+        assert!(!h.tokens.authorizes("settings", second));
+        h.core
+            .apply(Command::ResetWebview { label: h.label() }, h.now);
+        assert!(!h.tokens.authorizes(LABEL, second), "reload revokes");
+        let third = h.open();
+        assert!(h.tokens.authorizes(LABEL, third));
+        h.core
+            .apply(Command::RemoveWebview { label: h.label() }, h.now);
+        assert!(!h.tokens.authorizes(LABEL, third), "destruction revokes");
+    }
+
+    #[test]
+    fn a_stream_is_refused_when_the_system_cannot_supply_entropy() {
+        let mut h = Harness::with_source(Box::new(|| Err("no entropy")));
+        assert_eq!(h.try_open(), Err("no entropy"));
+        assert!(!h.tokens.authorizes(LABEL, 0));
+        assert_eq!(h.request(Endpoint::Poll, 0, &[]), Some(STATUS_FORBIDDEN));
+    }
+
+    #[test]
+    fn a_failed_reopen_leaves_the_existing_stream_untouched() {
+        let mut calls = 0;
+        let mut h = Harness::with_source(Box::new(move || {
+            calls += 1;
+            if calls == 1 {
+                Ok(0xFEED)
+            } else {
+                Err("no entropy")
+            }
+        }));
+        let token = h.open();
+        h.attach(token, &[]);
+        assert!(h.try_open().is_err());
+        assert!(h.tokens.authorizes(LABEL, token));
+        assert_eq!(h.request(Endpoint::Ack, token, &[]), Some(STATUS_OK));
+    }
+
+    #[test]
+    fn tokens_come_from_os_entropy_and_never_from_the_clock() {
+        let mut bytes = [0u8; 8];
+        let mut source = || {
+            getrandom::fill(&mut bytes).unwrap();
+            bytes
+        };
+        let a = random_token(|out| {
+            out.copy_from_slice(&source());
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        let b = random_token(|out| {
+            out.copy_from_slice(&source());
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_ne!(a, 0);
+        assert_ne!(a, b);
+        assert!(os_token().is_ok());
+        // Entropy failure is an error, with no time-based fallback.
+        assert_eq!(
+            random_token(|_| Err::<(), _>("EIO")),
+            Err(TOKEN_UNAVAILABLE)
+        );
+        // A zero draw is retried; endless zeros fail rather than yield a token.
+        let mut draws = 0;
+        let token = random_token(|out| {
+            draws += 1;
+            out.copy_from_slice(&if draws < 3 { 0u64 } else { 0x77 }.to_le_bytes());
+            Ok::<_, ()>(())
+        });
+        assert_eq!(token, Ok(0x77));
+        assert_eq!(
+            random_token(|out| {
+                out.fill(0);
+                Ok::<_, ()>(())
+            }),
+            Err(TOKEN_UNAVAILABLE)
         );
     }
 

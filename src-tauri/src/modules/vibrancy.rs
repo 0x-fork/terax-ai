@@ -121,6 +121,36 @@ fn set_backdrop(
     }
 }
 
+/// Toggles the web view's own fill through key-value coding.
+///
+/// `setValue:forKey:` raises an `NSException` for a key the receiver does not
+/// accept, which WebKit can change between releases. Unwinding that through the
+/// Rust frames above would abort the process, so it is caught and reported.
+///
+/// # Safety
+/// `view` must point to a live Objective-C object, and the call must be on the
+/// thread that owns it.
+#[cfg(target_os = "macos")]
+unsafe fn set_draws_background(
+    view: *mut objc2::runtime::AnyObject,
+    draws: bool,
+) -> Result<(), String> {
+    use objc2::msg_send;
+    use objc2_foundation::{NSNumber, NSString};
+
+    let key = NSString::from_str("drawsBackground");
+    let value = NSNumber::numberWithBool(draws);
+    objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+        let _: () = msg_send![view, setValue: &*value, forKey: &*key];
+    }))
+    .map_err(|exception| {
+        let reason =
+            exception.map_or_else(|| "unknown exception".to_string(), |e| format!("{e:?}"));
+        log::error!("could not set drawsBackground on the web view: {reason}");
+        reason
+    })
+}
+
 /// Makes the NSWindow and its WKWebView non-opaque (or opaque again).
 /// `drawsBackground` is the same WebKit key wry sets for a transparent window;
 /// it is the only way to toggle the web view's own fill at runtime.
@@ -130,19 +160,16 @@ fn set_window_see_through(
     see_through: bool,
     rgb: [u8; 3],
 ) -> Result<(), String> {
-    use objc2::msg_send;
     use objc2::runtime::AnyObject;
     use objc2_app_kit::{NSColor, NSWindow};
-    use objc2_foundation::{NSNumber, NSString};
 
     window
         .with_webview(move |platform| unsafe {
             // The closure runs on the main thread, which owns both objects.
             let ns_window = platform.ns_window() as *mut NSWindow;
             let webview = platform.inner() as *mut AnyObject;
-            let key = NSString::from_str("drawsBackground");
-            let draws = NSNumber::numberWithBool(!see_through);
-            let _: () = msg_send![webview, setValue: &*draws, forKey: &*key];
+            // Already logged; the window itself can still be updated.
+            let _ = set_draws_background(webview, !see_through);
 
             let native = &*ns_window;
             let color = if see_through {
@@ -251,5 +278,43 @@ mod tests {
             "\"vibrancy\""
         );
         assert_eq!(serde_json::to_string(&Backdrop::None).unwrap(), "\"none\"");
+    }
+
+    #[cfg(target_os = "macos")]
+    mod objc {
+        use super::super::set_draws_background;
+        use objc2::msg_send;
+        use objc2::runtime::{AnyClass, AnyObject};
+
+        fn instance(class: &std::ffi::CStr) -> *mut AnyObject {
+            let class = AnyClass::get(class).expect("Foundation class");
+            unsafe { msg_send![class, new] }
+        }
+
+        #[test]
+        fn a_key_value_coding_exception_is_reported_instead_of_aborting() {
+            // A plain NSObject has no `drawsBackground`: setValue:forKey:
+            // raises NSUnknownKeyException, as a changed WKWebView could.
+            let view = instance(c"NSObject");
+            let result = unsafe { set_draws_background(view, true) };
+            let reason = result.expect_err("the exception must surface as an error");
+            assert!(
+                reason.to_lowercase().contains("drawsbackground")
+                    || reason.contains("NSUnknownKeyException"),
+                "{reason}"
+            );
+            // The process is still alive and can make the call again.
+            assert!(unsafe { set_draws_background(view, false) }.is_err());
+        }
+
+        #[test]
+        fn a_receiver_that_accepts_the_key_is_updated() {
+            // NSMutableDictionary treats any key as valid.
+            let object = instance(c"NSMutableDictionary");
+            unsafe { set_draws_background(object, false) }.expect("accepted key");
+            let key = objc2_foundation::NSString::from_str("drawsBackground");
+            let stored: *mut AnyObject = unsafe { msg_send![object, objectForKey: &*key] };
+            assert!(!stored.is_null());
+        }
     }
 }

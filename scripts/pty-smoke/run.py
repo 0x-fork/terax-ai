@@ -36,6 +36,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def do_GET(self):
+        # The page the admission check loads in an iframe: another origin.
+        served = {"/frame.html": "text/html", "/frame.js": "text/javascript"}
+        name = self.path.split("#")[0].split("?")[0]
+        if name not in served:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        data = (root / name[1:]).read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", served[name])
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -52,6 +68,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         if self.path == "/report":
             finished.set()
+
+
+def check_gate(gate):
+    """The stream scheme's refusals, measured in the real webview (multiplexed driver only)."""
+    if gate is None:
+        return
+    foreign = gate["foreignOrigin"]
+    expected = {
+        "a valid request from the page succeeds": gate["positiveControl"] == 200,
+        "a wrong token is 403": gate["wrongToken"] == [403],
+        "an oversized body is 413": gate["oversized"] == 413,
+        "a malformed body is 400": gate["malformed"] == 400,
+        "a wrong method is 405": gate["wrongMethod"] == 405,
+        "refusals from the page never reach the hub": gate["hubUntouchedByPageRefusals"],
+        "a foreign origin holding a valid token gets no readable response": not foreign["anyReadable"],
+        "a foreign origin never reaches the hub": foreign["hubUntouched"],
+        "every foreign attempt was made": foreign["attempts"] == 10,
+    }
+    failed = [name for name, ok in expected.items() if not ok]
+    if failed:
+        raise RuntimeError(f"terax-pty admission checks failed: {failed}\n{json.dumps(gate, indent=2)}")
+    print("terax-pty admission checks passed")
 
 
 server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -123,6 +161,7 @@ try:
     if "error" in result:
         raise RuntimeError(result)
     print(json.dumps(result, indent=2))
+    check_gate(result.get("gate"))
 finally:
     if process and process.poll() is None:
         process.terminate()

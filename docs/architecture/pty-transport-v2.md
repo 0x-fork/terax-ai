@@ -30,8 +30,19 @@ terminal, and hidden tabs pay the same as the visible one. Ten agent tabs at
   `convertFileSrc(path, "terax-pty")`: `terax-pty://localhost/poll`, or
   `http://terax-pty.localhost/poll` on Windows. CSP `connect-src` allows both.
 - **Credential.** `pty_stream_open` (an ordinary command, so only the page's own
-  frame can call it) returns a random 64-bit token. Every request carries it;
-  anything else gets `403`. Reopening the stream, a page load or a window
+  frame can call it) returns a random 64-bit token from OS entropy (no fallback:
+  if entropy is unavailable the command fails). Every request carries it. The
+  request handler admits a request before the hub thread is touched: the
+  `Origin` header must equal the app's own origin (`tauri://localhost`;
+  `http(s)://tauri.localhost` on Windows; the dev server's origin when running
+  unbundled; absent means token-only), the body must not exceed 12 + 256 x 12
+  bytes (`413`), must be well framed (`400`), and must carry the webview's live
+  token (`403`, compared in constant time against a table the hub publishes).
+  Responses name the allowed origin in `Access-Control-Allow-Origin` with
+  `Vary: Origin`, never `*`. Anything else gets `403`. `scripts/pty-smoke` checks
+  this in the real webview: wrong token, oversized and malformed bodies, and a
+  foreign-origin iframe holding a valid token must all be refused without moving
+  the hub's wake-up or request counters. Reopening the stream, a page load or a window
   destruction invalidates the previous token.
 - **Request body** (`poll` and `ack`, all little-endian):
   `[u64 token][u32 count]` then `count` x `[u32 pty_id][u64 cumulative_parsed_bytes]`.
@@ -78,7 +89,8 @@ class:
 | Window occluded or asleep | 250 ms |
 
 A pending queue of 256 KiB or more is always due immediately. The frontend
-reports classes with `pty_set_presentation(ids, class)` (async), and only on
+reports classes with `pty_set_presentation(ids, class, seq)` (async; `seq` grows per
+report and a terminal ignores a report not newer than the last one naming it), and only on
 change. Occlusion is applied natively without a round trip. The hub responds
 when any due PTY has data, and includes every PTY that has pending data whose
 deadline is at most one interactive tick away. That aligns wakeups across

@@ -42,6 +42,8 @@ pub(super) const ACK_ENTRY_LEN: usize = 12;
 /// Wire maximum. The frontend sends at most 64 per request so a request body
 /// stays below 1 KiB, which WebKitGTK's body reader handles in one pass.
 pub(super) const MAX_ACKS_PER_REQUEST: usize = 256;
+/// Longest legal request body. Anything longer is refused before it is read.
+pub(super) const MAX_REQUEST_LEN: usize = REQUEST_HEADER_LEN + MAX_ACKS_PER_REQUEST * ACK_ENTRY_LEN;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Ack {
@@ -66,9 +68,9 @@ pub(super) enum WireError {
     BadUtf8,
 }
 
-impl fmt::Display for WireError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+impl WireError {
+    pub(super) fn message(self) -> &'static str {
+        match self {
             Self::Truncated => "request is shorter than its header",
             Self::TooManyAcks => "request carries too many acknowledgements",
             Self::LengthMismatch => "request length does not match its acknowledgement count",
@@ -76,7 +78,13 @@ impl fmt::Display for WireError {
             Self::UnknownKind => "unknown frame kind",
             #[cfg(test)]
             Self::BadUtf8 => "frame reason is not UTF-8",
-        })
+        }
+    }
+}
+
+impl fmt::Display for WireError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message())
     }
 }
 

@@ -299,6 +299,7 @@ describe("PTY bridge over the multiplexed stream", () => {
     expect(mocks.invoke).toHaveBeenCalledWith("pty_set_presentation", {
       ids: [session.id],
       class: "focused",
+      seq: 1,
     });
     await session.close();
   });

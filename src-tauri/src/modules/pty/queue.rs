@@ -33,6 +33,8 @@ struct QueueState {
     drain_timed_out: bool,
     /// The exit frame was handed to the transport (or nobody can take it).
     finished: bool,
+    /// Extra bytes the reader may retain beyond `MAX_BUFFERED_BYTES`.
+    overdraft: usize,
 }
 
 impl QueueState {
@@ -143,6 +145,7 @@ impl OutputQueue {
                 exit_code: None,
                 drain_timed_out: false,
                 finished: false,
+                overdraft: 0,
             }),
             changed: Condvar::new(),
             closed: AtomicBool::new(false),
@@ -189,8 +192,8 @@ impl OutputQueue {
         }
     }
 
-    /// Reader side. Blocks while the 2 MiB pending plus in-flight bound is
-    /// full; returns `false` once the queue is closed.
+    /// Reader side. Blocks while the 2 MiB pending plus in-flight bound (and
+    /// any overdraft) is full; returns `false` once the queue is closed.
     pub fn push(&self, bytes: &[u8]) -> bool {
         self.push_with(bytes, Instant::now)
     }
@@ -201,7 +204,7 @@ impl OutputQueue {
         let mut state = self.lock();
         while !self.is_closed()
             && state.pending_len() + state.credit.in_flight_bytes() + bytes.len()
-                > MAX_BUFFERED_BYTES
+                > MAX_BUFFERED_BYTES + state.overdraft
         {
             state = self.wait_change(state);
         }
@@ -226,6 +229,17 @@ impl OutputQueue {
             self.poke();
         }
         true
+    }
+
+    /// Lets the reader retain `bytes` beyond the usual bound, and wakes it if
+    /// it is waiting for room. For the last moments of a PTY whose backlog the
+    /// frontend has not caught up on: the reader must be able to take what the
+    /// pseudoconsole still holds so that closing it cannot wait on the
+    /// frontend. Memory stays bounded by `bytes` on top of the usual bound.
+    #[cfg(any(windows, test))]
+    pub fn allow_overdraft(&self, bytes: usize) {
+        self.lock().overdraft = bytes;
+        self.changed.notify_all();
     }
 
     /// Hub side: appends up to `max` bytes to `out`, registering them as one
@@ -431,6 +445,68 @@ mod tests {
         let mut out = Vec::new();
         queue.take_into(&mut out, max, Instant::now())?;
         Some(out)
+    }
+
+    fn full_queue() -> Arc<OutputQueue> {
+        let queue = Arc::new(OutputQueue::new(None));
+        // 1 MiB in flight, 1 MiB pending: the 2 MiB bound is exactly full.
+        assert!(queue.push(&vec![0; MAX_IN_FLIGHT_BYTES]));
+        assert_eq!(take(&queue).unwrap().len(), MAX_IN_FLIGHT_BYTES);
+        assert!(queue.push(&vec![0; MAX_IN_FLIGHT_BYTES]));
+        queue
+    }
+
+    #[test]
+    fn an_overdraft_releases_a_reader_blocked_on_credit_without_any_acknowledgement() {
+        let queue = full_queue();
+        let (done, finished) = mpsc::channel();
+        let reader = {
+            let queue = queue.clone();
+            thread::spawn(move || done.send(queue.push(&[7; 1000])).unwrap())
+        };
+        assert!(
+            finished.recv_timeout(Duration::from_millis(100)).is_err(),
+            "blocked while the queue is full"
+        );
+        queue.allow_overdraft(4096);
+        assert_eq!(finished.recv_timeout(Duration::from_secs(5)), Ok(true));
+        reader.join().unwrap();
+        let summary = queue.summary();
+        assert_eq!(summary.pending_len, MAX_IN_FLIGHT_BYTES + 1000);
+        assert_eq!(summary.in_flight_bytes, MAX_IN_FLIGHT_BYTES);
+    }
+
+    #[test]
+    fn the_overdraft_is_a_bound_not_a_removal_of_backpressure() {
+        let queue = full_queue();
+        queue.allow_overdraft(100);
+        assert!(queue.push(&[1; 100]));
+        let (done, finished) = mpsc::channel();
+        let reader = {
+            let queue = queue.clone();
+            thread::spawn(move || done.send(queue.push(&[2])).unwrap())
+        };
+        assert!(
+            finished.recv_timeout(Duration::from_millis(100)).is_err(),
+            "one byte past the overdraft waits again"
+        );
+        queue.close();
+        assert_eq!(finished.recv_timeout(Duration::from_secs(5)), Ok(false));
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn without_an_overdraft_the_usual_bound_holds() {
+        let queue = full_queue();
+        let (done, finished) = mpsc::channel();
+        let reader = {
+            let queue = queue.clone();
+            thread::spawn(move || done.send(queue.push(&[1])).unwrap())
+        };
+        assert!(finished.recv_timeout(Duration::from_millis(100)).is_err());
+        queue.close();
+        assert_eq!(finished.recv_timeout(Duration::from_secs(5)), Ok(false));
+        reader.join().unwrap();
     }
 
     #[test]

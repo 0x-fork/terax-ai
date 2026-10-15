@@ -10,7 +10,11 @@ describe("PtyPresentationReporter", () => {
   let watching: number;
   let send: ReturnType<
     typeof vi.fn<
-      (ids: number[], presentation: PtyPresentationClass) => Promise<unknown>
+      (
+        ids: number[],
+        presentation: PtyPresentationClass,
+        seq: number,
+      ) => Promise<unknown>
     >
   >;
   let reporter: PtyPresentationReporter;
@@ -64,13 +68,13 @@ describe("PtyPresentationReporter", () => {
     reporter.setLeaf(3, false, false);
     reporter.setLeaf(1, true, true); // unchanged
     await flush();
-    expect(send.mock.calls).toEqual([[[20, 30], "hidden"]]);
+    expect(send.mock.calls).toEqual([[[20, 30], "hidden", 1]]);
     reporter.setLeaf(2, false, false); // unchanged: no new request
     await flush();
     expect(send).toHaveBeenCalledTimes(1);
     reporter.setLeaf(3, true, false);
     await flush();
-    expect(send).toHaveBeenLastCalledWith([30], "visible");
+    expect(send).toHaveBeenLastCalledWith([30], "visible", 2);
   });
 
   it("moves every terminal to occluded and back with one request per class", async () => {
@@ -82,16 +86,50 @@ describe("PtyPresentationReporter", () => {
     hidden = true;
     notify();
     await flush();
-    expect(send.mock.calls).toEqual([[[10, 20, 30], "occluded"]]);
+    expect(send.mock.calls).toEqual([[[10, 20, 30], "occluded", 1]]);
     send.mockClear();
     hidden = false;
     notify();
     await flush();
     expect(send.mock.calls).toEqual([
-      [[10], "focused"],
-      [[20], "hidden"],
-      [[30], "visible"],
+      [[10], "focused", 2],
+      [[20], "hidden", 3],
+      [[30], "visible", 4],
     ]);
+  });
+
+  it("numbers every request so native can drop a report that arrives late", async () => {
+    reporter.setLeaf(1, true, true);
+    reporter.setLeaf(2, true, false);
+    reporter.bind(1, 10, "focused");
+    reporter.bind(2, 20, "visible");
+    reporter.setLeaf(1, false, false);
+    reporter.setLeaf(2, false, false);
+    await flush();
+    reporter.setLeaf(1, true, true);
+    await flush();
+    hidden = true;
+    notify();
+    await flush();
+    hidden = false;
+    notify();
+    await flush();
+    const numbers = send.mock.calls.map(([, , seq]) => seq);
+    expect(numbers.length).toBeGreaterThanOrEqual(4);
+    expect(numbers).toEqual(numbers.map((_, index) => index + 1));
+  });
+
+  it("keeps numbering across a failed request instead of reusing its number", async () => {
+    vi.spyOn(console, "debug").mockImplementation(() => {});
+    reporter.setLeaf(1, true, true);
+    reporter.bind(1, 10, "focused");
+    send.mockRejectedValueOnce(new Error("ipc down"));
+    reporter.setLeaf(1, false, false);
+    await flush();
+    await flush();
+    notify();
+    await flush();
+    expect(send.mock.calls.map(([, , seq]) => seq)).toEqual([1, 2]);
   });
 
   it("watches the window only while a terminal is bound", async () => {
@@ -132,7 +170,7 @@ describe("PtyPresentationReporter", () => {
     notify(); // any later trigger re-evaluates and retries
     await flush();
     expect(send).toHaveBeenCalledTimes(2);
-    expect(send).toHaveBeenLastCalledWith([10], "hidden");
+    expect(send).toHaveBeenLastCalledWith([10], "hidden", 2);
   });
 
   it("ignores a stale response for a class that has since changed", async () => {
@@ -147,7 +185,7 @@ describe("PtyPresentationReporter", () => {
     await flush();
     reporter.setLeaf(1, true, false);
     await flush();
-    expect(send).toHaveBeenLastCalledWith([10], "visible");
+    expect(send).toHaveBeenLastCalledWith([10], "visible", 2);
     fail(new Error("late"));
     await flush();
     await flush();

@@ -31,7 +31,7 @@ Long-lived interactive terminal sessions.
 
 - `pty_open` - create a new PTY session
 - `pty_stream_open` - open the window's multiplexed output stream and receive its token
-- `pty_set_presentation` - report which terminals are focused, visible, hidden or occluded
+- `pty_set_presentation` - report which terminals are focused, visible, hidden or occluded (numbered, so a late report cannot undo a newer one)
 - `pty_write` - send input bytes (text or control sequences)
 - `pty_resize` - resize the PTY
 - `pty_close` / `pty_close_all` - destroy one or all sessions
