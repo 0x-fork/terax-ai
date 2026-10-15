@@ -4,7 +4,7 @@
 tabs and splits, real window, the release profile users run) instead of the synthetic
 renderer in `scripts/renderer-profile`. It exists because the renderer lab did not reproduce
 what the user sees every day: memory that jumps on every tab switch and does not come back.
-Evidence for the first investigation is in `resource-evidence-2026-10-15/`.
+Reports are written to the output directory you pass; they are never committed.
 
 Nothing of it ships. The Rust side is behind the cargo feature `bench`, the frontend behind
 `TERAX_BENCH=1` (a Vite `define` that is the literal `false` otherwise, so the driver, its
@@ -113,174 +113,25 @@ Full sampling (`footprint` + `vmmap`) suspends the target for about a second per
 `light` mode keeps only the cheap timeline between full samples every `--full-every` cycles, which
 showed the same growth as full sampling.
 
-## Tab-switch investigation (HEAD `ee836e1`)
+## Findings that shaped the current design
 
-All numbers are MiB of physical footprint on an Apple M4, macOS 26.6.2, a 1280x820 point window
-on a 2048x1152 point display at 100 Hz, the release bench build of `ee836e1`, one run unless a
-range is given. Reports are `resource-evidence-2026-10-15/app-baseline-*.json` (the scenarios) and
-`app-exp-*.json` (the experiments below). `python3 scripts/app-lab/app_report.py app-exp-*.json`
-prints one comparable line per report.
+- Tab switches between differently sized panes resized a presented WebGPU canvas; WebKit keeps
+  every retired swapchain until JavaScriptCore collects its wrappers (minutes). Fixed by the window
+  canvas (one canvas per terminal area, only viewports change): 726 -> 218 MiB over 40 switches.
+- Per-frame WebGPU wrappers pin ~13 KiB of native memory JavaScriptCore does not count (~20 MiB/min
+  for a streaming agent). Fixed by `gpu/GcPressure.ts`.
+- A focused textarea with a collapsed selection keeps WebKit's display link running (idle 3.1 % CPU,
+  254 wakeups/s). Fixed by the input proxy's selected placeholder (0.24 %, ~11/s).
+- During a live window resize WebKit allocates a viewport-sized page tile per step (an empty page
+  peaks at ~420 MiB). Mitigated on macOS by pinning the document to a 512 px multiple while a drag
+  runs (`modules/theme/livePageResize.ts`); at rest the shell composites only the page tile, the
+  terminal textarea and the canvas.
+- Resizing the model and PTY during a drag made shells and Ink agents redraw per step, duplicating
+  prompts and agent regions. Fixed by one synchronized resize at gesture end (see
+  `terminal-renderer-v2.md`, Resizing).
 
-### Baselines
-
-| Scenario | WebContent | GPU | host | total |
-| --- | --- | --- | --- | --- |
-| `tabs` shell + agent, baseline -> 40 switches +30 s | 156 -> 223 | 31 -> 23 | 36 -> 30 | 229 -> 283 |
-| `tabs --variant saps` shell, agent, split pair, shell | 166 -> 663 | 36 -> 24 | 37 -> 31 | 246 -> 726 |
-| `resize` 3 cycles of 120 live steps, peak | 136 -> 1175 | 81 -> 156 | 37 | 261 -> 1373 (141 WC again after 10 s) |
-| `occlusion` 20 order-out/front cycles | 153 -> 165 | 123 -> 119 | 37 -> 30 | 319 -> 321 |
-
-| CPU scenario (median of 3) | App CPU (of one core) | host / WC / GPU | PTY procs | wakeups/s | instructions |
-| --- | --- | --- | --- | --- | --- |
-| `agents-steady` 1 visible + 6 hidden agents, 60 s | 24.5 % (21.9 to 25.1) | 9.8 / 10.1 / 4.6 | 4.3 % | 1,058 (host 434) | 0.52 G/s |
-| `idle` one shell, 30 s | 2.9 % | 1.4 / 1.1 / 0.4 | 0 | 270 (host 211) | 0.04 G/s |
-
-Power in mW swings with core placement (119, 64, 60 for the three agents runs) while instructions
-per second do not, so compare instructions. Switching to a tab whose agent is streaming adds about
-95 MiB in the GPU process (the presented swapchain) and 33 MiB in WebContent, and takes them away
-again a few seconds after switching back: that is the inherent cost of presenting a canvas, not the
-growth.
-
-### Root cause of the growth that does not come back
-
-Two independent mechanisms. Both end in the same state: **dead, native-backed WebGPU objects stay
-pinned in the WebContent process until JavaScriptCore garbage-collects their JavaScript wrappers,
-and JavaScriptCore does not collect for minutes** (the JS heap stays small and WebKit does not count
-the native weight). A forced full collection (`WKProcessPool._garbageCollectJavaScriptObjectsForTesting`,
-`--gc`) returns all of it, to or below the starting level. That is consistent with the user's
-observation that memory only returns when the display configuration changes (an event that
-plausibly makes WebKit collect; not verified here), while the app itself never triggers one.
-
-1. Canvas backing-store resizes (the large one). The canvas pool hands a returning pane the idle
-   canvas with the closest size. When tabs have different pane geometry (a split tab and a
-   full-size tab) every switch resizes a presented canvas, and each resize leaves the previous
-   swapchain buffer (10.4 MiB at this window size) in WebContent's `IOSurface` category.
-
-   | `tabs` run (40 switches, 3 s dwell) | backing-store resizes | WebContent IOSurface (dirty) | WebContent after +30 s | after forced GC |
-   | --- | --- | --- | --- | --- |
-   | shell + agent (same geometry) | 3 -> 5 | 76 -> 73 | +67 | not run |
-   | shell, agent, split pair, shell | 6 -> 46 | 77 -> 474 | +497 (663) | 173 (IOSurface 46) |
-   | same, light sampling (exp build, no toggles) | 6 -> 46 | 77 -> 518 | +494 | not run |
-   | same, every canvas at one fixed 2560x1700 backing | 2 -> 3 | 116 -> 66 | +41 (247) | not run |
-
-   The slope is 9 to 11 MiB per resize. The window-resize growth of the `resize` scenario (1.17 GiB
-   in WebContent, back to 140 MiB about ten seconds after the drag, when a collection happened to
-   run) is the same mechanism.
-
-2. Per-frame WebGPU wrappers of a visible streaming agent (the small one). Each presented frame
-   creates a canvas texture, a view and a command encoder wrapper; at 24 frames/s and 3 wrappers
-   each, 4,473 of them were still unfinalized after 60 cycles (5.8 finalized per cycle). They pin
-   about 12.6 KiB of WebKit malloc per frame (about 20 MiB/min), independent of tab switching:
-
-   | 60 cycles, WebContent MiB | start | +30 s | after forced GC |
-   | --- | --- | --- | --- |
-   | agent stays visible, never switches (WebGPU) | 155 | 224 (+70, malloc 71 -> 129) | 163 |
-   | the same with the WebGL renderer | 148 | 168 (+20) | 149 |
-   | shell + agent switching (two runs) | 157, 156 | 213, 211 | 143, 143 |
-   | two idle shells switching, no frames | 152 | 173 (+21) | 134 |
-   | agent hidden for the whole run (no frames) | 155 | 134 (-20) | 131 |
-
-Experiments that did **not** change anything (`tab-switch-toggles.patch`, 60 switches, shell + agent):
-keep the surface attached (no DOM re-parenting) +50; keep GPU buffers, atlas and canvas (+50);
-skip `releasePresentationResources` +45; `display:none` instead of `visibility:hidden` +55; the first
-three together +49, versus +56 and +54 for the unmodified build. The hide/show path of the terminal
-surface is not the cause. Window vibrancy on (+9), a 1900x1050 window (+11) and different working
-directories per tab (explorer and git panel following the switch, +51) stayed inside the run-to-run
-range (+5 to +67 over 40 switches).
-
-A mitigation that works today: every 30 s the page allocates and drops four 64 MiB zero-filled
-`ArrayBuffer`s (never touched, so not resident), which makes JavaScriptCore collect. With it the
-agent-visible run stays flat (126 MiB, 144 at start) and the split-pair run ends at 147 instead of
-663 (a sawtooth up to 280 meanwhile); it costs about 0.5 core-seconds per firing in WebContent.
-
-### Recommended fix
-
-1. Never resize a presented canvas on a tab switch: serve a pane only from an idle canvas whose
-   backing already fits (`CanvasBackingStore.surplusFor`) and otherwise create one canvas per size
-   class, instead of reallocating the closest one; drop parking, which is a resize too. One fixed
-   window-sized backing per canvas also works (experiment above) but costs a window-sized swapchain
-   per visible pane.
-2. Reduce wrapper churn per frame (fewer `queue.writeBuffer` calls: 1.6 per frame today, one
-   coalesced upload; cap streaming agents at a lower visible frame rate) and file the unfinalized
-   canvas-texture wrappers with WebKit; the WebGL renderer does not show the growth.
-3. Until then, a bounded allocation-pressure valve (above) keeps a long session from drifting.
-
-### Result: window canvas and GC mirroring
-
-Both mechanisms are fixed in the product: one shared canvas per window (tab switches, splits and
-dividers never reallocate it) and a per-frame `ArrayBuffer` mirror that makes JavaScriptCore
-collect the frame wrappers steadily (`gpu/GcPressure.ts`). `tabs --variant saps`: 726 -> 218 MiB
-total at the end (40 switches, 46 -> 2 canvas allocations, forced GC 204), `tabs`: 283 -> 200;
-`agents-steady` CPU is unchanged (23.3 % vs 23.4 % of a core, 0.38 G instructions/s). The mirror
-weight was chosen with `--instrument --local-storage terax:terminal-gc-mirror=<bytes>:<batch>`
-(120 s, visible agent): unfinalized canvas textures 2,626 off, 939 at 5x the native cost, 195 at
-10x (the default), 42 at 20x. The experiment patch `tab-switch-toggles.patch` applies to `ee836e1` only.
-
-### Idle wakeups and the focused terminal input
-
-An idle app with one shell and a focused terminal cost 3.1 % of a core and 254 wakeups/s
-(host 193), against 0.2 % and 10 wakeups/s once the focused `<textarea>` is blurred (`--probe blur`).
-`caret-color: transparent`, `caret-animation: manual`, `readonly`, a zero-size or clipped textarea
-and `content-visibility: hidden` changed nothing (220 to 280 wakeups/s): a focused editable with a collapsed selection keeps a
-display link running at display rate, whatever the caret paints (consistent with the animated caret fade of macOS 14+).
-The page itself is quiet (no timers, `requestAnimationFrame`, animations or IPC); the host wakes for
-`CVDisplayLink` threads and the JavaScriptCore scavenger. A **non-collapsed selection paints no caret**:
-`--probe selection` (value one placeholder, selected) gives 0.16 % and 10 wakeups/s, as does focusing a
-non-editable element (`selection-nofocus-div`, 0.27 %). `TerminalInputProxy` keeps that selection in
-the product (3 runs: 0.22 to 0.25 % total, host 0.04 %, 10 to 13 wakeups/s). `--scenario input` drives
-the real web view with native key events (`sendEvent:`) and `NSTextInputClient` calls (`setMarkedText`,
-`insertText`) against a raw-mode PTY reader and prints `[input-check]` lines to `page.log`.
-
-### WebKit malloc attribution (WebContent, fresh launch)
-
-About 60 MiB of `WebKit malloc` at launch (before any terminal), of which two WASM instances
-add about 4.6 MiB of linear memory (7 instances in `agents-steady`: 16.7 MiB), the DOM stays under
-350 elements, and a forced collection frees about 10 MiB of garbage; the rest is the application
-and WebKit itself. `performance.memory` does not exist in WebKit, so the JS heap itself
-cannot be read from the page.
-
-
-## Compositing layers (HEAD `561d820`)
-
-`bench_window layers` walks the web view's Core Animation tree in the UI process. WebKit mirrors
-the page's composited layers one to one there, with their debug names, sizes, clips, masks and
-whether they hold contents; the driver attaches it to `setup-complete` / `baseline` /
-`measure-start` (full list) and to `shrink-1`, `grow-1`, `resize-settled` (counts), and
-`resizeSteps` can capture it in the middle of a drag (`layersMid`, first shrink). `--toggle
-css=<rules>` injects a stylesheet before first paint, so a compositing experiment needs no rebuild.
-Reports: `resource-evidence-2026-10-15/layers-*.json` (`layers-exp-*` are the experiments).
-
-At rest (idle shell, 1280x820 @2x) the shell is 33 to 37 layers, **3 with contents**: the page
-tile (16.8 MiB per buffer, six 512 px tiles at rest), the terminal's hidden `<textarea>` (12x11,
-a composited scroll container) and the WebGPU canvas. The rest are clip layers without a backing
-store (the rounded `.terax-pane` is one `contents clipping` layer, radius 13). The 48 MiB of
-WebContent IOSurface at rest is the page tile held in about three buffers plus the canvas
-swapchain, not a dozen layers. No `will-change`, 3D transform, backdrop-filter or filter exists in
-the default state; removing the pane's rounded clip changed neither footprint nor WindowServer/GPU
-CPU (`layers-exp-pane-no-clip-resize`, `layers-exp-agents-steady-*`), so it stays.
-
-During a live resize WebKit collapses the page into **one tile of exactly the viewport size**
-(`tile at 0,0 [1044,702]`) and allocates a new viewport-sized IOSurface at every step (11 to 17
-MiB); they are volatile only after the drag. That is the empty page's 420 MiB: with `#root`
-hidden the app peaks at 493 MiB total (`layers-exp-root-hidden-resize`), hiding the canvas changes
-nothing. The page-side lever is the tile size: while `html[data-live-resize]` is set (resize
-events less than 250 ms apart, macOS only) `body::after` gives the document an invisible size
-rounded up to 512 px, WebKit then keeps one 1536x1024 tile across the drag and reuses its buffers.
-Static variants (`layers-exp-ghost-static-*`): 512 px peaked lowest, 128/256 px less, a fixed
-3000x2000 worse (the tile becomes the whole 96 MiB document), so the quantum is 512 and it is
-gesture-scoped (a static one costs +8 MiB per buffer at rest). The document never scrolls
-(`page.scroll` stays `[0,0]` in the reports).
-
-| `resize`, 3 cycles of 120 steps, 3 runs each | base | with live-resize tile quantum |
-| --- | --- | --- |
-| peak total (1 s timeline), MiB | 856, 907, 818 | 718, 601, 620 |
-| peak WebContent, MiB | 656, 719, 623 | 503, 413, 420 |
-| at rest (baseline sample), total MiB | 253, 270, 267 | 266, 266, 265 |
-| `idle` total / WC IOSurface / wakeups per s | 198.5 / 47.9 / 268 | 197.2 / 47.9 / 263 |
-| `tabs` 20 switches, baseline to last switch | +54.5 | +55.3 |
-
-What remains of the drag peak is the terminal canvas growing in the grow half (about +120 MiB per
-cycle in both builds) and the WebKit floor.
+Judge memory by the timeline floor and the value after `--gc`: dead native objects are released
+when garbage collection runs, so single samples vary between runs.
 
 ## Limits
 

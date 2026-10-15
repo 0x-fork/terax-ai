@@ -77,31 +77,28 @@ collects them after minutes (20 MiB a minute for a streaming agent). Allocating 
 dropping a 126 KiB `ArrayBuffer` per frame (ten times the native cost; measured:
 unfinalized canvas textures after 120 s 2,626 without, 195 with it, no change in
 instructions per second) makes young-generation collections run steadily.
-Resizing keeps the model and the PTY in step.
-`TerminalResizeSync` resizes the Ghostty model and tells the PTY (SIGWINCH) in
-one synchronous call, model first, and rate limits that call to once per 100 ms
-while the host keeps changing (first change at once, then every interval, then
-the last one within an interval; `lib/resizeThrottle.ts`). Ghostty clears the
-prompt on every model resize and relies on the shell's SIGWINCH redraw, so the
-two must never drift apart; there is no second PTY debounce, and a size the
-shell never heard about is never applied. A resize at a shell prompt holds the
-pane's presentation (it keeps drawing its previous frame) until the shell's
-redraw ends or 70 ms pass (`core/ResizePromptHold.ts`, driven by the OSC 133
-events; only at a prompt, never in the alternate screen), so the prompt does not
-flash blank. Between applications the pane keeps its last grid and frame inside
-its already updated rectangle. A resize gesture (the native macOS live resize
-`NSWindowWillStart/DidEndLiveResize` forwarded as `liveResize` in
-`terax:window-presentation`, or a burst of size changes of the terminal area
-less than 150 ms apart, `lib/terminalResizeGesture.ts`; a pane divider drag via
-`terminalResizeInteraction` also keeps pane buffers compact-on-end but never
-touches the canvas) makes the window canvas's backing store grow-only: it keeps
-its allocation while the area shrinks, and when the area outgrows it, allocates
-once, on both axes, to the largest size it can reach (`gpu/GestureBacking.ts`:
-the area plus the screen room the window has left when the window itself is being
-dragged, else the window; capped by the device limit). When the gesture ends the
-held grids land at once and the backing compacts to the nearby size, so a drag
-costs at most one growth and one compaction. The WebGL canvas follows the same
-rules per pane.
+Resizing applies one synchronized model + PTY resize per gesture. Every SIGWINCH
+makes zsh/fish and Ink-based agents redraw, and redraws that do not line up with a
+reflowed grid leave duplicates in scrollback, so during a resize gesture (native
+macOS live resize via `NSWindowWillStart/DidEndLiveResize`, forwarded as
+`liveResize` in `terax:window-presentation`; a pane divider drag via
+`terminalResizeInteraction`; elsewhere a burst of size changes less than 150 ms
+apart, `lib/terminalResizeGesture.ts`) neither the model nor the PTY changes. The
+pane follows the pointer at display rate (`SurfaceFramePacer` gesture mode) and
+draws its existing grid: shifted up (`shift_y`) so the cursor row stays visible
+when the pane is shorter, clipped on the right or padded with the background
+otherwise. At release `TerminalResizeSync` resizes the model and tells the PTY in
+one call, model first. Ghostty clears the prompt on that resize and relies on the
+shell's redraw, so the pane holds its previous frame until the redraw ends or
+70 ms pass (`core/ResizePromptHold.ts`; only at an OSC 133 prompt, never in the
+alternate screen). Resizes outside a gesture (sidebar, font, ratio, first fit,
+showing a hidden pane) apply at once. During a gesture the window canvas's backing
+store is grow-only: it keeps its allocation while the area shrinks and, when the
+area outgrows it, allocates once to the largest size it can reach
+(`gpu/GestureBacking.ts`: the area plus the screen room left when the window
+itself is dragged, else the window; capped by the device limit), then compacts at
+release, so a drag costs at most one growth and one compaction. The WebGL
+fallback defers the same way per pane (top-anchored).
 
 The WebGPU path (renderer v2, `docs/architecture/terminal-renderer-v2.md`) runs
 no per-cell JavaScript. Ghostty encodes 16-byte cell records natively and
