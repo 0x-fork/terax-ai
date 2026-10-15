@@ -931,6 +931,53 @@ async function move(run: Run) {
   await sync(run, "settle+30s");
 }
 
+/**
+ * Window drag-resize like a user dragging the bottom-right corner: shrink then grow back, several
+ * times, with output streaming and scrollback to reflow. Footprint is sampled after every half.
+ */
+async function resize(run: Run) {
+  const { params } = run.context;
+  const cycles = number(params, "cycles", 3);
+  const steps = number(params, "steps", 120);
+  const stepPoints = number(params, "stepPoints", 4);
+  const intervalMs = number(params, "stepIntervalMs", 16);
+  const live = (params.get("resizeMode") ?? "live") === "live";
+  const scrollbackLines = number(params, "scrollbackLines", 3000);
+  await native("show", { mode: "orderout" }); // ensure the window is key and active
+  const encoder = new TextEncoder();
+  for (const pane of run.panes) {
+    let text = "";
+    for (let line = 0; line < scrollbackLines; line++) {
+      text += `\x1b[3${line % 8}m${String(line).padStart(6, "0")}\x1b[0m lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor ${line}\r\n`;
+      if (text.length > 64 * 1024) {
+        pane.model.write(encoder.encode(text));
+        text = "";
+      }
+    }
+    if (text) pane.model.write(encoder.encode(text));
+  }
+  startAgents(run, 250, 500);
+  await pause(3000);
+  await sync(run, "setup", { cycles, steps, stepPoints, intervalMs, live, scrollbackLines });
+  await pause(2000);
+  await sync(run, "baseline");
+  for (let cycle = 1; cycle <= cycles; cycle++) {
+    await native("resizeSteps", { dw: -stepPoints, dh: -stepPoints / 2, count: steps, intervalMs, live });
+    await sync(run, `shrink-${cycle}`, { cycle });
+    await native("resizeSteps", { dw: stepPoints, dh: stepPoints / 2, count: steps, intervalMs, live });
+    await sync(run, `grow-${cycle}`, { cycle });
+    // Idle terminals present nothing after a drag; this shows what WebKit keeps without frames.
+    if (cycle === cycles && params.get("idleAfter") === "1") stopAgents(run);
+  }
+  await pause(1500);
+  await sync(run, "resize-settled");
+  await pause(10_000);
+  await sync(run, "settle+10s");
+  await pause(20_000);
+  await sync(run, "settle+30s");
+  stopAgents(run);
+}
+
 async function agentsOrIdle(run: Run, idle: boolean) {
   const { params } = run.context;
   const duration = number(params, "duration", idle ? 30 : 60) * 1000;
@@ -971,7 +1018,7 @@ export async function runNamedWorkload(name: string, context: LabContext): Promi
   if (parkMs !== null) localStorage.setItem("terax:terminal-canvas-park-ms", parkMs);
   const instrument =
     context.params.get("instrument") ??
-    (["occlusion", "move", "canvas", "tabs"].includes(name) ? "1" : "0");
+    (["occlusion", "move", "resize", "canvas", "tabs"].includes(name) ? "1" : "0");
   if (instrument === "1") installCanvasInstrumentation();
   context.report("blank");
   await pause(3000);
@@ -980,6 +1027,7 @@ export async function runNamedWorkload(name: string, context: LabContext): Promi
   switch (name) {
     case "occlusion":
     case "move":
+    case "resize":
       run.panes = await buildTabs(context, blink, failure);
       break;
     case "tabs":
@@ -997,6 +1045,7 @@ export async function runNamedWorkload(name: string, context: LabContext): Promi
   if (name === "occlusion") await occlusion(run);
   else if (name === "canvas") await canvasProbe(run);
   else if (name === "move") await move(run);
+  else if (name === "resize") await resize(run);
   else if (name === "tabs") await tabs(run);
   else await agentsOrIdle(run, name === "idle");
   stopAgents(run);

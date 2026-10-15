@@ -223,6 +223,11 @@ final class Delegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler,
         dx: body["dx"] as? Double ?? 0, dy: body["dy"] as? Double ?? 0,
         count: body["count"] as? Int ?? 1, intervalMs: body["intervalMs"] as? Double ?? 16,
         reply: reply)
+    case "resizeSteps":
+      resizeSteps(
+        dw: body["dw"] as? Double ?? 0, dh: body["dh"] as? Double ?? 0,
+        count: body["count"] as? Int ?? 1, intervalMs: body["intervalMs"] as? Double ?? 16,
+        live: body["live"] as? Bool ?? true, reply: reply)
     case "moveTo":
       let x = body["x"] as? Double ?? 0
       let y = body["y"] as? Double ?? 0
@@ -341,6 +346,31 @@ final class Delegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler,
       done += 1
       if done >= count {
         timer.invalidate()
+        reply(["ok": true, "steps": done, "ms": uptimeMs() - start])
+      }
+    }
+  }
+
+  /// Resizes the window like a user drag on the bottom-right corner: the top-left corner stays
+  /// put, and with `live` the web view gets the same live-resize notifications AppKit sends.
+  func resizeSteps(
+    dw: Double, dh: Double, count: Int, intervalMs: Double, live: Bool,
+    reply: @escaping ([String: Any]) -> Void
+  ) {
+    var done = 0
+    let start = uptimeMs()
+    if live { web.viewWillStartLiveResize() }
+    Timer.scheduledTimer(withTimeInterval: intervalMs / 1000, repeats: true) { timer in
+      var frame = self.window.frame
+      let top = frame.maxY
+      frame.size.width = max(480, frame.size.width + CGFloat(dw))
+      frame.size.height = max(320, frame.size.height + CGFloat(dh))
+      frame.origin.y = top - frame.size.height
+      self.window.setFrame(frame, display: true)
+      done += 1
+      if done >= count {
+        timer.invalidate()
+        if live { self.web.viewDidEndLiveResize() }
         reply(["ok": true, "steps": done, "ms": uptimeMs() - start])
       }
     }

@@ -50,7 +50,7 @@ SCOPE = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False)
-    parser.add_argument("--workload", choices=["default", "occlusion", "canvas", "tabs", "move", "agents", "idle"], default="default")
+    parser.add_argument("--workload", choices=["default", "occlusion", "canvas", "tabs", "move", "resize", "agents", "idle"], default="default")
     parser.add_argument("--output", type=Path, help="Scratch directory for build products (default: a temp directory)")
     parser.add_argument("--report", type=Path, help="Where to write the JSON report (default: <output>/report.json)")
     parser.add_argument("--source", type=Path, help="Optional baseline checkout; its node_modules must be installed")
@@ -78,6 +78,9 @@ def parse_args() -> argparse.Namespace:
     # move
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--jumps", type=int, default=50)
+    parser.add_argument("--resize-mode", choices=["live", "plain"], default="live", help="resize workload: wrap each drag in NSView live-resize notifications like a user drag, or plain setFrame")
+    parser.add_argument("--idle-after", action="store_true", help="resize workload: stop all output when the last drag ends (idle terminals present no frames)")
+    parser.add_argument("--scrollback-lines", type=int, default=3000, help="resize workload: lines written into each model before dragging (reflow cost)")
     parser.add_argument("--step-points", type=float, default=3)
     # agents / idle
     parser.add_argument("--hidden", type=int, default=8, help="Hidden models (agents/idle)")
@@ -129,7 +132,7 @@ dist = output / "dist"
 bundle = output / "Terax Renderer Lab.app"
 executable = bundle / "Contents/MacOS/renderer-lab"
 executable.parent.mkdir(parents=True, exist_ok=True)
-vmmap_enabled = args.vmmap if args.vmmap is not None else args.workload in ("occlusion", "canvas", "move", "tabs")
+vmmap_enabled = args.vmmap if args.vmmap is not None else args.workload in ("occlusion", "canvas", "move", "resize", "tabs")
 cycling = args.workload in ("occlusion", "canvas", "tabs")
 report_path = (args.report or output / "report.json").resolve()
 report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -143,8 +146,8 @@ elif args.workload == "tabs":
     host_timeout = args.cycles * (2 * args.dwell_ms + 4000) / 1000 + 240
 elif cycling:
     host_timeout = args.cycles * (hidden_ms + args.visible_ms + 4000) / 1000 + 240 + (240 if args.force_gc != "none" else 0)
-elif args.workload == "move":
-    host_timeout = 240
+elif args.workload in ("move", "resize"):
+    host_timeout = 420
 else:
     host_timeout = duration + args.warmup + 120
 
@@ -285,7 +288,7 @@ if args.workload != "default":
         "workload": args.workload, "blink": args.blink,
         "mode": args.occlusion_mode, "variant": args.variant, "resizeSteps": args.resize_steps, "dwellMs": args.dwell_ms, "order": args.order, "cycles": args.cycles, "hiddenMs": hidden_ms, "visibleMs": args.visible_ms,
         "gc": args.force_gc, "gcWhen": args.gc_when, "sampleHidden": 0 if args.control_no_reclaim else 1,
-        "steps": args.steps, "jumps": args.jumps, "stepPoints": args.step_points,
+        "steps": args.steps, "jumps": args.jumps, "stepPoints": args.step_points, "resizeMode": args.resize_mode, "idleAfter": 1 if args.idle_after else 0, "scrollbackLines": args.scrollback_lines,
         "hidden": args.hidden, "duration": duration, "warmup": args.warmup, "tick": args.tick,
     })
 url = f"http://127.0.0.1:{server.server_port}/?{urlencode(query)}" + ("&inspect=1" if args.inspect else "")

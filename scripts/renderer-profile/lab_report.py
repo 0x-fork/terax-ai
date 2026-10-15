@@ -330,7 +330,7 @@ def compute_metrics(report: dict) -> dict[str, float]:
             _add_interval_metrics(metrics, "cycles", interval(base, visible[-1][1]))
         return metrics
 
-    if workload == "move":
+    if workload in ("move", "resize"):
         named = [s for s in samples if phase_of(s) not in ("blank", "done")]
         for sample in named:
             _footprint_metrics(metrics, phase_of(sample), sample)
@@ -545,7 +545,7 @@ def summarize(report: dict) -> str:
             }))
         out.append("\nCPU / energy, time-weighted over all cycles:")
         out.append(_interval_table(pairs, roles))
-    elif workload == "move":
+    elif workload in ("move", "resize"):
         out.append(f"  steps {config.get('steps')}, jumps {config.get('jumps')}")
         rows, previous = [], None
         for sample in samples:
