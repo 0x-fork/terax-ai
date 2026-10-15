@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { CanvasBackingStore } from "./CanvasBackingStore";
 
 function fakeCanvas(width: number, height: number) {
@@ -149,5 +149,96 @@ describe("CanvasBackingStore", () => {
     expect(backing.pending).toBe(false);
     expect(backing.size).toEqual({ width: 1000, height: 600 });
     expect(backing.stage(900, 560, 2)).toBe(false);
+  });
+
+  describe("during a resize gesture", () => {
+    function presented(width: number, height: number, scale = 2) {
+      const canvas = fakeCanvas(300, 150);
+      const backing = new CanvasBackingStore(canvas);
+      backing.stage(width, height, scale);
+      backing.commit();
+      return { canvas, backing };
+    }
+
+    it("keeps the backing, and the exact 1:1 CSS size, while the window shrinks", () => {
+      const { canvas, backing } = presented(3000, 2000);
+      const growth = vi.fn(() => ({ width: 5000, height: 3000 }));
+      let allocations = 0;
+      for (let width = 3000; width >= 800; width -= 8) {
+        const before = canvas.width;
+        backing.stage(width, Math.round(width * 0.66), 2, growth);
+        backing.commit();
+        if (canvas.width !== before) allocations += 1;
+      }
+      expect(allocations).toBe(0);
+      expect(canvas).toMatchObject({
+        width: 3000,
+        height: 2000,
+        style: { width: "1500px", height: "1000px" },
+      });
+      // Nothing to grow, so nothing is measured.
+      expect(growth).not.toHaveBeenCalled();
+    });
+
+    it("allocates once, to the bound, when the window outgrows the backing", () => {
+      const { canvas, backing } = presented(1000, 700);
+      const growth = vi.fn(() => ({ width: 3456, height: 2234 }));
+      let allocations = 0;
+      for (let width = 1000; width <= 3400; width += 8) {
+        const before = canvas.width;
+        backing.stage(width, Math.round(width * 0.62), 2, growth);
+        backing.commit();
+        if (canvas.width !== before) allocations += 1;
+        expect(canvas.width).toBeGreaterThanOrEqual(width);
+      }
+      expect(allocations).toBe(1);
+      expect(canvas).toMatchObject({ width: 3456 });
+      expect(canvas.style.width).toBe("1728px");
+      expect(Number.parseFloat(canvas.style.width) * 2).toBe(canvas.width);
+    });
+
+    it("grows both axes together, so the other one cannot cost a second allocation", () => {
+      const { canvas, backing } = presented(2000, 1400);
+      backing.stage(2200, 1000, 2, () => ({ width: 3000, height: 2600 }));
+      backing.commit();
+      expect(canvas).toMatchObject({ width: 3000, height: 2600 });
+    });
+
+    it("never allocates less than what is required, whatever the bound says", () => {
+      const { canvas, backing } = presented(1000, 700);
+      backing.stage(2400, 600, 2, () => ({ width: 100, height: 100 }));
+      backing.commit();
+      // Never smaller than it was, either.
+      expect(canvas).toMatchObject({ width: 2400, height: 700 });
+    });
+
+    it("compacts to the usual nearby size with the first stage after the gesture", () => {
+      const { canvas, backing } = presented(1000, 700);
+      backing.stage(3000, 2000, 2, () => ({ width: 3456, height: 2234 }));
+      backing.commit();
+      expect(canvas.width).toBe(3456);
+
+      backing.stage(1010, 706, 2);
+      backing.commit();
+
+      expect(canvas).toMatchObject({ width: 1024, height: 768 });
+      expect(canvas.style.width).toBe("512px");
+    });
+
+    it("leaves a backing that is only slightly large alone when the gesture ends", () => {
+      const { canvas, backing } = presented(1000, 700);
+      backing.stage(900, 650, 2, () => ({ width: 5000, height: 5000 }));
+      expect(backing.stage(900, 650, 2)).toBe(false);
+      backing.commit();
+      expect(canvas).toMatchObject({ width: 1000, height: 700 });
+    });
+
+    it("sizes a store that has not presented yet exactly", () => {
+      const canvas = fakeCanvas(300, 150);
+      const backing = new CanvasBackingStore(canvas);
+      backing.stage(900, 500, 2, () => ({ width: 5000, height: 5000 }));
+      backing.commit();
+      expect(canvas).toMatchObject({ width: 900, height: 500 });
+    });
   });
 });

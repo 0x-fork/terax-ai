@@ -3,10 +3,12 @@ import { bindTerminalInteraction } from "@/modules/terminal/ghostty/input/termin
 import { TerminalScrollbarSync } from "@/modules/terminal/ghostty/gpu/terminalScrollbar";
 import { terminalWindowPresentation } from "@/modules/terminal/ghostty/windowPresentation";
 import type { TerminalSurface } from "@/modules/terminal/backend/contracts";
+import { noteTerminalHostResize } from "@/modules/terminal/lib/terminalResizeGesture";
 import {
   subscribeTerminalResizeInteraction,
   terminalResizeInteractionActive,
 } from "@/modules/terminal/lib/terminalResizeInteraction";
+import { TerminalResizeSync } from "@/modules/terminal/lib/terminalResizeSync";
 import type { Rgb } from "../core/packedCells";
 import type {
   GhosttyGpuFrame,
@@ -15,7 +17,14 @@ import type {
 import { GhosttySearchController } from "../search/GhosttySearchController";
 import { TerminalSelectionController } from "../selection/TerminalSelectionController";
 import type { WebGpuCanvasLease } from "@/modules/terminal/ghostty/gpu/WebGpuCanvasPool";
+import type { GestureGrowth } from "./CanvasBackingStore";
 import { DevicePixelRatioMonitor } from "./DevicePixelRatioMonitor";
+import {
+  type CssSize,
+  gestureBackingBound,
+  measureGestureBackingEnvironment,
+  windowInnerSize,
+} from "./GestureBacking";
 import { TerminalGlyphMap, type RasterBudget } from "./GlyphMap";
 import { ScreenUniform } from "./ScreenUniform";
 import { SCREEN_UNIFORM_BYTES } from "./shaders";
@@ -74,6 +83,8 @@ export type WebGpuTerminalSurfaceOptions = {
   readonly cursorBlink: boolean;
   readonly cursorStyle: "block" | "underline" | "bar";
   readonly onResize: (cols: number, rows: number) => void;
+  /** Minimum time between grid changes while the host is resizing (tests only). */
+  readonly resizeIntervalMs?: number;
   readonly onError: (error: Error) => void;
   readonly onFirstFrame?: () => void;
   readonly onFrame?: () => void;
@@ -84,6 +95,9 @@ export type WebGpuTerminalSurfaceOptions = {
 export type WebGpuTerminalSurfaceStats = {
   readonly frames: number;
   readonly backingStoreResizes: number;
+  /** Grid changes applied (model and PTY resized together) and held back by the throttle. */
+  readonly gridResizes: number;
+  readonly deferredGridResizes: number;
   readonly cellCompactions: number;
   readonly cellCapacity: number;
   readonly bufferBytes: number;
@@ -123,6 +137,13 @@ export class WebGpuTerminalSurface
   private readonly search: GhosttySearchController;
   private readonly pixelRatioMonitor: DevicePixelRatioMonitor;
   private readonly fitQueue = new TerminalFitQueue();
+  private readonly resizeSync: TerminalResizeSync;
+  /** Newest host measurement a throttled grid change is waiting to apply. */
+  private heldBounds: TerminalFitBounds | null = null;
+  /** The next queued fit is the end of a gesture and must not wait for the throttle. */
+  private fitImmediate = false;
+  private gridResizeCount = 0;
+  private deferredGridResizeCount = 0;
   private atlasLease: GlyphAtlasLease | null = null;
   private glyphMap = new TerminalGlyphMap();
   private atlasBlocked = false;
@@ -150,6 +171,8 @@ export class WebGpuTerminalSurface
   private documentSuspended = !terminalWindowPresentation().visible;
   private runtimeRegistered = false;
   private resizeInteractionActive = terminalResizeInteractionActive();
+  /** The window's inner size when the current gesture began; a change means the window is the one moving. */
+  private gestureStartInner: CssSize = windowInnerSize();
   private compactAfterResize = false;
   private nativeCursorVisible = false;
   private windowFocused = terminalWindowFocused();
@@ -186,6 +209,27 @@ export class WebGpuTerminalSurface
     this.pixelRatioMonitor = new DevicePixelRatioMonitor(() =>
       this.resizeToHost(),
     );
+    this.resizeSync = new TerminalResizeSync({
+      model: {
+        get cols() {
+          return options.model.cols;
+        },
+        get rows() {
+          return options.model.rows;
+        },
+        resize: (cols, rows) => {
+          this.applyingFit = true;
+          try {
+            options.model.resize(cols, rows);
+          } finally {
+            this.applyingFit = false;
+          }
+        },
+      },
+      notify: options.onResize,
+      intervalMs: options.resizeIntervalMs,
+      onDue: () => this.queueFit(this.heldBounds ?? undefined),
+    });
     this.cursorBlinking = options.cursorBlink;
     this.theme = options.theme;
     options.model.setCursorOptions(options.cursorStyle, options.cursorBlink);
@@ -231,7 +275,9 @@ export class WebGpuTerminalSurface
 
     this.resizeObserver = new ResizeObserver((entries) => {
       const entry = entries[entries.length - 1];
-      if (entry) this.queueFit(this.boundsFromEntry(entry));
+      if (!entry) return;
+      noteTerminalHostResize(this);
+      this.queueFit(this.boundsFromEntry(entry));
     });
     this.unsubscribeDamage = options.model.subscribeDamage(() => {
       if (!this.visible || this.documentSuspended || !this.host) return;
@@ -244,9 +290,14 @@ export class WebGpuTerminalSurface
     this.unsubscribeResizeInteraction = subscribeTerminalResizeInteraction(
       (active) => {
         this.resizeInteractionActive = active;
-        if (active) return;
+        if (active) {
+          this.gestureStartInner = windowInnerSize();
+          return;
+        }
+        // The gesture is over: land the held grid now and shrink the backing to fit it.
         this.compactAfterResize = true;
-        this.queueFit();
+        this.fitImmediate = true;
+        this.queueFit(this.heldBounds ?? undefined);
       },
     );
     this.root.addEventListener("pointerdown", this.handlePointerDown);
@@ -289,6 +340,8 @@ export class WebGpuTerminalSurface
     this.resizeObserver.disconnect();
     window.removeEventListener?.("resize", this.handleWindowResize);
     this.fitQueue.clear();
+    this.resizeSync.cancel();
+    this.heldBounds = null;
     this.pixelRatioMonitor.stop();
     this.clearCursorTimer();
     this.clearTextBlinkTimer();
@@ -627,6 +680,8 @@ export class WebGpuTerminalSurface
     return {
       frames: this.frameCount,
       backingStoreResizes: this.backingStoreResizeCount,
+      gridResizes: this.gridResizeCount,
+      deferredGridResizes: this.deferredGridResizeCount,
       cellCompactions: this.cellCompactionCount,
       cellCapacity: this.cellCapacity,
       bufferBytes: retainedBufferBytes,
@@ -899,7 +954,11 @@ export class WebGpuTerminalSurface
   private applyQueuedFit(): void {
     if (!this.host) return;
     const bounds = this.fitQueue.take(() => this.measureHost());
-    if (bounds) this.resizeToHost(bounds, false);
+    if (bounds) {
+      const throttled = !this.fitImmediate;
+      this.fitImmediate = false;
+      this.resizeToHost(bounds, false, throttled);
+    }
     if (this.compactAfterResize && !this.resizeInteractionActive) {
       this.compactAfterResize = false;
       this.options.model.compactPresentationResources();
@@ -908,9 +967,15 @@ export class WebGpuTerminalSurface
     }
   }
 
+  /**
+   * Fits the grid to the host. `throttled` fits come from the host changing size (observer,
+   * window resize): they apply at most once per interval, so the model and the PTY follow a
+   * drag in lockstep without a SIGWINCH per pointer step. Every other caller applies at once.
+   */
   private resizeToHost(
     measuredBounds?: TerminalFitBounds,
     scheduleRender = true,
+    throttled = false,
   ): void {
     if (
       !this.host ||
@@ -947,35 +1012,57 @@ export class WebGpuTerminalSurface
       return;
     }
 
-    const changed =
-      cols !== this.options.model.cols || rows !== this.options.model.rows;
-    if (changed) {
-      this.applyingFit = true;
-      try {
-        this.options.model.resize(cols, rows);
-      } finally {
-        this.applyingFit = false;
-      }
+    const outcome = this.resizeSync.request(cols, rows, throttled);
+    if (outcome === "deferred") {
+      // The grid, the PTY and the backing keep their last size; the canvas keeps showing the
+      // last frame and the host clips or pads it until the next interval.
+      this.heldBounds = bounds;
+      this.deferredGridResizeCount += 1;
+      if (this.applySnap(bounds)) this.forceFullRedraw = true;
+      return;
     }
-    if (changed) this.selection.reconcile();
+    this.heldBounds = null;
+    const changed = outcome === "applied";
+    if (changed) {
+      this.gridResizeCount += 1;
+      this.selection.reconcile();
+    }
     this.ensureCellCapacity(cols * rows, this.runtime.resources().device);
 
     const backingStoreChanged = this.target.backingStore.stage(
       pixelWidth,
       pixelHeight,
       this.metrics.scale,
+      this.gestureGrowth(),
     );
     this.lastBackingSize = { width: pixelWidth, height: pixelHeight };
     const snapped = this.applySnap(bounds);
     if (changed || backingStoreChanged) {
       this.options.model.setPixelSize(pixelWidth, pixelHeight);
     }
-    if (changed) this.options.onResize(cols, rows);
     if (changed || backingStoreChanged || snapped) this.forceFullRedraw = true;
     this.updateScrollbar();
     if (scheduleRender && (changed || backingStoreChanged)) {
       this.runtime.schedule(this);
     }
+  }
+
+  /**
+   * During a drag the backing store never shrinks and grows once, to the bound the drag
+   * cannot exceed (see `gestureBackingBound`); `undefined` outside a drag.
+   */
+  private gestureGrowth(): GestureGrowth | undefined {
+    const host = this.host;
+    if (!this.resizeInteractionActive || !host) return undefined;
+    return () =>
+      gestureBackingBound(
+        measureGestureBackingEnvironment(
+          host,
+          this.gestureStartInner,
+          this.metrics.scale,
+          this.runtime.resources().device.limits?.maxTextureDimension2D ?? 8192,
+        ),
+      );
   }
 
   /**

@@ -7,7 +7,10 @@ import type { TerminalDamage } from "@/modules/terminal/backend/contracts";
 import { CellFlags } from "@terax/ghostty-core/protocol";
 import type { Rgb, TerminalCellReader } from "../core/packedCells";
 import type { GhosttyTerminalModelApi } from "../GhosttyTerminalModel";
-import { CanvasBackingStore } from "../gpu/CanvasBackingStore";
+import {
+  CanvasBackingStore,
+  type GestureGrowth,
+} from "../gpu/CanvasBackingStore";
 import type {
   TerminalFontMetrics,
   TerminalGpuTheme,
@@ -208,7 +211,12 @@ export class WebGlCellRenderer {
     this.onContextFailure = null;
   }
 
-  resize(cols: number, rows: number, deferCompaction = false): boolean {
+  resize(
+    cols: number,
+    rows: number,
+    deferCompaction = false,
+    gesture?: GestureGrowth,
+  ): boolean {
     this.assertLive();
     if (!this.profile) throw new Error("WebGL renderer is not configured");
     if (cols * rows > MAX_SURFACE_CELLS) {
@@ -226,6 +234,7 @@ export class WebGlCellRenderer {
       width,
       height,
       this.profile.scale,
+      gesture,
     );
     if (backingStoreChanged) this.viewportDirty = true;
     if (changed) this.resizeModel(cols, rows);

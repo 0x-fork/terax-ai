@@ -282,7 +282,8 @@ text: the CSS size is always `backing / ratio`, drawing uses a viewport of exact
 `cols * cellW` by `rows * cellH`, and the surplus (up to 255 device pixels per
 axis after a shrink, aligned to 128) is cleared to the background and clipped by the container.
 A test drags a pane across 400 device pixels in 3 pixel steps and requires fewer
-than a tenth as many swapchain reallocations as steps.
+than a tenth as many swapchain reallocations as steps. During a resize gesture the
+store is stricter still; see "Resizing".
 
 ### Canvas lifecycle
 
@@ -335,6 +336,107 @@ So a presented WebGPU canvas is never destroyed (`WebGpuCanvasPool`):
 
 The WebGL fallback is unaffected: its canvases are garbage collected, so its
 two-second occlusion reclaim stays.
+
+### Resizing
+
+Two problems shared one cause: the surface followed the pointer step for step.
+
+**Prompts.** Ghostty's `Screen.resize` clears a redrawable prompt (OSC 133 `A`/`B` with
+`redraw` left at its default, which zsh and fish rely on) whenever the grid changes, and
+expects the shell to print it again on SIGWINCH. Terax resized the model on every drag step
+and delivered the PTY resize 256 ms after the last step, so a prompt was blank for the
+whole drag. Upstream Ghostty reached the same conclusion from the other side
+(`termio: synchronize pty and terminal resizing`, #14706: take the terminal lock before
+resizing the pty so the shell's redraw is never parsed against the old dimensions).
+`TerminalResizeSync` (`lib/terminalResizeSync.ts`) now changes the model and the PTY in one
+synchronous call, model first, and the surface asks it for every grid change that comes from
+the host changing size. `ResizeThrottle` lets the first change through at once, then at
+most one per 100 ms, and always lands the newest within an interval of the last movement
+(`onDue` re-fits against the host). The interval is 100 ms because a shell needs a few
+milliseconds to answer SIGWINCH, so the prompt is blank for a few milliseconds in every
+hundred instead of for the drag, and a full-screen program gets at most ten relayouts a
+second instead of one per cell of pointer travel (a reflow itself costs about 1 ms). The
+old PTY debounce is gone: a size the PTY has not heard about is never applied to the model
+(`PtyResizeDelivery` only skips repeats and does not record a size when no PTY exists yet).
+Between applications nothing changes: not the model, not the PTY, not the backing store, and
+the canvas keeps its last frame, which the host clips (shrinking) or leaves background
+(growing). Font and ratio changes, the first fit, a pane becoming visible and the end of a
+gesture are not throttled; hidden panes still fit when they are shown.
+`resizePromptRedraw.test.ts` runs this against the real WASM core: a zsh-like prompt is
+cleared by the model resize and restored by the redraw bytes that follow the PTY resize, and
+during a simulated one second drag it is blank for the shell's answer time only.
+
+**Memory.** A resizing canvas allocates a replacement swapchain for every backing-store
+change, and WebKit keeps the retired ones until the live resize ends (three buffers each,
+30 MiB for a 2000x1300 canvas). The lab's window drag (`--workload resize`, 80 drags of
+about 120 steps) made 609 backing-store reallocations (about 8 per drag; 54 over the three
+cycles of one run). A resize gesture is now one of:
+
+- a pane divider drag (`terminalResizeInteraction`),
+- the native macOS live resize: `window_presentation.rs` observes
+  `NSWindowWillStartLiveResizeNotification`/`NSWindowDidEndLiveResizeNotification` next to
+  the occlusion notifications and publishes `liveResize` in the same
+  `terax:window-presentation` snapshot; `windowPresentation.ts` forwards it to
+  `setNativeLiveResize`,
+- everywhere else (Windows, Linux, animated layouts): the same surface seeing its host change
+  size twice less than 150 ms apart (`lib/terminalResizeGesture.ts`), until 150 ms pass
+  without a change. Several surfaces laying out once each, as on a tab switch, is not a burst.
+
+While a gesture runs `CanvasBackingStore.stage` never shrinks. When the pane outgrows the
+backing it allocates once, on both axes, to `gestureBackingBound`: if the window's inner size
+changed since the gesture began (the window is being dragged), the host plus the screen room
+the window has left; otherwise (a divider, an animated sidebar) the terminal area
+(`[data-terminal-tab]`, else the window), because the window did not grow; capped by
+`maxTextureDimension2D`. The CSS size stays exactly `backing / ratio`
+and the viewport exactly `cols * cellW` by `rows * cellH`, so nothing is scaled; the rest is
+background, clipped by the root. The surface subscribes to the gesture's end, lands the held
+grid immediately and the next `stage` without a gesture compacts the backing to the usual
+nearby size, so a drag costs at most one growth plus one compaction. The WebGL canvas uses
+the same store and throttle.
+
+Measured with `scripts/renderer-profile` (`--workload resize --cycles 3`: one 1000x650 window,
+one visible pane and one hidden, 3000 lines of scrollback each, output streaming, three
+shrink drags and three grow drags of 120 steps of 4 pt every 16 ms, macOS 26, M4; three runs
+each, `docs/architecture/resource-evidence-2026-10-15/resize-*.json`). Footprint is the sum of
+the host and its WebKit processes at the end of each drag; "peak" is the largest of the six.
+
+| | HEAD | after (native signal) | after (burst heuristic only) | control: empty page, no WebGPU |
+| --- | --- | --- | --- | --- |
+| peak total MiB (runs) | 949 (884, 949, 979) | 607 (607, 613, 595) | 658 (664, 658, 593) | 436 |
+| peak WebContent MiB | 778 (718, 778, 807) | 467 (467, 477, 460) | 522 (518, 522, 461) | 320 |
+| backing-store resizes per run (6 drags) | 54 | 10 | 10 | |
+| per drag, max / mean | 15 / 8.8 | 2 / 1.3 | 2 / 1.3 | |
+| total 1.5 s after the last drag | 238 | 243 | 276 | 85 |
+| total 30 s after | 233 | 252 | 237 | 77 |
+| `--idle-after`: peak total / 30 s after | 940 / 176 | 606 / 238 | | |
+
+The control is the part of the spike Terax cannot influence: with no terminal, no WebGPU and
+an empty DOM the same window drag takes the WebContent process from 22 to 320 MiB (total 68
+to 436). WebKit's own live resize retains page layer buffers, whatever the page holds. Over
+that control plus the steady 120 MiB a pane costs (558), the drag peak was 391 MiB above it
+and is now 49 MiB above it: the extra swapchain of the growth bound, which is the point.
+Shrinking drags peak at 445-497 MiB (no extra allocation at all) and grow drags at 573-613 (the
+bound). The rest of the heuristic-only spread is one drag in two runs that reached 660
+instead of 600. The 30 s totals differ by a few MiB because the GPU process compresses or
+releases swapchain pages at times it chooses (HEAD's own `--idle-after` runs settle at a median of 176 and up to 222 MiB).
+
+Other workloads, new against the 2026-10-14 reports and same-day HEAD (the new code paths
+are idle in them: no gesture, grid and backing counters identical to HEAD): `default` x3
+against `v2-default` x3 and same-day HEAD x2: `resized` 243 MiB (v2 241); `switched` and
+`repainted` are 247 and 261 against 247 and 248 for HEAD today, so the +40 MiB against
+`v2-default` is HEAD's, not this change's. `tabs` (hide-first) 20 cycles: 13% below `v2-tabs`
+at the end. `tabs --order show-first` x2 against same-day HEAD x2: pool created 5, reused 100,
+backing-store resizes 5 in all four runs; end totals 218 against 211 MiB, growth 0.55 against
+-0.07 MiB per cycle (v2: 0.31). `occlusion --cycles 20`: 20 reclamations, growth 0.16 MiB per
+cycle (HEAD today 0.07, v2 -0.23). `move`: 4% below v2.
+
+Checked pixel for pixel with `scripts/terminal-visual` (Chromium, window `resize` events and
+the native signal driving a 75 step shrink and a 75 step grow of a 1000x640 host; the
+browser pane was hidden, so no ResizeObserver callbacks were delivered): at ratio 2 and 1.25,
+during the gesture (backing 1998x1260 kept through the shrink, 5528x3255 after the grow) and
+after the compaction (1408x1024, 2048x1280), the grid area is byte-identical to a fresh load
+at the same size (0 differing bytes) and everything outside it is one background colour.
+CSS size times ratio equals the backing size in every state.
 
 ### Glyph atlas
 

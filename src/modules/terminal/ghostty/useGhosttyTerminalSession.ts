@@ -11,8 +11,7 @@ import { ensureMonoFontsLoaded, resolveFontFamily } from "@/lib/fonts";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import type { TerminalBackendKind } from "@/modules/terminal/backend/contracts";
 import { setLeafPresentation } from "@/modules/terminal/lib/ptyPresentation";
-import { PtyResizeScheduler } from "@/modules/terminal/lib/ptyResizeScheduler";
-import { subscribeTerminalResizeInteraction } from "@/modules/terminal/lib/terminalResizeInteraction";
+import { PtyResizeDelivery } from "@/modules/terminal/lib/ptyResizeDelivery";
 import { useTerminalFont } from "@/modules/terminal/lib/useTerminalFont";
 import type { TerminalSearchController } from "@/modules/terminal/search/TerminalSearchController";
 import { invoke } from "@tauri-apps/api/core";
@@ -69,8 +68,7 @@ type GhosttySession = {
   surfaceOptions: GhosttySurfaceBaseOptions | null;
   input: GhosttyInputController | null;
   pty: PtySession | null;
-  ptyResize: PtyResizeScheduler;
-  unsubscribeResizeInteraction: () => void;
+  ptyResize: PtyResizeDelivery;
   writer: BoundedPtyWriter;
   container: HTMLDivElement | null;
   callbacks: Callbacks;
@@ -404,7 +402,6 @@ export function disposeGhosttySession(leafId: number): boolean {
   session.surface?.dispose();
   disposeGhosttyBlocks(leafId);
   session.model?.dispose();
-  session.unsubscribeResizeInteraction();
   session.ptyResize.reset();
   session.writer.dispose();
   void session.pty?.close();
@@ -521,15 +518,12 @@ function ensureSession(
     }
     return existing;
   }
-  const ptyResize = new PtyResizeScheduler((cols, rows) => {
-    void sessions.get(leafId)?.pty?.resize(cols, rows);
+  const ptyResize = new PtyResizeDelivery((cols, rows) => {
+    const pty = sessions.get(leafId)?.pty;
+    if (!pty) return false;
+    void pty.resize(cols, rows);
+    return true;
   });
-  const unsubscribeResizeInteraction = subscribeTerminalResizeInteraction(
-    (active) => {
-      if (active) ptyResize.suspend();
-      else ptyResize.resume();
-    },
-  );
   const session: GhosttySession = {
     leafId,
     backend,
@@ -541,7 +535,6 @@ function ensureSession(
     input: null,
     pty: null,
     ptyResize,
-    unsubscribeResizeInteraction,
     writer: new BoundedPtyWriter((error) => {
       console.error("[terax] Ghostty PTY write failed:", error);
     }),
@@ -708,7 +701,7 @@ async function initializeSessionGeneration(
     cursorBlink: preferences.terminalCursorBlink,
     cursorStyle: preferences.terminalCursorStyle,
     onResize: (cols: number, rows: number) => {
-      session.ptyResize.schedule(cols, rows);
+      session.ptyResize.send(cols, rows);
     },
     onFirstFrame: () => mark("firstFrameMs"),
     onFrame: () => ghosttyBlocks(session.leafId)?.present(),
@@ -832,7 +825,7 @@ async function initializeSessionGeneration(
   session.pty = pty;
   session.writer.attach(pty);
   if (model.cols !== startCols || model.rows !== startRows) {
-    session.ptyResize.schedule(model.cols, model.rows);
+    session.ptyResize.send(model.cols, model.rows);
   }
 }
 

@@ -8,6 +8,11 @@ import { SCREEN_UNIFORM_BYTES } from "@/modules/terminal/ghostty/gpu/shaders";
 import { WebGpuTerminalSurface } from "@/modules/terminal/ghostty/gpu/WebGpuTerminalSurface";
 import { WebGpuCanvasPool } from "@/modules/terminal/ghostty/gpu/WebGpuCanvasPool";
 import { deriveFontMetrics } from "@/modules/terminal/ghostty/gpu/terminalVisuals";
+import { resetTerminalResizeGestureForTest } from "@/modules/terminal/lib/terminalResizeGesture";
+import {
+  beginTerminalResizeInteraction,
+  endTerminalResizeInteraction,
+} from "@/modules/terminal/lib/terminalResizeInteraction";
 
 const bridge = vi.hoisted(() => ({ runtime: {} as unknown, visible: true }));
 vi.mock(
@@ -29,6 +34,7 @@ vi.mock("@/modules/terminal/ghostty/windowPresentation", () => ({
 const surfaces: WebGpuTerminalSurface[] = [];
 const canvasPools: WebGpuCanvasPool[] = [];
 afterEach(() => {
+  resetTerminalResizeGestureForTest();
   for (const surface of surfaces.splice(0)) surface.dispose();
   for (const pool of canvasPools.splice(0)) pool.dispose();
   vi.unstubAllGlobals();
@@ -433,6 +439,254 @@ describe("pixel-exact geometry", () => {
   });
 });
 
+describe("resizing the host", () => {
+  const ORIGIN = { left: 0, top: 0 };
+  const hostSize = (width: number, height = 640) => ({
+    width,
+    height,
+    ...ORIGIN,
+  });
+
+  it("resizes the model and tells the PTY in the same call, at most once per interval during a drag", async () => {
+    vi.useFakeTimers();
+    const h = await harness({ resizeIntervalMs: 100 });
+    h.render();
+    vi.advanceTimersByTime(500);
+    const first = h.surface.diagnostics();
+    h.onResize.mockClear();
+
+    // A drag: a new host width every 16 ms for a second, a frame after each.
+    const applied: Array<[number, number]> = [];
+    h.onResize.mockImplementation((cols: number, rows: number) => {
+      applied.push([cols, rows]);
+      // The model already has the size the PTY is told about.
+      expect(h.surface.diagnostics().cols).toBe(cols);
+      expect(h.surface.diagnostics().rows).toBe(rows);
+    });
+    for (let step = 1; step <= 62; step++) {
+      h.observe(hostSize(960 - step * 8));
+      h.render();
+      vi.advanceTimersByTime(16);
+      h.render();
+    }
+    vi.advanceTimersByTime(100);
+    h.render();
+
+    expect(applied.length).toBeGreaterThanOrEqual(9);
+    expect(applied.length).toBeLessThanOrEqual(11);
+    // The final width lands within one interval of the last movement.
+    const last = h.surface.diagnostics();
+    expect(last.cols).toBe(Math.floor((960 - 62 * 8) / 8));
+    expect(applied[applied.length - 1]).toEqual([last.cols, last.rows]);
+    expect(last.cols).toBeLessThan(first.cols);
+    expect(h.surface.diagnostics().deferredGridResizes).toBeGreaterThan(30);
+  });
+
+  it("applies the first change at once and every non-drag fit immediately", async () => {
+    vi.useFakeTimers();
+    const h = await harness({ resizeIntervalMs: 100 });
+    h.render();
+    vi.advanceTimersByTime(500);
+    h.onResize.mockClear();
+
+    h.observe(hostSize(800));
+    h.render();
+    expect(h.onResize).toHaveBeenCalledTimes(1);
+
+    // A font change is not a drag and is never held back.
+    h.surface.setFontMetrics({
+      ...METRICS,
+      deviceCellWidth: 10,
+      cellWidth: 10,
+    });
+    expect(h.onResize).toHaveBeenCalledTimes(2);
+    expect(h.surface.diagnostics().cols).toBe(80);
+  });
+
+  it("keeps the model, PTY and backing store still between throttled steps", async () => {
+    vi.useFakeTimers();
+    const h = await harness({ resizeIntervalMs: 100 });
+    h.render();
+    vi.advanceTimersByTime(500);
+    h.observe(hostSize(900));
+    h.render();
+    h.onResize.mockClear();
+    h.model.setPixelSize.mockClear();
+    const resizes = h.surface.diagnostics().backingStoreResizes;
+    const canvas = h.canvas();
+    const backing = { width: canvas.width, height: canvas.height };
+    vi.advanceTimersByTime(10);
+
+    h.observe(hostSize(700));
+    h.render();
+
+    expect(h.onResize).not.toHaveBeenCalled();
+    expect(h.model.setPixelSize).not.toHaveBeenCalled();
+    expect(h.surface.diagnostics().cols).toBe(112);
+    expect(h.surface.diagnostics().backingStoreResizes).toBe(resizes);
+    expect({ width: canvas.width, height: canvas.height }).toEqual(backing);
+    expect(h.schedule).toHaveBeenCalled();
+
+    vi.advanceTimersByTime(90);
+    h.render();
+    expect(h.onResize).toHaveBeenCalledOnce();
+    expect(h.surface.diagnostics().cols).toBe(87);
+  });
+
+  it("applies the held size as soon as the gesture ends, not when the interval is up", async () => {
+    vi.useFakeTimers();
+    // An interval so long that only the end of the gesture can release the held size.
+    const h = await harness({ resizeIntervalMs: 60_000 });
+    h.render();
+    vi.advanceTimersByTime(61_000);
+    h.observe(hostSize(900));
+    h.render();
+    vi.advanceTimersByTime(10);
+    h.observe(hostSize(640));
+    h.render();
+    vi.advanceTimersByTime(100);
+    h.render();
+    expect(h.surface.diagnostics().cols).toBe(112);
+
+    // 150 ms without a host change ends the burst the observer saw.
+    vi.advanceTimersByTime(100);
+    h.render();
+
+    expect(h.surface.diagnostics().cols).toBe(80);
+    expect(h.onResize).toHaveBeenLastCalledWith(80, expect.any(Number));
+  });
+
+  describe("backing store during a gesture", () => {
+    const token = {};
+    afterEach(() => endTerminalResizeInteraction(token));
+
+    it("never reallocates while the window shrinks and grows back, then compacts once", async () => {
+      vi.useFakeTimers();
+      vi.stubGlobal("screen", { availWidth: 1600, availHeight: 1000 });
+      const h = await harness({ scale: 2 });
+      Object.assign(window, { innerWidth: 1000, innerHeight: 700 });
+      h.render();
+      h.observe(hostSize(960, 640));
+      h.render();
+      const start = h.surface.diagnostics();
+      const startBacking = h.canvas().width;
+      beginTerminalResizeInteraction(token);
+
+      // Shrink to a third, then grow back to the original size, a frame per step.
+      for (let width = 960; width >= 320; width -= 8) {
+        h.observe(hostSize(width, Math.round(width * 0.66)));
+        h.render();
+      }
+      for (let width = 320; width <= 960; width += 8) {
+        h.observe(hostSize(width, Math.round(width * 0.66)));
+        h.render();
+      }
+      expect(h.surface.diagnostics().backingStoreResizes).toBe(
+        start.backingStoreResizes,
+      );
+      expect(h.canvas().width).toBe(startBacking);
+      // The canvas is still exactly backing / ratio, drawn through an exact viewport.
+      expect(Number.parseFloat(h.canvas().style.width) * 2).toBe(
+        h.canvas().width,
+      );
+
+      h.observe(hostSize(400, 300));
+      h.render();
+      expect(h.canvas().width).toBe(startBacking);
+      const during = h.surface.diagnostics();
+      expect(h.pass.setViewport).toHaveBeenLastCalledWith(
+        0,
+        0,
+        during.cols * during.deviceCellWidth,
+        during.rows * during.deviceCellHeight,
+        0,
+        1,
+      );
+
+      endTerminalResizeInteraction(token);
+      // The observer's own burst detector lets go 150 ms after the last change.
+      vi.advanceTimersByTime(200);
+      h.render();
+      const after = h.surface.diagnostics();
+      expect(after.backingStoreResizes).toBe(start.backingStoreResizes + 1);
+      expect(h.canvas().width).toBeLessThan(startBacking);
+      expect(h.canvas().width).toBeLessThan(
+        after.cols * after.deviceCellWidth + 256,
+      );
+    });
+
+    it("grows once, to the room the screen leaves, when the window outgrows the backing", async () => {
+      vi.useFakeTimers();
+      vi.stubGlobal("screen", { availWidth: 1600, availHeight: 1000 });
+      const h = await harness({ scale: 2 });
+      h.observe(hostSize(480, 320));
+      h.render();
+      const start = h.surface.diagnostics();
+      beginTerminalResizeInteraction(token);
+
+      // The window grows with its content: 40 x 60 CSS pixels of chrome around the host.
+      for (let width = 480; width <= 1000; width += 8) {
+        const height = Math.round(width * 0.66);
+        Object.assign(window, {
+          innerWidth: width + 40,
+          innerHeight: height + 60,
+        });
+        h.observe(hostSize(width, height));
+        h.render();
+        vi.advanceTimersByTime(16);
+      }
+
+      const during = h.surface.diagnostics();
+      // The first outgrowing step allocates, to the bound; nothing after that does.
+      expect(during.backingStoreResizes - start.backingStoreResizes).toBe(1);
+      // A pane can never be larger than the screen minus the chrome.
+      expect(h.canvas().width).toBe((1600 - 40) * 2);
+      expect(h.canvas().height).toBe((1000 - 60) * 2);
+      expect(Number.parseFloat(h.canvas().style.width) * 2).toBe(
+        h.canvas().width,
+      );
+    });
+
+    it("bounds a layout-only gesture by the window it sits in, not by the screen", async () => {
+      vi.useFakeTimers();
+      vi.stubGlobal("screen", { availWidth: 1600, availHeight: 1000 });
+      const h = await harness({ scale: 2 });
+      // The window keeps its size while the host (a sidebar closing, a divider) grows.
+      Object.assign(window, { innerWidth: 1000, innerHeight: 700 });
+      h.observe(hostSize(480, 320));
+      h.render();
+      beginTerminalResizeInteraction(token);
+
+      for (let width = 480; width <= 960; width += 8) {
+        h.observe(hostSize(width, Math.round(width * 0.66)));
+        h.render();
+        vi.advanceTimersByTime(16);
+      }
+
+      expect(h.canvas().width).toBe(1000 * 2);
+      expect(h.canvas().height).toBe(700 * 2);
+    });
+
+    it("allocates to nearby sizes, step by step, when the host changes slowly", async () => {
+      vi.useFakeTimers();
+      const h = await harness({ scale: 2 });
+      h.render();
+      h.observe(hostSize(480, 320));
+      h.render();
+      const start = h.surface.diagnostics().backingStoreResizes;
+      // A change every 200 ms is no gesture, so nothing is held for later.
+      for (let width = 480; width <= 960; width += 8) {
+        vi.advanceTimersByTime(200);
+        h.observe(hostSize(width, Math.round(width * 0.66)));
+        h.render();
+      }
+      expect(
+        h.surface.diagnostics().backingStoreResizes - start,
+      ).toBeGreaterThan(1);
+    });
+  });
+});
+
 describe("WebGPU surface resource lifecycle", () => {
   it("uploads only the changed row and pauses text blinking in an unfocused window", async () => {
     vi.useFakeTimers();
@@ -737,7 +991,9 @@ type FakeFrameState = {
   setCell(index: number, glyph: number): void;
 };
 
-async function harness(options: { scale?: number } = {}) {
+async function harness(
+  options: { scale?: number; resizeIntervalMs?: number } = {},
+) {
   let scale = options.scale ?? 1;
   bridge.visible = true;
   const destroy = vi.fn();
@@ -1019,6 +1275,8 @@ async function harness(options: { scale?: number } = {}) {
     cursorStyle: "block",
     onResize,
     onError,
+    // Grid changes are rate limited in production; tests that are not about that apply at once.
+    resizeIntervalMs: options.resizeIntervalMs ?? 0,
   });
   surfaces.push(surface);
   const mask: { bytes: number[] | null } = { bytes: null };
@@ -1030,7 +1288,8 @@ async function harness(options: { scale?: number } = {}) {
     mask.bytes ? Uint8Array.from(mask.bytes) : null,
   );
   let maskRevision = 0;
-  surface.attach(element() as unknown as HTMLElement);
+  const hostElement = element();
+  surface.attach(hostElement as unknown as HTMLElement);
   const lastBuffer = (label: string) =>
     [...buffers].reverse().find((buffer) => buffer.label?.includes(label));
   return {
@@ -1096,6 +1355,13 @@ async function harness(options: { scale?: number } = {}) {
       top: number;
       device?: { width: number; height: number };
     }) {
+      // A real host reports its new size to whoever measures it later, too.
+      hostElement.getBoundingClientRect = () => ({
+        width: entry.width,
+        height: entry.height,
+        left: entry.left,
+        top: entry.top,
+      });
       const root = elements.find(
         (e) => e.getAttribute("data-terax-ghostty-surface") === "webgpu",
       );

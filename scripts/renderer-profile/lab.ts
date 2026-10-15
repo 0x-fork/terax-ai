@@ -3,6 +3,7 @@ import { WebGpuTerminalSurface } from "@/modules/terminal/ghostty/gpu/WebGpuTerm
 import { webGpuTerminalRuntimeDiagnostics } from "@/modules/terminal/ghostty/gpu/WebGpuTerminalRuntime";
 import type { GhosttyTerminalModelApi } from "@/modules/terminal/ghostty/GhosttyTerminalModel";
 import type { TerminalGpuTheme } from "@/modules/terminal/ghostty/gpu/terminalVisuals";
+import { setNativeLiveResize } from "@/modules/terminal/lib/terminalResizeGesture";
 import { runNamedWorkload } from "./workloads";
 declare global {
   interface Window {
@@ -10,6 +11,12 @@ declare global {
       messageHandlers: { report: { postMessage(value: string): void } };
     };
   }
+}
+// `--native-signal`: stand in for the NSWindow live-resize notifications Terax forwards from
+// window_presentation.rs (the lab has no Tauri host). Without it only the heuristic runs.
+if (new URLSearchParams(location.search).get("nativeSignal") === "1") {
+  (window as unknown as { __teraxLiveResize: (active: boolean) => void }).__teraxLiveResize =
+    setNativeLiveResize;
 }
 const core = getGhosttyCoreRuntime();
 const host = document.querySelector("#host") as HTMLElement;

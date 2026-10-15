@@ -1028,7 +1028,12 @@ export async function runNamedWorkload(name: string, context: LabContext): Promi
     case "occlusion":
     case "move":
     case "resize":
-      run.panes = await buildTabs(context, blink, failure);
+      // `--no-gpu` (resize): a control that drags the same window with an empty page, to show what
+      // WebKit's live resize costs by itself.
+      run.panes =
+        name === "resize" && context.params.get("noGpu") === "1"
+          ? []
+          : await buildTabs(context, blink, failure);
       break;
     case "tabs":
       run.panes = await buildMixedTabs(context, blink, failure);

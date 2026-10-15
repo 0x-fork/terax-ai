@@ -60,6 +60,28 @@ disposing the runtime itself tears canvases down. Reused targets stay hidden
 until the new owner's frame is encoded. Nearby backing sizes reuse storage; the
 canvas is always styled backing/ratio and drawn through an exact viewport, so
 text is never scaled.
+Resizing keeps the model and the PTY in step and the backing store still.
+`TerminalResizeSync` resizes the Ghostty model and tells the PTY (SIGWINCH) in
+one synchronous call, model first, and rate limits that call to once per 100 ms
+while the host keeps changing (first change at once, then every interval, then
+the last one within an interval; `lib/resizeThrottle.ts`). Ghostty clears the
+prompt on every model resize and relies on the shell's SIGWINCH redraw, so the
+two must never drift apart; there is no second PTY debounce, and a size the
+shell never heard about is never applied. Between applications the surface keeps
+its last grid and frame and the host clips or pads it. A resize gesture (a pane
+divider via `terminalResizeInteraction`, the native macOS live resize
+`NSWindowWillStart/DidEndLiveResize` forwarded as `liveResize` in
+`terax:window-presentation`, or a burst of host size changes from one surface
+less than 150 ms apart, `lib/terminalResizeGesture.ts`) makes the backing store
+grow-only: it keeps its allocation while the pane shrinks, and when the pane
+outgrows it, allocates once, on both axes, to the largest size the pane can reach
+(`gpu/GestureBacking.ts`: host plus the screen room the window has left when the
+window itself is being dragged, else the terminal area; capped by the device limit).
+When the gesture ends the held size lands at once and the backing
+compacts to the nearby size, so a drag costs at most one growth and one
+compaction. WebKit keeps every swapchain a resizing canvas retires until the
+drag ends, so reallocating per step multiplied the footprint by the number of
+steps. The WebGL canvas follows the same rules.
 
 The WebGPU path (renderer v2, `docs/architecture/terminal-renderer-v2.md`) runs
 no per-cell JavaScript. Ghostty encodes 16-byte cell records natively and
@@ -75,8 +97,8 @@ while something is highlighted, so none of them rewrites cell records.
 Geometry is pixel exact. Fonts are measured at size times ratio and cells are
 whole device pixels (`TerminalFontMetrics.deviceCell*`). `cellWidth` and
 `cellHeight` are the CSS size, device divided by ratio, and are what fit,
-hit-testing, selection, links and block overlays use. The backing store is exactly
-cols by rows device cells and the canvas origin is translated onto the device
+hit-testing, selection, links and block overlays use. The backing store holds at
+least cols by rows device cells (exactly that outside drags; slack is clipped) and the canvas origin is translated onto the device
 pixel grid when the observer, ratio or window size changes. A ratio change
 re-measures the font and rebuilds atlas and buffers.
 Each terminal maps Ghostty glyph ids to a glyph atlas shared per font and ratio.

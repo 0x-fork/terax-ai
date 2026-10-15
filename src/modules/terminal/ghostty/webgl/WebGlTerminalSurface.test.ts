@@ -74,6 +74,55 @@ describe("WebGL surface renderer ownership", () => {
   });
 });
 
+describe("WebGL surface resizing", () => {
+  it("resizes the model and tells the PTY together, at most once per interval while the host changes", () => {
+    const h = harness({ resizeIntervalMs: 100 });
+    h.surface.renderFrame(h.renderer as unknown as WebGlCellRenderer);
+    vi.advanceTimersByTime(500);
+    const applied: Array<[number, number]> = [];
+    h.onResize.mockImplementation((cols: number, rows: number) => {
+      applied.push([cols, rows]);
+      expect(h.surface.diagnostics().cols).toBe(cols);
+    });
+
+    for (let step = 1; step <= 62; step++) {
+      h.setHost(960 - step * 8);
+      h.resize();
+      h.surface.renderFrame(h.renderer as unknown as WebGlCellRenderer);
+      vi.advanceTimersByTime(16);
+      h.surface.renderFrame(h.renderer as unknown as WebGlCellRenderer);
+    }
+    vi.advanceTimersByTime(100);
+    h.surface.renderFrame(h.renderer as unknown as WebGlCellRenderer);
+
+    expect(applied.length).toBeGreaterThanOrEqual(9);
+    expect(applied.length).toBeLessThanOrEqual(11);
+    const cols = Math.floor((960 - 62 * 8) / 8);
+    expect(h.surface.diagnostics().cols).toBe(cols);
+    expect(applied[applied.length - 1][0]).toBe(cols);
+  });
+
+  it("keeps the renderer's grid still while a size is held", () => {
+    const h = harness({ resizeIntervalMs: 100 });
+    h.surface.renderFrame(h.renderer as unknown as WebGlCellRenderer);
+    vi.advanceTimersByTime(500);
+    h.setHost(800);
+    h.resize();
+    h.surface.renderFrame(h.renderer as unknown as WebGlCellRenderer);
+    const rendererResizes = h.renderer.resize.mock.calls.length;
+    h.onResize.mockClear();
+    vi.advanceTimersByTime(10);
+
+    h.setHost(600);
+    h.resize();
+    h.surface.renderFrame(h.renderer as unknown as WebGlCellRenderer);
+
+    expect(h.onResize).not.toHaveBeenCalled();
+    expect(h.renderer.resize).toHaveBeenCalledTimes(rendererResizes);
+    expect(h.surface.diagnostics().cols).toBe(100);
+  });
+});
+
 const METRICS = {
   font: {
     family: "monospace",
@@ -126,7 +175,7 @@ function measuringContext() {
   return context;
 }
 
-function harness() {
+function harness(options: { resizeIntervalMs?: number } = {}) {
   vi.useFakeTimers();
   const element = () =>
     Object.assign(new EventTarget(), {
@@ -194,19 +243,29 @@ function harness() {
     consumeDamage: () => ({ kind: "none" }),
   };
   const onError = vi.fn();
+  const onResize = vi.fn();
   const surface = new WebGlTerminalSurface({
     model: model as unknown as GhosttyTerminalModelApi,
     metrics: METRICS,
     theme: THEME,
     cursorBlink: false,
     cursorStyle: "block",
-    onResize: vi.fn(),
+    onResize,
     onError,
+    resizeIntervalMs: options.resizeIntervalMs ?? 0,
   });
   surfaces.push(surface);
-  surface.attach(element() as unknown as HTMLElement);
+  const hostElement = element();
+  const hostSize = { width: 960, height: 640 };
+  hostElement.getBoundingClientRect = () => ({ ...hostSize });
+  surface.attach(hostElement as unknown as HTMLElement);
   return {
     surface,
+    onResize,
+    setHost(width: number, height = 640) {
+      hostSize.width = width;
+      hostSize.height = height;
+    },
     renderer: current,
     acquire,
     onError,

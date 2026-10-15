@@ -359,7 +359,12 @@ final class Delegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler,
   ) {
     var done = 0
     let start = uptimeMs()
-    if live { web.viewWillStartLiveResize() }
+    if live {
+      web.viewWillStartLiveResize()
+      // What Terax gets from NSWindowWillStartLiveResizeNotification in the real app; a page
+      // without the hook (older renderers, or the heuristic-only variant) ignores it.
+      web.evaluateJavaScript("window.__teraxLiveResize && window.__teraxLiveResize(true)")
+    }
     Timer.scheduledTimer(withTimeInterval: intervalMs / 1000, repeats: true) { timer in
       var frame = self.window.frame
       let top = frame.maxY
@@ -370,7 +375,10 @@ final class Delegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler,
       done += 1
       if done >= count {
         timer.invalidate()
-        if live { self.web.viewDidEndLiveResize() }
+        if live {
+          self.web.viewDidEndLiveResize()
+          self.web.evaluateJavaScript("window.__teraxLiveResize && window.__teraxLiveResize(false)")
+        }
         reply(["ok": true, "steps": done, "ms": uptimeMs() - start])
       }
     }

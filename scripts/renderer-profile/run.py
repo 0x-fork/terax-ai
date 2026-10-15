@@ -79,6 +79,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--jumps", type=int, default=50)
     parser.add_argument("--resize-mode", choices=["live", "plain"], default="live", help="resize workload: wrap each drag in NSView live-resize notifications like a user drag, or plain setFrame")
+    parser.add_argument("--native-signal", action="store_true", help="resize workload: also tell the page when each drag starts and ends, like the NSWindow live-resize notifications the app forwards (renderers without the hook ignore it)")
+    parser.add_argument("--no-gpu", action="store_true", help="resize workload: control run that drags the window with an empty page (no terminals, no WebGPU) to show what WebKit's live resize costs by itself")
     parser.add_argument("--idle-after", action="store_true", help="resize workload: stop all output when the last drag ends (idle terminals present no frames)")
     parser.add_argument("--scrollback-lines", type=int, default=3000, help="resize workload: lines written into each model before dragging (reflow cost)")
     parser.add_argument("--step-points", type=float, default=3)
@@ -288,7 +290,7 @@ if args.workload != "default":
         "workload": args.workload, "blink": args.blink,
         "mode": args.occlusion_mode, "variant": args.variant, "resizeSteps": args.resize_steps, "dwellMs": args.dwell_ms, "order": args.order, "cycles": args.cycles, "hiddenMs": hidden_ms, "visibleMs": args.visible_ms,
         "gc": args.force_gc, "gcWhen": args.gc_when, "sampleHidden": 0 if args.control_no_reclaim else 1,
-        "steps": args.steps, "jumps": args.jumps, "stepPoints": args.step_points, "resizeMode": args.resize_mode, "idleAfter": 1 if args.idle_after else 0, "scrollbackLines": args.scrollback_lines,
+        "steps": args.steps, "jumps": args.jumps, "stepPoints": args.step_points, "resizeMode": args.resize_mode, "idleAfter": 1 if args.idle_after else 0, "nativeSignal": 1 if args.native_signal else 0, "noGpu": 1 if args.no_gpu else 0, "scrollbackLines": args.scrollback_lines,
         "hidden": args.hidden, "duration": duration, "warmup": args.warmup, "tick": args.tick,
     })
 url = f"http://127.0.0.1:{server.server_port}/?{urlencode(query)}" + ("&inspect=1" if args.inspect else "")

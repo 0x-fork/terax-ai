@@ -77,6 +77,34 @@ def _pool_metrics(metrics: dict, event: dict) -> None:
         metrics["renderer.backing_store_resizes"] = sum(s.get("backingStoreResizes", 0) for s in surfaces)
 
 
+def _surface_total(sample: dict | None, key: str) -> int | None:
+    surfaces = ((sample or {}).get("event") or {}).get("surfaces") or []
+    if not surfaces or key not in surfaces[0]:
+        return None
+    return sum(s.get(key, 0) for s in surfaces)
+
+
+def _resize_metrics(metrics: dict, by_phase: dict, named: list[dict]) -> None:
+    """Per-drag counters and the peak WebContent / total footprint of the shrink-N and grow-N phases."""
+    gestures = [s for s in named if phase_of(s).startswith(("shrink-", "grow-"))]
+    if not gestures:
+        return
+    metrics["resize.gestures"] = len(gestures)
+    metrics["resize.peak_total_mib"] = max(total_bytes(s) for s in gestures) / MIB
+    metrics["resize.peak_web_content_mib"] = max(footprint_by_role(s).get("web_content", 0) for s in gestures) / MIB
+    for key, name in (("backingStoreResizes", "backing_store_resizes"), ("gridResizes", "grid_resizes"), ("deferredGridResizes", "deferred_grid_resizes")):
+        previous = _surface_total(by_phase.get("baseline"), key)
+        counts = []
+        for sample in gestures:
+            current = _surface_total(sample, key)
+            if previous is not None and current is not None:
+                counts.append(current - previous)
+            previous = current
+        if counts:
+            metrics[f"resize.{name}_per_gesture.max"] = max(counts)
+            metrics[f"resize.{name}_per_gesture.mean"] = sum(counts) / len(counts)
+
+
 def roles_present(samples: list[dict]) -> list[str]:
     seen = {role for sample in samples for role in footprint_by_role(sample)}
     ordered = [role for role in ROLE_ORDER if role in seen]
@@ -336,6 +364,8 @@ def compute_metrics(report: dict) -> dict[str, float]:
             _footprint_metrics(metrics, phase_of(sample), sample)
         totals = [total_bytes(s) / MIB for s in named]
         metrics["footprint.max_mib"] = max(totals)
+        if workload == "resize":
+            _resize_metrics(metrics, by_phase, named)
         if "baseline" in by_phase and "settle+30s" in by_phase:
             metrics["footprint.growth_total_mib"] = (total_bytes(by_phase["settle+30s"]) - total_bytes(by_phase["baseline"])) / MIB
         last = samples[-1]["event"]
@@ -570,6 +600,11 @@ def summarize(report: dict) -> str:
         if "pool.created" in metrics:
             out.append("Renderer canvas pool: created {}, reused {}, reconfigured {}, destroyed {}; backing-store resizes {}".format(
                 metrics.get("pool.created"), metrics.get("pool.reused"), metrics.get("pool.reconfigured"), metrics.get("pool.destroyed"), metrics.get("renderer.backing_store_resizes", "-")))
+        if "resize.gestures" in metrics:
+            out.append("Resize gestures {}: peak WebContent {:.1f} MiB, peak total {:.1f} MiB; backing-store resizes per gesture max {} mean {:.1f}{}".format(
+                metrics["resize.gestures"], metrics["resize.peak_web_content_mib"], metrics["resize.peak_total_mib"],
+                metrics.get("resize.backing_store_resizes_per_gesture.max", "-"), metrics.get("resize.backing_store_resizes_per_gesture.mean", 0),
+                "; grid resizes per gesture mean {:.1f} (deferred {:.1f})".format(metrics["resize.grid_resizes_per_gesture.mean"], metrics.get("resize.deferred_grid_resizes_per_gesture.mean", 0)) if "resize.grid_resizes_per_gesture.mean" in metrics else ""))
     elif workload in ("agents", "idle"):
         out.append(f"  visible panes {config.get('panes')}; hidden models {config.get('hidden')}; measured {config.get('duration')} s after {config.get('warmup')} s warm-up; cursor blink {config.get('blink')}")
         rows, previous = [], None
