@@ -137,7 +137,7 @@ fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
 }
 
 #[cfg(target_os = "macos")]
-fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+pub(super) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     let from = c_path(from)?;
     let to = c_path(to)?;
     let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
@@ -149,7 +149,7 @@ fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+pub(super) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     let from = c_path(from)?;
     let to = c_path(to)?;
     let result = unsafe {
@@ -192,12 +192,12 @@ fn move_file_windows(from: &Path, to: &Path, replace: bool) -> io::Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+pub(super) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     move_file_windows(from, to, false)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+pub(super) fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     if metadata_if_exists(to)?.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -487,63 +487,6 @@ fn fs_delete_batch_impl(
     FsDeleteBatchResult { deleted, failed }
 }
 
-fn copy_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    if src.is_dir() {
-        std::fs::create_dir(dst)?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
-        }
-        Ok(())
-    } else {
-        std::fs::copy(src, dst).map(|_| ())
-    }
-}
-
-/// Copies external files/dirs into a destination directory, recursively for
-/// dirs. Sources are absolute OS paths (from a drag-drop); only the destination
-/// is workspace-resolved. Refuses to overwrite existing entries.
-#[tauri::command]
-pub async fn fs_copy(
-    index: State<'_, FileIndexState>,
-    sources: Vec<String>,
-    dest_dir: String,
-    workspace: Option<WorkspaceEnv>,
-) -> Result<(), String> {
-    let index = index.inner().clone();
-    blocking(move || {
-        let workspace = WorkspaceEnv::from_option(workspace);
-        let dest = resolve_path(&dest_dir, &workspace);
-        let result = copy_into(&sources, &dest);
-        // A failed copy can still have written earlier sources.
-        note_dir_changed(&index, &dest);
-        result
-    })
-    .await
-}
-
-fn copy_into(sources: &[String], dest: &Path) -> Result<(), String> {
-    for source in sources {
-        let src = std::path::PathBuf::from(source);
-        let name = src
-            .file_name()
-            .ok_or_else(|| format!("invalid source: {source}"))?;
-        let target = dest.join(name);
-        if target.exists() {
-            return Err(format!("already exists: {}", target.display()));
-        }
-        copy_recursive(&src, &target).map_err(|e| {
-            log::warn!(
-                "fs_copy({} -> {}) failed: {e}",
-                src.display(),
-                target.display()
-            );
-            e.to_string()
-        })?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,35 +685,6 @@ mod tests {
         assert!(!conflict(result).0);
         assert_eq!(std::fs::read(from.join("new.txt")).unwrap(), b"new");
         assert_eq!(std::fs::read(to.join("old.txt")).unwrap(), b"old");
-    }
-
-    #[test]
-    fn copy_brings_file_and_dir_in_and_refuses_clobber() {
-        let src = tempfile::tempdir().unwrap();
-        let dest = tempfile::tempdir().unwrap();
-        std::fs::write(src.path().join("a.txt"), b"payload").unwrap();
-        std::fs::create_dir_all(src.path().join("d/inner")).unwrap();
-        std::fs::write(src.path().join("d/inner/y.txt"), b"y").unwrap();
-
-        copy_into(
-            &[s(src.path().join("a.txt")), s(src.path().join("d"))],
-            dest.path(),
-        )
-        .expect("copy");
-
-        assert_eq!(
-            std::fs::read(dest.path().join("a.txt")).unwrap(),
-            b"payload"
-        );
-        assert_eq!(
-            std::fs::read(dest.path().join("d/inner/y.txt")).unwrap(),
-            b"y"
-        );
-        // copy, not move: the source survives.
-        assert!(src.path().join("a.txt").exists());
-
-        let err = copy_into(&[s(src.path().join("a.txt"))], dest.path()).unwrap_err();
-        assert!(err.contains("already exists"), "got: {err}");
     }
 
     #[test]

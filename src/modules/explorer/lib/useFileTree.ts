@@ -134,6 +134,7 @@ export function useFileTree(rootPath: string | null, options?: Options) {
   const optionsRef = useRef(options);
   const scopeKey = `${workspaceKey}\u0000${rootPath ?? ""}`;
   const scopeKeyRef = useRef(scopeKey);
+  const scopeGenerationRef = useRef(0);
   const conflictPromptsRef = useRef<Map<string | number, () => void>>(
     new Map(),
   );
@@ -153,13 +154,17 @@ export function useFileTree(rootPath: string | null, options?: Options) {
   }, [active, rootPath]);
 
   useLayoutEffect(() => {
-    if (scopeKeyRef.current !== scopeKey) cancelConflictPrompts();
+    if (scopeKeyRef.current !== scopeKey) {
+      cancelConflictPrompts();
+      scopeGenerationRef.current += 1;
+    }
     scopeKeyRef.current = scopeKey;
   }, [scopeKey, cancelConflictPrompts]);
 
   useEffect(
     () => () => {
       scopeKeyRef.current = "";
+      scopeGenerationRef.current += 1;
       cancelConflictPrompts();
     },
     [cancelConflictPrompts],
@@ -186,6 +191,9 @@ export function useFileTree(rootPath: string | null, options?: Options) {
 
   const fetchChildren = useCallback(
     async (path: string) => {
+      if (scopeKeyRef.current !== scopeKey) return false;
+      const generation = scopeGenerationRef.current;
+      const isCurrent = () => generation === scopeGenerationRef.current;
       if (nodesRef.current[path]?.status !== "loaded") {
         setNodes((s) => ({ ...s, [path]: { status: "loading" } }));
       }
@@ -194,15 +202,16 @@ export function useFileTree(rootPath: string | null, options?: Options) {
           path,
           showHidden: showHiddenRef.current,
           gitDecorations: gitDecorationsRef.current,
-          workspace: currentWorkspaceEnv(),
+          workspace,
         });
+        if (!isCurrent()) return false;
 
         const prev = nodesRef.current[path];
         if (
           prev?.status === "loaded" &&
           sameDirListing(prev.entries, entries)
         ) {
-          return;
+          return true;
         }
 
         const liveDirs = new Set(
@@ -243,14 +252,17 @@ export function useFileTree(rootPath: string | null, options?: Options) {
           });
           watches.removeMany([...dead]);
         }
+        return true;
       } catch (e) {
+        if (!isCurrent()) return false;
         setNodes((s) => ({
           ...s,
           [path]: { status: "error", message: String(e) },
         }));
+        return false;
       }
     },
-    [watches],
+    [scopeKey, workspace, watches],
   );
 
   // Root change → restore the cached expansion for this root, re-scope watches,
@@ -388,10 +400,15 @@ export function useFileTree(rootPath: string | null, options?: Options) {
   );
 
   const refresh = useCallback(
-    (path: string) => {
-      void fetchChildren(path);
+    (path: string, reveal = false) => {
+      if (scopeKeyRef.current !== scopeKey) return Promise.resolve(false);
+      if (reveal && path !== rootPath && !expandedRef.current.has(path)) {
+        setExpanded((curr) => new Set(curr).add(path));
+        addWatch(path);
+      }
+      return fetchChildren(path);
     },
-    [fetchChildren],
+    [fetchChildren, addWatch, rootPath, scopeKey],
   );
 
   // --- mutations ---

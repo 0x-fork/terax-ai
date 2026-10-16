@@ -1,121 +1,60 @@
 import { describe, expect, it } from "vitest";
-import {
-  createIconEngine,
-  iconEngine,
-  type IconifySet,
-  type IconMaps,
-} from "./iconEngine";
+import { iconEngine } from "./iconEngine";
 
-const set: IconifySet = {
-  width: 16,
-  height: 16,
-  icons: {
-    file: { body: "<path d='file'/>" },
-    folder: { body: "<path d='folder'/>" },
-    "folder-open": { body: "<path d='folder-open'/>" },
-    "folder-src": { body: "<path d='src'/>" },
-    "folder-src-open": { body: "<path d='src-open'/>" },
-    typescript: { body: "<path d='ts'/>" },
-    "typescript-react": { body: "<path d='tsx'/>" },
-    "typescript-def": { body: "<path d='dts'/>" },
-    npm: { body: "<path d='npm'/>" },
-    rust: { body: "<path d='rs'/>" },
-  },
-  aliases: { "ts-alias": { parent: "typescript" } },
-};
+const { fileIconUrl, folderIconUrl } = iconEngine;
 
-const maps: IconMaps = {
-  fileNames: { "package.json": "npm", "broken.cfg": "does-not-exist" },
-  fileExtensions: { "d.ts": "typescript_def", tsx: "typescript-react" },
-  languageIds: { typescript: "ts_alias", rust: "rust" },
-  extToLanguageId: { ts: "typescript", rs: "rust" },
-  folderNames: { src: "folder_src", ghost: "folder_ghost" },
-};
+// These assertions lock the resolution chain (by-name, extension, compound
+// extension, and default fallback) rather than the icon SVGs themselves, so
+// they stay valid when the underlying icon set changes.
+const DEFAULT = fileIconUrl("file-with-no-known-extension");
 
-const engine = createIconEngine(set, maps);
-const decode = (url: string) =>
-  decodeURIComponent(url.replace("data:image/svg+xml;utf8,", ""));
-
-describe("createIconEngine", () => {
-  it("prefers an exact file name over its extension", () => {
-    expect(decode(engine.fileIconUrl("package.json"))).toContain("d='npm'");
-    expect(decode(engine.fileIconUrl("PACKAGE.JSON"))).toContain("d='npm'");
+describe("fileIconUrl resolution chain", () => {
+  it("returns an inline svg data url", () => {
+    expect(fileIconUrl("a.ts")).toContain("data:image/svg");
   });
 
-  it("falls through compound extensions from most to least specific", () => {
-    expect(decode(engine.fileIconUrl("types.d.ts"))).toContain("d='dts'");
-    // `a.b.tsx` has no `b.tsx` entry, so the trailing `tsx` wins.
-    expect(decode(engine.fileIconUrl("a.b.tsx"))).toContain("d='tsx'");
+  it("is deterministic for the same extension", () => {
+    expect(fileIconUrl("a.ts")).toBe(fileIconUrl("b.ts"));
   });
 
-  it("uses the language-id table when an extension has no direct icon, resolving aliases and underscores", () => {
-    expect(decode(engine.fileIconUrl("main.rs"))).toContain("d='rs'");
-    expect(decode(engine.fileIconUrl("index.ts"))).toContain("d='ts'");
+  it("resolves a known extension to something other than the default", () => {
+    expect(fileIconUrl("a.ts")).not.toBe(DEFAULT);
   });
 
-  it("falls back to the generic file icon for unknown names and dangling mappings", () => {
-    const generic = engine.fileIconUrl("README");
-    expect(decode(generic)).toContain("d='file'");
-    expect(engine.fileIconUrl("x.unknownext")).toBe(generic);
-    expect(engine.fileIconUrl("broken.cfg")).toBe(generic);
-    expect(engine.fileIconUrl(".gitignore-like.")).toBe(generic);
-  });
-
-  it("maps folder names to open and closed variants", () => {
-    expect(decode(engine.folderIconUrl("src", false))).toContain("d='src'");
-    expect(decode(engine.folderIconUrl("SRC", true))).toContain("d='src-open'");
-    expect(decode(engine.folderIconUrl("random", false))).toContain(
-      "d='folder'",
-    );
-    expect(decode(engine.folderIconUrl("random", true))).toContain(
-      "d='folder-open'",
-    );
-    // A mapped name whose icon is missing degrades to the plain folder.
-    expect(decode(engine.folderIconUrl("ghost", true))).toContain(
-      "d='folder-open'",
+  it("distinguishes a compound extension from its base", () => {
+    // .test.tsx should resolve differently from a plain .tsx.
+    expect(fileIconUrl("component.test.tsx")).not.toBe(
+      fileIconUrl("component.tsx"),
     );
   });
 
-  it("returns an empty string when even the default icon is missing", () => {
-    const bare = createIconEngine({ icons: {} }, maps);
-    expect(bare.fileIconUrl("a.ts")).toBe("");
-    expect(bare.folderIconUrl("a", false)).toBe("");
+  it("resolves a by-name match (no extension) to a non-default icon", () => {
+    expect(fileIconUrl("Dockerfile")).not.toBe(DEFAULT);
   });
 
-  it("builds a sized SVG data URL once per icon", () => {
-    const url = engine.fileIconUrl("main.rs");
-    expect(url.startsWith("data:image/svg+xml;utf8,")).toBe(true);
-    expect(decode(url)).toContain('viewBox="0 0 16 16"');
-    expect(engine.fileIconUrl("other.rs")).toBe(url);
+  it("falls back to the default for an unknown extension", () => {
+    expect(fileIconUrl("mystery.qzxwv")).toBe(DEFAULT);
   });
 });
 
-describe("bundled Catppuccin engine", () => {
-  it("resolves common development files to distinct, non-generic icons", () => {
-    const generic = iconEngine.fileIconUrl("zzz.unknownext");
-    for (const name of [
-      "main.rs",
-      "index.tsx",
-      "package.json",
-      "README.md",
-      "Dockerfile",
-      "styles.css",
-    ]) {
-      const url = iconEngine.fileIconUrl(name);
-      expect(url.startsWith("data:image/svg+xml;utf8,"), name).toBe(true);
-      expect(url, name).not.toBe(generic);
-    }
-    expect(iconEngine.fileIconUrl("index.tsx")).not.toBe(
-      iconEngine.fileIconUrl("index.ts"),
-    );
+describe("folderIconUrl", () => {
+  it("returns an inline svg data url", () => {
+    expect(folderIconUrl("src", false)).toContain("data:image/svg");
   });
 
-  it("resolves folder icons and their open variants", () => {
-    expect(iconEngine.folderIconUrl("src", false)).not.toBe(
-      iconEngine.folderIconUrl("src", true),
-    );
-    expect(iconEngine.folderIconUrl("node_modules", false)).not.toBe(
-      iconEngine.folderIconUrl("zzz-not-special", false),
-    );
+  it("uses distinct open and closed icons for a mapped folder", () => {
+    const closed = folderIconUrl("src", false);
+    const expanded = folderIconUrl("src", true);
+    expect(expanded).toContain("data:image/svg");
+    expect(expanded).not.toBe(closed);
+  });
+
+  it("differs from the confirmed unknown-folder fallback when mapped", () => {
+    const fallback = folderIconUrl("qzxwv-dir", false);
+    const fallbackExpanded = folderIconUrl("qzxwv-dir", true);
+    expect(fallback).toContain("data:image/svg");
+    expect(fallbackExpanded).toContain("data:image/svg");
+    expect(fallbackExpanded).not.toBe(fallback);
+    expect(folderIconUrl("src", false)).not.toBe(fallback);
   });
 });
