@@ -29,6 +29,7 @@ describe("WebGpuTerminalRuntime", () => {
   });
 
   it("creates no encoder when dirty notifications resolve to unchanged pixels", async () => {
+    vi.useFakeTimers();
     const h = createHarness();
     const runtime = await createRuntime();
     const surface = createSurface();
@@ -43,8 +44,10 @@ describe("WebGpuTerminalRuntime", () => {
     surface.prepareFrame.mockReturnValue(false);
     for (let notification = 0; notification < 20; notification++) {
       runtime.schedule(surface);
+      vi.advanceTimersByTime(17);
       h.flushFrame();
     }
+    expect(surface.prepareFrame).toHaveBeenCalledTimes(21);
     expect(h.device.createCommandEncoder).not.toHaveBeenCalled();
     expect(h.gpuContext.getCurrentTexture).not.toHaveBeenCalled();
     expect(h.submit).toHaveBeenCalledOnce();

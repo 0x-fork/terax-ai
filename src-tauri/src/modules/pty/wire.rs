@@ -101,7 +101,9 @@ pub(super) fn decode_request(body: &[u8]) -> Result<StreamRequest, WireError> {
         return Err(WireError::LengthMismatch);
     }
     let acks = entries
-        .chunks_exact(ACK_ENTRY_LEN)
+        .as_chunks::<ACK_ENTRY_LEN>()
+        .0
+        .iter()
         .map(|entry| Ack {
             id: u32::from_le_bytes(entry[..4].try_into().expect("4-byte slice")),
             bytes: u64::from_le_bytes(entry[4..].try_into().expect("8-byte slice")),
