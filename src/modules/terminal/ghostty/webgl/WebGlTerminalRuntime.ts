@@ -15,7 +15,7 @@ import {
 } from "./WebGlCellRenderer";
 
 export const MAX_WEBGL_RENDERER_SLOTS = 5;
-export const MIN_WARM_WEBGL_RENDERER_SLOTS = 1;
+const MIN_WARM_WEBGL_RENDERER_SLOTS = 1;
 export const WEBGL_RENDERER_IDLE_TTL_MS = 30_000;
 
 export interface WebGlRuntimeSurface {

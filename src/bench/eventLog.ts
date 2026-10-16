@@ -17,7 +17,7 @@ let installed = false;
 
 const now = () => Math.round(performance.now());
 
-export function logEvent(k: string, v?: unknown): void {
+function logEvent(k: string, v?: unknown): void {
   if (entries.length >= MAX_ENTRIES) {
     entries.shift();
     dropped++;

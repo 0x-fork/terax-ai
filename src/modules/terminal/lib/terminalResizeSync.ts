@@ -1,5 +1,5 @@
 /** The terminal grid a surface keeps in step with its host. */
-export type ResizeModel = {
+type ResizeModel = {
   readonly cols: number;
   readonly rows: number;
   resize(cols: number, rows: number): void;

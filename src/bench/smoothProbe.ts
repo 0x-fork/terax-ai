@@ -93,7 +93,7 @@ export type SmoothSummary = {
   }>;
 };
 
-export type Stat = {
+type Stat = {
   n: number;
   p50: number;
   p95: number;
@@ -465,7 +465,6 @@ export class SmoothProbe implements SmoothHooks {
     });
   }
 }
-
 
 export function installSmoothProbe(): SmoothProbe {
   const g = globalThis as unknown as Record<string, SmoothProbe | undefined>;

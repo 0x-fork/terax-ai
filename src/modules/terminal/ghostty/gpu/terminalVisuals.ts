@@ -139,7 +139,7 @@ export function metricsEqual(
   );
 }
 
-export function fontSpecKey(font: TerminalFontSpec): string {
+function fontSpecKey(font: TerminalFontSpec): string {
   return [
     font.family,
     font.size,

@@ -111,7 +111,7 @@ export function starterTheme(): Theme {
   };
 }
 
-export function emitThemeEdit(req: ThemeEditRequest): Promise<void> {
+function emitThemeEdit(req: ThemeEditRequest): Promise<void> {
   return emit(THEME_EDIT_EVENT, req);
 }
 

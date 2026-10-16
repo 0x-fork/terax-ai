@@ -411,7 +411,7 @@ export function disposeGhosttySession(leafId: number): boolean {
   return true;
 }
 
-export async function respawnGhosttySession(
+async function respawnGhosttySession(
   leafId: number,
   cwd?: string,
 ): Promise<boolean> {

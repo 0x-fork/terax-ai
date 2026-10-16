@@ -393,7 +393,7 @@ export class GhosttyBlocks {
   }
 }
 
-export function decodeBlockCommand(raw: string): string {
+function decodeBlockCommand(raw: string): string {
   if (raw.startsWith("cmdline_url=")) {
     try {
       return decodeURIComponent(raw.slice(12).split(";")[0]);

@@ -12,7 +12,6 @@ import {
   hasGhosttySession,
   interruptGhosttySession,
   pasteIntoGhosttySession,
-  respawnGhosttySession,
   submitToGhosttySession,
   whenGhosttySessionReady,
   writeToGhosttySession,
@@ -150,13 +149,6 @@ export function leafIdForPty(ptyId: number): number | null {
 
 export function ptyIdForLeaf(leafId: number): number | null {
   return ghosttyPtyIdForLeaf(leafId);
-}
-
-export async function respawnSession(
-  leafId: number,
-  cwd?: string,
-): Promise<void> {
-  await respawnGhosttySession(leafId, cwd);
 }
 
 export async function leafHasForegroundProcess(

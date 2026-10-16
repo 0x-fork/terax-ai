@@ -5,7 +5,7 @@ import type { TerminalFontMetrics } from "./terminalVisuals";
 
 /** Words per `glyph_table` entry: rect xy, size wh, bearing xy, flags. */
 export const GLYPH_ENTRY_WORDS = 4;
-export const GLYPH_ENTRY_BYTES = GLYPH_ENTRY_WORDS * 4;
+const GLYPH_ENTRY_BYTES = GLYPH_ENTRY_WORDS * 4;
 export const GLYPH_ENTRY_FLAG_COLOR = 1;
 /** Coverage is final (cell-exact shapes): the shader applies no contrast. */
 export const GLYPH_ENTRY_FLAG_EXACT = 2;

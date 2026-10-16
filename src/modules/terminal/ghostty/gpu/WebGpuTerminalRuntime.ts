@@ -163,7 +163,7 @@ export type WebGpuRuntimeStats = {
   };
 };
 
-export type LatencyStats = {
+type LatencyStats = {
   readonly count: number;
   readonly sumMs: number;
   readonly maxMs: number;
