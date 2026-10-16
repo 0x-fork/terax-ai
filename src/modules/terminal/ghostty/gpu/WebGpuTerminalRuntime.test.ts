@@ -195,6 +195,78 @@ describe("WebGpuTerminalRuntime", () => {
     expect(harness.frames.size).toBe(0);
   });
 
+  it("draws every prepared change in the frame that prepared it, whatever the GPU's pace", async () => {
+    // Randomized pane output against a GPU that confirms work late and unevenly: a pane whose
+    // prepareFrame reported a change must reach the same flush's submission, and once the GPU
+    // catches up no dirty pane may be left behind (a lost change would sit undrawn until the
+    // next unrelated one).
+    vi.useFakeTimers();
+    const harness = createHarness();
+    const completions: (() => void)[] = [];
+    harness.onSubmittedWorkDone.mockImplementation(
+      () =>
+        new Promise<undefined>((resolve) =>
+          completions.push(() => resolve(undefined)),
+        ),
+    );
+    const runtime = await createRuntime();
+    const surface = createSurface();
+    join(runtime, surface);
+    let seed = 11;
+    const random = () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed / 0x100000000;
+    };
+    // The first frame of a window always draws (it is dirty by itself); start from there.
+    runtime.schedule(surface);
+    harness.flushFrame(0);
+    completions.shift()?.();
+    await Promise.resolve();
+    const baseline = harness.submit.mock.calls.length;
+    let changedFlushes = 0;
+    let owed = false;
+    surface.prepareFrame.mockImplementation(() => {
+      // Most flushes find a change; some find the damage resolved to nothing.
+      owed = random() < 0.7;
+      return owed;
+    });
+    let now = 0;
+    for (let step = 0; step < 600; step++) {
+      if (random() < 0.8) runtime.schedule(surface);
+      now += 4 + random() * 20;
+      vi.advanceTimersByTime(4 + random() * 20);
+      if (random() < 0.5 && completions.length > 0) {
+        completions.shift()?.();
+        await Promise.resolve();
+      }
+      if (harness.frames.size === 0) continue;
+      owed = false;
+      const before = harness.submit.mock.calls.length;
+      harness.flushFrame(now);
+      const submitted = harness.submit.mock.calls.length - before;
+      if (owed) changedFlushes += 1;
+      expect(submitted).toBe(owed ? 1 : 0);
+    }
+    // The GPU catches up; whatever is still dirty must now be drawn.
+    for (let settle = 0; settle < 50; settle++) {
+      while (completions.length > 0) {
+        completions.shift()?.();
+        await Promise.resolve();
+      }
+      vi.advanceTimersByTime(40);
+      now += 40;
+      owed = false;
+      surface.prepareFrame.mockImplementation(() => true);
+      if (harness.frames.size > 0) {
+        harness.flushFrame(now);
+        changedFlushes += 1;
+      }
+    }
+    expect(changedFlushes).toBeGreaterThan(40);
+    expect(runtime.diagnostics().pendingSurfaces).toBe(0);
+    expect(harness.submit.mock.calls.length - baseline).toBe(changedFlushes);
+  });
+
   it("defers device recreation while hidden and resumes it once visible", async () => {
     const harness = createHarness();
     const runtime = await createRuntime();

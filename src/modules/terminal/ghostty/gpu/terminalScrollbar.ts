@@ -5,6 +5,26 @@ const PINNED_WRITE_INTERVAL_MS = 100;
 /** Accessibility values change at most four times per second. */
 const ARIA_INTERVAL_MS = 250;
 
+/**
+ * A scroll event that echoes our own write: the browser clamped the `scrollTop` we set to the
+ * extent the content has now, because the scrollback shrank (Ghostty prunes whole pages). It
+ * reports where the browser put the thumb, not where the user dragged it, and must not move the
+ * model: with history one line longer by the time it was delivered the clamped position read as
+ * "scrolled up one line", which left the view anchored above the bottom for good while output
+ * streamed on.
+ */
+export function isClampedScrollEcho(
+  written: number | null,
+  scrollTop: number,
+  scrollHeight: number,
+  clientHeight: number,
+): boolean {
+  const max = scrollHeight - clientHeight;
+  return (
+    written !== null && written > max + 1 && Math.abs(scrollTop - max) <= 1
+  );
+}
+
 export type ScrollbarClock = {
   now(): number;
   setTimeout(callback: () => void, delay: number): number;
@@ -178,8 +198,19 @@ export class TerminalScrollbarSync {
       () => {
         this.trailingTimer = null;
         const binding = this.binding;
-        if (!binding || !this.available) return;
-        this.apply(binding, this.history, this.offset, this.available, false);
+        if (!binding) return;
+        // Read the model again. The values this class holds can be gone: the scroll handler
+        // invalidates them, and a write derived from that placeholder (history -1) put
+        // `scrollTop` at a negative line, which the browser clamped to the top and the handler
+        // then took for the user dragging the view there.
+        this.history = -1;
+        this.sync(
+          binding.viewportHeight,
+          binding.scrollbar,
+          binding.content,
+          binding.model,
+          binding.cellHeight,
+        );
       },
       Math.max(1, delay),
     );

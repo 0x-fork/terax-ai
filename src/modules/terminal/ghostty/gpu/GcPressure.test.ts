@@ -3,6 +3,7 @@ import {
   GC_MIRROR_BATCH_BYTES,
   GC_MIRROR_FACTOR,
   GC_MIRROR_MAX_BYTES_PER_SECOND,
+  allocateMirrorBuffer,
   GcPressureMirror,
   gcPressureOptionsFromStorage,
   NATIVE_BYTES_PER_FRAME,
@@ -153,6 +154,46 @@ describe("GcPressureMirror", () => {
     mirror.noteFrame(2);
     expect(mirror.diagnostics().allocations).toBe(1);
     expect(mirror.diagnostics().allocatedBytes).toBe(80_000);
+  });
+});
+
+describe("allocateMirrorBuffer", () => {
+  const prototype = ArrayBuffer.prototype as { transfer?: unknown };
+  const original = Object.getOwnPropertyDescriptor(prototype, "transfer");
+  afterEach(() => {
+    if (original) Object.defineProperty(prototype, "transfer", original);
+    else delete prototype.transfer;
+  });
+
+  it("detaches the buffer at once when the engine can, so no pages stay resident", () => {
+    const transfer = vi.fn();
+    Object.defineProperty(prototype, "transfer", {
+      value: transfer,
+      configurable: true,
+      writable: true,
+    });
+    allocateMirrorBuffer(65_536);
+    expect(transfer).toHaveBeenCalledExactlyOnceWith(0);
+  });
+
+  it("tolerates an engine without ArrayBuffer.prototype.transfer", () => {
+    Object.defineProperty(prototype, "transfer", {
+      value: undefined,
+      configurable: true,
+      writable: true,
+    });
+    expect(() => allocateMirrorBuffer(65_536)).not.toThrow();
+  });
+
+  it("is what a default mirror allocates with", () => {
+    const transfer = vi.fn();
+    Object.defineProperty(prototype, "transfer", {
+      value: transfer,
+      configurable: true,
+      writable: true,
+    });
+    new GcPressureMirror({ bytesPerFrame: 40_000 }).noteFrame(2);
+    expect(transfer).toHaveBeenCalledExactlyOnceWith(0);
   });
 });
 

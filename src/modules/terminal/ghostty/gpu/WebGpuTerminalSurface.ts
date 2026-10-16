@@ -1,6 +1,6 @@
 import { terminalWindowFocused } from "@/modules/terminal/ghostty/renderScheduling";
 import { bindTerminalInteraction } from "@/modules/terminal/ghostty/input/terminalInteraction";
-import { TerminalScrollbarSync } from "@/modules/terminal/ghostty/gpu/terminalScrollbar";
+import { isClampedScrollEcho, TerminalScrollbarSync } from "@/modules/terminal/ghostty/gpu/terminalScrollbar";
 import { terminalWindowPresentation } from "@/modules/terminal/ghostty/windowPresentation";
 import type { TerminalSurface } from "@/modules/terminal/backend/contracts";
 import { smoothHooks } from "@/bench/smoothHooks";
@@ -847,9 +847,22 @@ export class WebGpuTerminalSurface
   private readonly handleScroll = (): void => {
     if (!this.host || !this.visible || this.documentSuspended) return;
     const scrollTop = this.scrollbar.scrollTop;
-    if (scrollTop === this.scrollbarSync.writtenScrollTop) return;
+    const written = this.scrollbarSync.writtenScrollTop;
+    if (scrollTop === written) return;
     this.scrollbarSync.invalidate();
     this.scrollbarSync.observe(scrollTop);
+    if (
+      isClampedScrollEcho(
+        written,
+        scrollTop,
+        this.scrollbar.scrollHeight,
+        this.scrollbar.clientHeight,
+      )
+    ) {
+      // The browser clamped our write to shorter content: not a drag, take the model's position.
+      this.updateScrollbar();
+      return;
+    }
     const { history, offset } = this.options.model.scrollPosition();
     const line = Math.round(scrollTop / this.metrics.cellHeight);
     if (history - line !== offset) {

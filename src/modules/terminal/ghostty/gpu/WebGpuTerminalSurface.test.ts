@@ -769,6 +769,39 @@ describe("WebGPU surface resource lifecycle", () => {
     expect(h.schedule).not.toHaveBeenCalled();
   });
 
+  it("does not take the browser clamping its own scroll write for the user scrolling up", async () => {
+    // Ghostty prunes whole pages of scrollback, so the history can shrink by hundreds of lines
+    // under a bottom-pinned view. The browser clamps the thumb to the shorter content and
+    // reports a scroll event for a position the surface did not write; read as a drag, with the
+    // history one line longer by then, it moved the model one line above the bottom and left the
+    // view anchored there while output streamed on (the pane stopped changing on screen).
+    const h = await harness();
+    h.position.history = 1_028;
+    h.position.offset = 0;
+    h.render();
+    const scrollbar = h.elements.find(
+      (element) => element.getAttribute("role") === "scrollbar",
+    ) as unknown as {
+      scrollTop: number;
+      scrollHeight: number;
+      clientHeight: number;
+      dispatchEvent(event: Event): boolean;
+    };
+    const line = h.surface.cellSize().height;
+    expect(scrollbar.scrollTop).toBe(1_028 * line);
+    h.position.history = 494;
+    h.render();
+    h.position.history = 495;
+    scrollbar.scrollHeight = scrollbar.clientHeight + 494 * line;
+    scrollbar.scrollTop = 494 * line;
+    scrollbar.dispatchEvent(new Event("scroll"));
+    expect(h.model.scrollTo).not.toHaveBeenCalled();
+    // A real drag (here to the top) is still honoured.
+    scrollbar.scrollTop = 0;
+    scrollbar.dispatchEvent(new Event("scroll"));
+    expect(h.model.scrollTo).toHaveBeenCalledTimes(1);
+  });
+
   it("reads no layout on presented frames while history grows", async () => {
     const h = await harness();
     h.position.history = 10;

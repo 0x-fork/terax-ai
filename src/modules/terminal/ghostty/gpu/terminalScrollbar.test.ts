@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { GhosttyTerminalModelApi } from "@/modules/terminal/ghostty/GhosttyTerminalModel";
 import {
+  isClampedScrollEcho,
   type ScrollbarClock,
   TerminalScrollbarSync,
 } from "@/modules/terminal/ghostty/gpu/terminalScrollbar";
@@ -237,5 +238,89 @@ describe("TerminalScrollbarSync", () => {
     expect(h.clock.pending).toBeGreaterThan(0);
     h.sync.dispose();
     expect(h.clock.pending).toBe(0);
+  });
+
+  it("never writes a position derived from invalidated state, so the view is not sent to the top", () => {
+    // Bottom-pinned growth leaves a throttled write pending; the browser clamps the thumb when
+    // the scrollback shrinks, the scroll handler sees a position it did not write and
+    // invalidates. The pending write used to run with the placeholder history (-1): a negative
+    // `scrollTop`, clamped to 0 by the browser, read back by the handler as "the user dragged
+    // the view to the top", and the model scrolled there for good while output streamed on.
+    const h = harness();
+    h.scroll.offset = 0;
+    h.run();
+    h.scroll.history += 1;
+    h.run();
+    h.run();
+    expect(h.clock.pending).toBeGreaterThan(0);
+    h.writes.mockClear();
+    h.sync.invalidate();
+    h.sync.observe(8);
+    h.clock.advance(250);
+    for (const [value] of h.writes.mock.calls)
+      expect(value).toBeGreaterThanOrEqual(0);
+    expect(h.sync.writtenScrollTop).toBe(h.scroll.history * 20);
+    expect(h.writes).toHaveBeenLastCalledWith(h.scroll.history * 20);
+  });
+
+  it("follows the model after history shrinks under a pending write", () => {
+    const h = harness();
+    h.scroll.offset = 0;
+    h.scroll.history = 1_000;
+    h.run();
+    h.scroll.history += 1;
+    h.run();
+    h.scroll.history = 494;
+    h.sync.invalidate();
+    h.sync.observe(494 * 20);
+    h.writes.mockClear();
+    h.clock.advance(250);
+    expect(h.writes.mock.calls.every(([value]) => value >= 0)).toBe(true);
+    expect(h.sync.writtenScrollTop).toBe(494 * 20);
+  });
+
+  it("never writes a negative or non-finite scroll position, whatever happens to the cache", () => {
+    const h = harness();
+    let seed = 7;
+    const random = () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed / 0x100000000;
+    };
+    h.scroll.offset = 0;
+    h.run();
+    for (let step = 0; step < 3_000; step += 1) {
+      const roll = random();
+      if (roll < 0.4) h.scroll.history += 1;
+      else if (roll < 0.45) h.scroll.history = Math.floor(random() * 500);
+      else if (roll < 0.5)
+        h.scroll.offset = Math.floor(random() * h.scroll.history);
+      else if (roll < 0.6) h.scroll.offset = 0;
+      else if (roll < 0.7) h.sync.invalidate();
+      else if (roll < 0.72) h.sync.forget();
+      else if (roll < 0.76) h.sync.observe(random() * 4_000);
+      h.scroll.offset = Math.min(h.scroll.offset, h.scroll.history);
+      h.clock.advance(random() * 60);
+      h.run();
+    }
+    h.clock.advance(500);
+    for (const [value] of h.writes.mock.calls) {
+      expect(Number.isFinite(value)).toBe(true);
+      expect(value).toBeGreaterThanOrEqual(0);
+    }
+  });
+});
+
+describe("isClampedScrollEcho", () => {
+  it("recognizes the browser clamping a write to shorter content, and nothing a user can do", () => {
+    // Content 9,128 high in a 730 viewport: the thumb tops out at 8,398.
+    expect(isClampedScrollEcho(17_476, 8_398, 9_128, 730)).toBe(true);
+    // A drag away from the bottom, or one that lands where the thumb was written.
+    expect(isClampedScrollEcho(17_476, 5_000, 9_128, 730)).toBe(false);
+    expect(isClampedScrollEcho(8_000, 8_000, 9_128, 730)).toBe(false);
+    // Dragging down to the end: the write was below the end.
+    expect(isClampedScrollEcho(5_000, 8_398, 9_128, 730)).toBe(false);
+    // Nothing written yet (re-attached element) or no layout available.
+    expect(isClampedScrollEcho(null, 0, 9_128, 730)).toBe(false);
+    expect(isClampedScrollEcho(17_476, 0, Number.NaN, 730)).toBe(false);
   });
 });

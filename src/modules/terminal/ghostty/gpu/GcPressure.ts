@@ -37,6 +37,18 @@ export const GC_MIRROR_BATCH_BYTES = 64 * 1024;
  */
 export const GC_MIRROR_MAX_BYTES_PER_SECOND = 4 * 1024 * 1024;
 
+/**
+ * The default mirror allocation. The buffer is detached at once (`transfer(0)`, where the engine
+ * has it) so its zero-filled pages are never resident: a plain allocation sat in the JS VM
+ * Gigacage (1.3 to 13 MiB in a quiet session) until JavaScriptCore collected it, while the
+ * allocation volume the collector reacts to is counted all the same.
+ */
+export function allocateMirrorBuffer(bytes: number): void {
+  (
+    new ArrayBuffer(bytes) as { transfer?: (length: number) => unknown }
+  ).transfer?.(0);
+}
+
 export type GcPressureOptions = {
   readonly bytesPerFrame?: number;
   readonly batchBytes?: number;
@@ -82,7 +94,7 @@ export class GcPressureMirror {
     const cap = options.maxBytesPerSecond ?? GC_MIRROR_MAX_BYTES_PER_SECOND;
     this.maxBytesPerSecond = cap > 0 ? cap : Number.MAX_VALUE;
     this.burstBytes = this.maxBytesPerSecond / 4;
-    this.allocate = options.allocate ?? ((bytes) => new ArrayBuffer(bytes));
+    this.allocate = options.allocate ?? allocateMirrorBuffer;
     this.now = options.now ?? (() => performance.now());
     this.allowance = this.burstBytes;
     this.lastAt = this.now();
