@@ -1,23 +1,19 @@
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::thread;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-
-use shared_child::SharedChild;
 
 use crate::modules::git::errors::{GitError, Result};
 use crate::modules::git::types::{
     GitOutput, TextSource, DEFAULT_TIMEOUT_SECS, MAX_FILE_BYTES, MAX_OUTPUT_BYTES,
     MAX_TIMEOUT_SECS, MIN_GIT_VERSION,
 };
-use crate::modules::workspace::WorkspaceEnv;
+use crate::modules::proc::capture::{self, Limits};
 #[cfg(windows)]
 use crate::modules::workspace::validate_wsl_distro_name;
+use crate::modules::workspace::WorkspaceEnv;
 
 #[derive(Clone)]
 enum Availability {
@@ -91,7 +87,7 @@ pub fn ensure_git_available(workspace: &WorkspaceEnv) -> Result<()> {
 }
 
 fn check_git_availability(workspace: &WorkspaceEnv) -> Availability {
-    let output = match run_git_uncached(workspace, None, ["--version"], 10) {
+    let output = match run_git(workspace, None, ["--version"], 10) {
         Ok(o) => o,
         Err(_) => return Availability::NotInstalled,
     };
@@ -231,7 +227,23 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run_git_uncached(workspace, cwd, args, timeout_secs)
+    run_git_uncached(workspace, cwd, args, timeout_secs, MAX_OUTPUT_BYTES, false)
+}
+
+/// Like `run_git`, but kills git once it has produced `stdout_cap` bytes. For
+/// listings whose tail is not wanted, so a huge result costs a bounded walk.
+pub fn run_git_capped<I, S>(
+    workspace: &WorkspaceEnv,
+    cwd: Option<&str>,
+    args: I,
+    timeout_secs: u64,
+    stdout_cap: usize,
+) -> Result<GitOutput>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_git_uncached(workspace, cwd, args, timeout_secs, stdout_cap, true)
 }
 
 fn run_git_uncached<I, S>(
@@ -239,6 +251,8 @@ fn run_git_uncached<I, S>(
     cwd: Option<&str>,
     args: I,
     timeout_secs: u64,
+    stdout_cap: usize,
+    stop_on_stdout_cap: bool,
 ) -> Result<GitOutput>
 where
     I: IntoIterator<Item = S>,
@@ -262,45 +276,28 @@ where
         .stderr(Stdio::piped());
     crate::modules::proc::hide_console(&mut cmd);
 
-    let child = Arc::new(SharedChild::spawn(&mut cmd).map_err(|e| GitError::Spawn(e.to_string()))?);
-    let mut stdout_pipe = child
-        .take_stdout()
-        .ok_or_else(|| GitError::Spawn("no stdout pipe".into()))?;
-    let mut stderr_pipe = child
-        .take_stderr()
-        .ok_or_else(|| GitError::Spawn("no stderr pipe".into()))?;
-
-    let stdout_handle = thread::spawn(move || drain(&mut stdout_pipe, 64 * 1024));
-    let stderr_handle = thread::spawn(move || drain(&mut stderr_pipe, 4 * 1024));
-
-    let (tx, rx) = mpsc::channel();
-    let waiter = Arc::clone(&child);
-    thread::spawn(move || {
-        let _ = tx.send(waiter.wait());
-    });
-
-    let (exit_code, timed_out) = match rx.recv_timeout(dur) {
-        Ok(Ok(status)) => (status.code(), false),
-        Ok(Err(e)) => return Err(GitError::Io(e)),
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            (None, true)
+    let captured = capture::run(
+        &mut cmd,
+        dur,
+        Limits {
+            stdout: stdout_cap,
+            stderr: MAX_OUTPUT_BYTES,
+            stop_on_stdout_cap,
+        },
+    )
+    .map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+            GitError::Spawn(e.to_string())
         }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            return Err(GitError::Spawn("git wait thread disconnected".into()));
-        }
-    };
-
-    let (stdout, stdout_truncated) = stdout_handle.join().unwrap_or((Vec::new(), false));
-    let (stderr, _stderr_truncated) = stderr_handle.join().unwrap_or((Vec::new(), false));
+        _ => GitError::Io(e),
+    })?;
 
     Ok(GitOutput {
-        stdout,
-        stderr,
-        exit_code,
-        timed_out,
-        truncated: stdout_truncated,
+        stdout: captured.stdout,
+        stderr: captured.stderr,
+        exit_code: captured.exit_code,
+        timed_out: captured.timed_out,
+        truncated: captured.stdout_truncated,
     })
 }
 
@@ -380,30 +377,6 @@ fn decode_text(bytes: Vec<u8>) -> TextSource {
         Ok(text) => TextSource::Text(text),
         Err(e) => TextSource::Text(String::from_utf8_lossy(&e.into_bytes()).into_owned()),
     }
-}
-
-fn drain<R: Read>(reader: &mut R, prealloc: usize) -> (Vec<u8>, bool) {
-    let mut out: Vec<u8> = Vec::with_capacity(prealloc.min(MAX_OUTPUT_BYTES));
-    let mut buf = [0u8; 16 * 1024];
-    let mut truncated = false;
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if out.len() >= MAX_OUTPUT_BYTES {
-                    truncated = true;
-                    continue;
-                }
-                let take = (MAX_OUTPUT_BYTES - out.len()).min(n);
-                out.extend_from_slice(&buf[..take]);
-                if take < n {
-                    truncated = true;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    (out, truncated)
 }
 
 #[cfg(test)]

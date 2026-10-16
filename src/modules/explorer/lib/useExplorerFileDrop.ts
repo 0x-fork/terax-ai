@@ -11,6 +11,8 @@ import {
 
 type Options = {
   rootPath: string | null;
+  /** No webview drag-drop listener while false (explorer not on screen). */
+  enabled?: boolean;
   isDir: (path: string) => boolean | undefined;
   onCopied: (destDir: string) => void;
 };
@@ -44,12 +46,18 @@ function dirAt(
 // Accepts files dropped from the OS onto an explorer folder (copy, not move),
 // via Tauri's native drag-drop. One webview-level listener; ignores drops that
 // land outside the explorer (the terminal handles its own).
-export function useExplorerFileDrop({ rootPath, isDir, onCopied }: Options) {
+export function useExplorerFileDrop({
+  rootPath,
+  enabled = true,
+  isDir,
+  onCopied,
+}: Options) {
   const [targetDir, setTargetDir] = useState<string | null>(null);
   const optsRef = useRef({ rootPath, isDir, onCopied });
   optsRef.current = { rootPath, isDir, onCopied };
 
   useEffect(() => {
+    if (!enabled) return;
     let disposed = false;
     let unlisten: (() => void) | null = null;
 
@@ -101,7 +109,7 @@ export function useExplorerFileDrop({ rootPath, isDir, onCopied }: Options) {
       setTargetDir(null);
       unlisten?.();
     };
-  }, []);
+  }, [enabled]);
 
   return { externalTargetDir: targetDir };
 }

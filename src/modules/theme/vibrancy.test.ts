@@ -1,197 +1,129 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const core = vi.hoisted(() => ({
+const bridge = vi.hoisted(() => ({
   invoke: vi.fn(),
+  frame: "rgb(20, 20, 20)",
 }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: bridge.invoke }));
 
-vi.mock("@tauri-apps/api/core", () => core);
+import { parseCssColor, toHex } from "./vibrancy";
 
-type FakeRoot = {
-  attrs: Map<string, string>;
-  style: { backgroundColor: string };
-};
+describe("parseCssColor", () => {
+  it("reads rgb() in its legacy and modern spellings", () => {
+    expect(parseCssColor("rgb(20, 20, 20)")).toEqual([20, 20, 20]);
+    expect(parseCssColor("rgb(255 128 0)")).toEqual([255, 128, 0]);
+    expect(parseCssColor("rgba(1, 2, 3, 1)")).toEqual([1, 2, 3]);
+    expect(parseCssColor("rgb(1 2 3 / 100%)")).toEqual([1, 2, 3]);
+  });
 
-function fakeDocument(): FakeRoot {
-  const attrs = new Map<string, string>();
-  const root = {
-    attrs,
-    style: { backgroundColor: "" },
-    setAttribute(k: string, v: string) {
-      attrs.set(k, v);
-    },
-    removeAttribute(k: string) {
-      attrs.delete(k);
-    },
-    hasAttribute(k: string) {
-      return attrs.has(k);
-    },
-  };
-  vi.stubGlobal("document", { documentElement: root });
-  return root as unknown as FakeRoot;
-}
+  it("reads color(srgb) as the webview serializes color-mix results", () => {
+    expect(parseCssColor("color(srgb 0.0784314 0.0784314 0.0784314)")).toEqual([
+      20, 20, 20,
+    ]);
+    expect(parseCssColor("color(srgb 1 1 1)")).toEqual([255, 255, 255]);
+  });
 
-async function loadModule() {
-  return await import("./vibrancy");
-}
+  it("converts oklab and oklch to sRGB", () => {
+    expect(parseCssColor("oklab(0 0 0)")).toEqual([0, 0, 0]);
+    expect(parseCssColor("oklab(1 0 0)")).toEqual([255, 255, 255]);
+    expect(parseCssColor("oklab(0.5 0 0)")).toEqual([99, 99, 99]);
+    expect(parseCssColor("oklch(0.5 0 120)")).toEqual([99, 99, 99]);
+    const [r, g, b] = parseCssColor("oklch(0.6 0.2 30)") ?? [];
+    expect(r).toBeGreaterThan(g ?? 0);
+    expect(r).toBeGreaterThan(b ?? 0);
+  });
 
-describe("vibrancy application", () => {
+  it("rejects translucent, unknown and malformed values", () => {
+    for (const bad of [
+      "",
+      "transparent",
+      "rgba(0, 0, 0, 0.5)",
+      "rgb(0 0 0 / 0.5)",
+      "color(display-p3 1 0 0)",
+      "hsl(0 0% 0%)",
+      "#141414",
+      "rgb(a, b, c)",
+    ]) {
+      expect(parseCssColor(bad), bad).toBeNull();
+    }
+  });
+
+  it("formats bytes as the #rrggbb the native side parses", () => {
+    expect(toHex([20, 20, 20])).toBe("#141414");
+    expect(toHex([255, 160, 177])).toBe("#ffa0b1");
+    expect(toHex([0, 0, 0])).toBe("#000000");
+  });
+});
+
+describe("applyVibrancy", () => {
   beforeEach(() => {
     vi.resetModules();
-    vi.unstubAllGlobals();
-    core.invoke.mockReset();
+    bridge.invoke.mockReset();
+    bridge.invoke.mockImplementation(async (command: string) =>
+      command === "window_backdrop_kind" ? "vibrancy" : undefined,
+    );
+    const probe = { style: { cssText: "" }, remove: vi.fn() };
+    const root = {
+      style: { backgroundColor: "" },
+      setAttribute: vi.fn(),
+      removeAttribute: vi.fn(),
+    };
+    vi.stubGlobal("document", {
+      documentElement: root,
+      createElement: () => probe,
+      body: { appendChild: vi.fn() },
+    });
+    vi.stubGlobal("getComputedStyle", () => ({
+      backgroundColor: bridge.frame,
+    }));
+    vi.stubGlobal("requestAnimationFrame", (cb: () => void) => cb());
   });
 
-  it("caches the backdrop kind in a single backend probe", async () => {
-    fakeDocument();
-    core.invoke.mockResolvedValue("mica");
-    const vibrancy = await loadModule();
+  const backdropCalls = () =>
+    bridge.invoke.mock.calls.filter(([c]) => c === "window_set_backdrop");
 
-    await vibrancy.getBackdropKind();
-    await vibrancy.getBackdropKind();
-
-    expect(core.invoke).toHaveBeenCalledTimes(1);
-    expect(core.invoke).toHaveBeenCalledWith("window_backdrop_kind");
+  it("turns the window opaque with the theme colour when vibrancy is off", async () => {
+    const mod = await import("./vibrancy");
+    await mod.applyVibrancy(false, true);
+    expect(backdropCalls()).toEqual([
+      [
+        "window_set_backdrop",
+        { enabled: false, dark: true, background: "#141414" },
+      ],
+    ]);
   });
 
-  it("falls back to none when the backend probe fails", async () => {
-    fakeDocument();
-    core.invoke.mockRejectedValue(new Error("unsupported"));
-    const vibrancy = await loadModule();
-
-    await expect(vibrancy.getBackdropKind()).resolves.toBe("none");
+  it("repeats nothing for an unchanged state but follows a theme colour change", async () => {
+    const mod = await import("./vibrancy");
+    await mod.applyVibrancy(false, true);
+    await mod.applyVibrancy(false, true);
+    expect(backdropCalls()).toHaveLength(1);
+    bridge.frame = "rgb(40, 42, 54)";
+    await mod.applyVibrancy(false, true);
+    expect(backdropCalls()).toHaveLength(2);
+    expect(backdropCalls()[1][1]).toMatchObject({ background: "#282a36" });
+    bridge.frame = "rgb(20, 20, 20)";
   });
 
-  it("turns the effect on and repaints the transparent surface", async () => {
-    const root = fakeDocument();
-    root.style.backgroundColor = "#141414";
-    core.invoke.mockResolvedValue("vibrancy");
-    const vibrancy = await loadModule();
-
-    await vibrancy.applyVibrancy(true, true);
-
-    expect(root.attrs.get("data-vibrancy")).toBe("on");
-    expect(root.style.backgroundColor).toBe("");
-    expect(core.invoke).toHaveBeenCalledWith("window_set_backdrop", {
+  it("makes the window see-through only while the backdrop is on", async () => {
+    const mod = await import("./vibrancy");
+    await mod.applyVibrancy(true, false);
+    expect(backdropCalls()[0][1]).toEqual({
       enabled: true,
-      dark: true,
-    });
-  });
-
-  it("skips the native call when the state was already applied", async () => {
-    fakeDocument();
-    core.invoke.mockResolvedValue("vibrancy");
-    const vibrancy = await loadModule();
-
-    await vibrancy.applyVibrancy(true, true);
-    await vibrancy.applyVibrancy(true, true);
-
-    expect(core.invoke).toHaveBeenCalledTimes(2);
-  });
-
-  it("rebuilds mica on a dark-mode flip", async () => {
-    fakeDocument();
-    core.invoke.mockResolvedValue("mica");
-    const vibrancy = await loadModule();
-
-    await vibrancy.applyVibrancy(true, true);
-    await vibrancy.applyVibrancy(true, false);
-
-    const backdrop = core.invoke.mock.calls.filter(
-      (c) => c[0] === "window_set_backdrop",
-    );
-    expect(backdrop).toHaveLength(2);
-    expect(backdrop[1][1]).toEqual({ enabled: true, dark: false });
-  });
-
-  it("keeps an existing NSVisualEffectView across a dark-mode flip", async () => {
-    fakeDocument();
-    core.invoke.mockResolvedValue("vibrancy");
-    const vibrancy = await loadModule();
-
-    await vibrancy.applyVibrancy(true, true);
-    await vibrancy.applyVibrancy(true, false);
-
-    const backdrop = core.invoke.mock.calls.filter(
-      (c) => c[0] === "window_set_backdrop",
-    );
-    expect(backdrop).toHaveLength(1);
-  });
-
-  it("paints opaque and disables natively when the platform reports none", async () => {
-    const root = fakeDocument();
-    root.style.backgroundColor = "";
-    core.invoke.mockResolvedValue("none");
-    const vibrancy = await loadModule();
-
-    await vibrancy.applyVibrancy(true, true);
-
-    expect(root.attrs.has("data-vibrancy")).toBe(false);
-    expect(root.style.backgroundColor).toBe("#141414");
-    const backdrop = core.invoke.mock.calls.filter(
-      (c) => c[0] === "window_set_backdrop",
-    );
-    expect(backdrop).toEqual([["window_set_backdrop", { enabled: false, dark: true }]]);
-  });
-
-  it("repaints opaque when the native side fails so the webview is never see-through", async () => {
-    const root = fakeDocument();
-    core.invoke.mockResolvedValue("vibrancy");
-    const vibrancy = await loadModule();
-
-    core.invoke.mockImplementation((cmd: string) =>
-      cmd === "window_backdrop_kind"
-        ? Promise.resolve("vibrancy")
-        : Promise.reject(new Error("boom")),
-    );
-    await vibrancy.applyVibrancy(true, true);
-
-    expect(root.attrs.has("data-vibrancy")).toBe(false);
-    expect(root.style.backgroundColor).toBe("#141414");
-
-    core.invoke.mockImplementation(() => Promise.resolve());
-    await vibrancy.applyVibrancy(true, true);
-
-    expect(root.attrs.get("data-vibrancy")).toBe("on");
-  });
-
-  it("repaints the light pre-paint color when disabling in light mode", async () => {
-    const root = fakeDocument();
-    core.invoke.mockResolvedValue("vibrancy");
-    const vibrancy = await loadModule();
-
-    await vibrancy.applyVibrancy(false, false);
-
-    expect(root.style.backgroundColor).toBe("#ffffff");
-    expect(core.invoke).toHaveBeenCalledWith("window_set_backdrop", {
-      enabled: false,
       dark: false,
+      background: undefined,
     });
+    await mod.applyVibrancy(false, false);
+    expect(backdropCalls()[1][1]).toMatchObject({ enabled: false });
   });
 
-  it("serializes concurrent toggles so they cannot land out of order", async () => {
-    fakeDocument();
-    const vibrancy = await loadModule();
-    let releaseFirst: (() => void) | undefined;
-    core.invoke.mockImplementation((cmd: string) => {
-      if (cmd === "window_backdrop_kind") return Promise.resolve("vibrancy");
-      if (core.invoke.mock.calls.filter((c) => c[0] === "window_set_backdrop").length === 1) {
-        return new Promise<void>((resolve) => {
-          releaseFirst = resolve;
-        });
-      }
-      return Promise.resolve();
+  it("falls back to opaque if the native call fails", async () => {
+    bridge.invoke.mockImplementation(async (command: string) => {
+      if (command === "window_backdrop_kind") return "vibrancy";
+      throw new Error("native failure");
     });
-
-    const first = vibrancy.applyVibrancy(true, true);
-    const second = vibrancy.applyVibrancy(false, true);
-
-    const backdropCalls = () =>
-      core.invoke.mock.calls.filter((c) => c[0] === "window_set_backdrop").length;
-    await new Promise((r) => setTimeout(r, 0));
-    expect(backdropCalls()).toBe(1);
-
-    releaseFirst?.();
-    await Promise.all([first, second]);
-    expect(backdropCalls()).toBe(2);
+    const mod = await import("./vibrancy");
+    await expect(mod.applyVibrancy(true, true)).resolves.toBeUndefined();
+    expect(document.documentElement.style.backgroundColor).toBe("#141414");
   });
 });

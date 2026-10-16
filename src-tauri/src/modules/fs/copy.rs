@@ -1,4 +1,8 @@
-use super::{mutate::rename_no_replace, to_canon};
+use super::{
+    index::FileIndexState,
+    mutate::{note_dir_changed, rename_no_replace},
+    to_canon,
+};
 use crate::modules::workspace::{resolve_path, WorkspaceEnv, WorkspaceRegistry};
 use serde::Serialize;
 use std::ffi::{OsStr, OsString};
@@ -38,6 +42,7 @@ pub async fn fs_copy(
             &root,
             &WorkspaceEnv::from_option(workspace),
             &app.state::<WorkspaceRegistry>(),
+            &app.state::<FileIndexState>(),
             rename_on_conflict.unwrap_or(false),
         )
     })
@@ -73,6 +78,7 @@ fn copy_batch(
     root: &str,
     workspace: &WorkspaceEnv,
     registry: &WorkspaceRegistry,
+    index: &FileIndexState,
     rename_on_conflict: bool,
 ) -> Result<CopyResult, String> {
     if sources.len() > MAX_COPY_SOURCES {
@@ -90,6 +96,9 @@ fn copy_batch(
                 message: error.to_string(),
             }),
         }
+    }
+    if !result.created.is_empty() {
+        note_dir_changed(index, &dest);
     }
     Ok(result)
 }
@@ -257,9 +266,46 @@ mod tests {
             &s(dest),
             &WorkspaceEnv::Local,
             &registry,
+            &FileIndexState::default(),
             rename,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn copying_invalidates_search_without_a_directory_watcher() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("new.txt"), b"new").unwrap();
+        let registry = WorkspaceRegistry::default();
+        registry.authorize(dest.path()).unwrap();
+        let index = FileIndexState::default();
+        let key = super::super::index::IndexKey {
+            root: std::fs::canonicalize(dest.path()).unwrap(),
+            show_hidden: false,
+            max_depth: None,
+        };
+        assert!(index.get_or_build(&key).entries.is_empty());
+        let result = copy_batch(
+            vec![
+                s(src.path().join("new.txt")),
+                s(src.path().join("missing.txt")),
+            ],
+            &s(dest.path()),
+            &s(dest.path()),
+            &WorkspaceEnv::Local,
+            &registry,
+            &index,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.created.len(), 1);
+        assert_eq!(result.failed.len(), 1);
+        assert!(index
+            .get_or_build(&key)
+            .entries
+            .iter()
+            .any(|(name, _)| name == "new.txt"));
     }
 
     #[test]
@@ -482,6 +528,7 @@ mod tests {
                 distro: "Ubuntu".into(),
             },
             &registry,
+            &FileIndexState::default(),
             true,
         )
         .unwrap();
