@@ -218,6 +218,24 @@ describe("built startup graph", () => {
     }
   });
 
+  it("bundles one shared Lezer highlighter for parsers and themes", () => {
+    const assets = join(outDir, "assets");
+    const sources = new Set<string>();
+    for (const file of readdirSync(assets).filter((f) =>
+      f.endsWith(".js.map"),
+    )) {
+      const map = JSON.parse(readFileSync(join(assets, file), "utf8")) as {
+        sources: string[];
+      };
+      for (const source of map.sources) {
+        if (source.includes("/node_modules/@lezer/highlight/")) {
+          sources.add(source);
+        }
+      }
+    }
+    expect([...sources]).toHaveLength(1);
+  });
+
   it("refuses to build the app-lab driver without its own identifier, and under the product one", () => {
     const build = (extra: Record<string, string>) =>
       execFileSync(

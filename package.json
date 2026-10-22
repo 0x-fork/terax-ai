@@ -72,7 +72,7 @@
     "@hugeicons/core-free-icons": "^4.3.5",
     "@hugeicons/react": "^1.1.10",
     "@iconify-json/catppuccin": "^1.2.17",
-    "@lezer/highlight": "^1.2.3",
+    "@lezer/highlight": "catalog:",
     "@radix-ui/react-use-controllable-state": "^1.2.6",
     "@replit/codemirror-lang-svelte": "^6.0.0",
     "@replit/codemirror-vim": "^6.4.0",
